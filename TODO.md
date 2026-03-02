@@ -1,7 +1,6 @@
-- hot-reloaded player ability slots
-- delay ability effect
+- Extend voxel_map_engine to support inserting pre-authored chunks
+- Extend voxel_map_engine to load full maps for pre-authored instances
 - buff stat modifiers
-- multiple map 'rooms?'
 - meaningful proc gen terrain
 - prefab world objects 'doodads?'
 - composable Character templates that are loadable Asset files. Character template asset files are composed of other ron asset files
