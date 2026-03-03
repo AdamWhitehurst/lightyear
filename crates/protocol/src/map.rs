@@ -1,6 +1,7 @@
+use avian3d::prelude::*;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-pub use voxel_map_engine::prelude::VoxelType;
+pub use voxel_map_engine::prelude::{ChunkTarget, VoxelChunk, VoxelType};
 
 /// Channel for voxel editing messages
 pub struct VoxelChannel;
@@ -41,5 +42,31 @@ pub struct VoxelStateSync {
     pub modifications: Vec<(IVec3, VoxelType)>,
 }
 
-/// Temporarily stubbed -- will be restored with VoxelChunk component
-pub fn attach_chunk_colliders() {}
+/// Attaches trimesh colliders to voxel chunks whenever their mesh changes.
+pub fn attach_chunk_colliders(
+    mut commands: Commands,
+    chunks: Query<
+        (Entity, &Mesh3d, Option<&Collider>),
+        (With<VoxelChunk>, Or<(Changed<Mesh3d>, Added<Mesh3d>)>),
+    >,
+    meshes: Res<Assets<Mesh>>,
+) {
+    for (entity, mesh_handle, existing_collider) in chunks.iter() {
+        let Some(mesh) = meshes.get(&mesh_handle.0) else {
+            warn!("Chunk entity {entity:?} has Mesh3d but mesh asset not found");
+            continue;
+        };
+        let Some(collider) = Collider::trimesh_from_mesh(mesh) else {
+            warn!("Failed to create trimesh collider for chunk entity {entity:?}");
+            continue;
+        };
+        if existing_collider.is_some() {
+            commands.entity(entity).remove::<Collider>();
+        }
+        commands.entity(entity).insert((
+            collider,
+            RigidBody::Static,
+            crate::hit_detection::terrain_collision_layers(),
+        ));
+    }
+}

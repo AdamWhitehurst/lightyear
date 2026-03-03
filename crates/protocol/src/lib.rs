@@ -24,8 +24,8 @@ pub use hit_detection::{
     terrain_collision_layers, GameLayer,
 };
 pub use map::{
-    attach_chunk_colliders, MapWorld, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest,
-    VoxelStateSync, VoxelType,
+    attach_chunk_colliders, ChunkTarget, MapWorld, VoxelChannel, VoxelChunk, VoxelEditBroadcast,
+    VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 
 pub const PROTOCOL_ID: u64 = 0;
@@ -162,6 +162,9 @@ impl Plugin for ProtocolPlugin {
         #[cfg(feature = "test_utils")]
         app.register_event::<TestTrigger>()
             .add_direction(NetworkDirection::Bidirectional);
+
+        // Voxel map components
+        app.register_component::<ChunkTarget>().add_map_entities();
 
         // Marker components
         app.register_component::<PlayerId>();

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use lightyear::prelude::{
@@ -7,14 +9,34 @@ use protocol::{
     MapWorld, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 use serde::{Deserialize, Serialize};
+use voxel_map_engine::prelude::{
+    flat_terrain_sdf, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld, WorldVoxel,
+};
 
 /// Plugin managing server-side voxel map functionality
 pub struct ServerMapPlugin;
+
+/// Resource tracking the primary overworld map entity.
+#[derive(Resource)]
+pub struct OverworldMap(pub Entity);
+
+fn spawn_overworld(mut commands: Commands, map_world: Res<MapWorld>) {
+    let map = commands
+        .spawn((
+            VoxelMapInstance::new(5),
+            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_sdf)),
+            Transform::default(),
+        ))
+        .id();
+    commands.insert_resource(OverworldMap(map));
+}
 
 fn load_voxel_world(
     mut modifications: ResMut<VoxelModifications>,
     map_world: Res<MapWorld>,
     save_path: Res<VoxelSavePath>,
+    overworld: Res<OverworldMap>,
+    mut voxel_world: VoxelWorld,
 ) {
     let loaded_mods = load_voxel_world_from_disk_at(&map_world, &save_path.0);
 
@@ -24,10 +46,11 @@ fn load_voxel_world(
 
     modifications.modifications = loaded_mods.clone();
 
-    info!(
-        "Loaded {} voxel modifications (engine not yet integrated)",
-        loaded_mods.len()
-    );
+    for &(pos, voxel_type) in &loaded_mods {
+        voxel_world.set_voxel(overworld.0, pos, WorldVoxel::from(voxel_type));
+    }
+
+    info!("Loaded {} voxel modifications", loaded_mods.len());
 }
 
 fn save_voxel_world_debounced(
@@ -84,12 +107,16 @@ pub fn save_voxel_world_on_shutdown(
 
 impl Plugin for ServerMapPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<MapWorld>()
+        app.add_plugins(VoxelPlugin)
+            .init_resource::<MapWorld>()
             .init_resource::<VoxelModifications>()
             .init_resource::<VoxelDirtyState>()
             .init_resource::<VoxelSavePath>()
-            .add_systems(Startup, load_voxel_world)
-            .add_systems(Update, handle_voxel_edit_requests)
+            .add_systems(Startup, (spawn_overworld, load_voxel_world).chain())
+            .add_systems(
+                Update,
+                (handle_voxel_edit_requests, protocol::attach_chunk_colliders),
+            )
             .add_systems(Update, save_voxel_world_debounced)
             .add_systems(Last, save_voxel_world_on_shutdown)
             .add_observer(send_initial_voxel_state);
@@ -268,16 +295,22 @@ fn handle_voxel_edit_requests(
     mut modifications: ResMut<VoxelModifications>,
     mut dirty_state: ResMut<VoxelDirtyState>,
     time: Res<Time>,
+    overworld: Res<OverworldMap>,
+    mut voxel_world: VoxelWorld,
 ) {
     let server_ref = server.into_inner();
     for mut message_receiver in receiver.iter_mut() {
         for request in message_receiver.receive() {
-            // Track modification
+            voxel_world.set_voxel(
+                overworld.0,
+                request.position,
+                WorldVoxel::from(request.voxel),
+            );
+
             modifications
                 .modifications
                 .push((request.position, request.voxel));
 
-            // Mark dirty
             let now = time.elapsed_secs_f64();
             if !dirty_state.is_dirty {
                 dirty_state.first_dirty_time = Some(now);
@@ -285,7 +318,6 @@ fn handle_voxel_edit_requests(
             dirty_state.is_dirty = true;
             dirty_state.last_edit_time = now;
 
-            // Broadcast to all clients
             sender
                 .send::<_, VoxelChannel>(
                     &VoxelEditBroadcast {

@@ -156,6 +156,7 @@ fn handle_connected(
     mut commands: Commands,
     character_query: Query<Entity, (With<CharacterMarker>, Without<DummyTarget>)>,
     remote_id_query: Query<&RemoteId, With<ClientOf>>,
+    overworld: Res<crate::map::OverworldMap>,
 ) {
     let client_entity = trigger.entity;
     let peer_id = remote_id_query
@@ -196,5 +197,6 @@ fn handle_connected(
         CharacterMarker,
         Health::new(100.0),
         AbilityCooldowns::default(),
+        ChunkTarget::new(overworld.0, 2),
     ));
 }

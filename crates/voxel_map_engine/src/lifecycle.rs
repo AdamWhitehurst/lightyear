@@ -220,7 +220,7 @@ fn handle_completed_chunk(
 }
 
 fn chunk_world_offset(chunk_pos: IVec3) -> Vec3 {
-    chunk_pos.as_vec3() * CHUNK_SIZE as f32
+    chunk_pos.as_vec3() * CHUNK_SIZE as f32 - Vec3::ONE
 }
 
 /// Despawn chunk entities whose position is no longer in the parent map's loaded_chunks.
@@ -348,6 +348,6 @@ mod tests {
     #[test]
     fn chunk_world_offset_calculation() {
         let offset = chunk_world_offset(IVec3::new(1, 2, 3));
-        assert_eq!(offset, Vec3::new(16.0, 32.0, 48.0));
+        assert_eq!(offset, Vec3::new(15.0, 31.0, 47.0));
     }
 }

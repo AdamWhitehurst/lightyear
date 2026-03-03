@@ -22,6 +22,7 @@ fn main() {
         // Register asset resources for voxel world mesh generation
         .add_message::<bevy::asset::AssetEvent<bevy::prelude::Mesh>>()
         .init_asset::<bevy::prelude::Mesh>()
+        .init_asset::<bevy::pbr::StandardMaterial>()
         .init_asset::<bevy::shader::Shader>()
         .add_message::<bevy::asset::AssetEvent<bevy::shader::Shader>>()
         .init_asset::<bevy::image::Image>()

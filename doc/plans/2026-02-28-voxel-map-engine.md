@@ -653,9 +653,9 @@ The persistence format (`VoxelWorldSave`) uses `Vec<(IVec3, VoxelType)>`. `Voxel
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` passes
-- [ ] `cargo test-all` passes
-- [ ] `cargo build-all` succeeds
+- [x] `cargo check-all` passes
+- [x] `cargo test-all` passes
+- [x] `cargo build-all` succeeds
 
 #### Manual Verification:
 - [ ] `cargo server` starts and generates terrain
