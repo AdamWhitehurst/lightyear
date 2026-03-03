@@ -72,3 +72,48 @@ impl From<WorldVoxel> for VoxelType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_chunk_shape_size() {
+        assert_eq!(PaddedChunkShape::SIZE, 18 * 18 * 18);
+    }
+
+    #[test]
+    fn padded_chunk_shape_linearize_roundtrip() {
+        let point = [5u32, 10, 3];
+        let index = PaddedChunkShape::linearize(point);
+        let back = PaddedChunkShape::delinearize(index);
+        assert_eq!(point, back);
+    }
+
+    #[test]
+    fn chunk_data_new_empty() {
+        let chunk = ChunkData::new_empty();
+        assert_eq!(chunk.voxels.len(), PaddedChunkShape::USIZE);
+        assert_eq!(chunk.fill_type, FillType::Empty);
+        assert!(chunk.voxels.iter().all(|v| *v == WorldVoxel::Air));
+    }
+
+    #[test]
+    fn world_voxel_to_voxel_type_roundtrip() {
+        let air: VoxelType = WorldVoxel::Air.into();
+        assert_eq!(air, VoxelType::Air);
+        let back: WorldVoxel = air.into();
+        assert_eq!(back, WorldVoxel::Air);
+
+        let solid: VoxelType = WorldVoxel::Solid(42).into();
+        assert_eq!(solid, VoxelType::Solid(42));
+        let back: WorldVoxel = solid.into();
+        assert_eq!(back, WorldVoxel::Solid(42));
+    }
+
+    #[test]
+    fn world_voxel_unset_maps_to_air() {
+        let vt: VoxelType = WorldVoxel::Unset.into();
+        assert_eq!(vt, VoxelType::Air);
+    }
+}

@@ -355,12 +355,12 @@ This validates the full data path: SDF generation → surface nets → Bevy Mesh
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` passes
-- [ ] `cargo test -p voxel_map_engine` passes (unit tests for ChunkData, PaddedChunkShape indexing, SDF→mesh conversion, mesh cache insertion/lookup)
-- [ ] `cargo test-all` passes
+- [x] `cargo check-all` passes
+- [x] `cargo test -p voxel_map_engine` passes (unit tests for ChunkData, PaddedChunkShape indexing, SDF→mesh conversion, mesh cache insertion/lookup)
+- [x] `cargo test-all` passes
 
 #### Manual Verification:
-- [ ] `cargo run --example terrain -p voxel_map_engine` shows smooth terrain surface at y=0
+- [x] `cargo run --example terrain -p voxel_map_engine` shows smooth terrain surface at y=0
 
 ---
 
