@@ -7,6 +7,25 @@ members = [
     "crates/render",
     "crates/ui",
 ]
+exclude = [
+    "git/avian",
+    "git/bevy",
+    "git/bevy_fsl_box_frame",
+    "git/bevy_metrics_dashboard", 
+    "git/bevy_triplanar_splatting",
+    "git/bevy_voxel_world",
+    "git/block-mesh-rs",
+    "git/fast-surface-nets-rs",
+    "git/grid-tree-rs",
+    "git/height-mesh-rs",
+    "git/lightyear",
+    "git/ndcopy-rs",
+    "git/ndshape-rs",
+    "git/qef",
+    "git/rkyv_impl",
+    "git/smooth-bevy-cameras",
+    "git/vector_expr",
+]
 resolver = "2"
 
 [workspace.dependencies]
