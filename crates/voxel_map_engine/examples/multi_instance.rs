@@ -52,7 +52,7 @@ fn setup(mut commands: Commands) {
 
 fn spawn_overworld(commands: &mut Commands) -> Entity {
     let (mut instance, config, marker) =
-        VoxelMapInstance::overworld(42, Arc::new(flat_terrain_sdf));
+        VoxelMapInstance::overworld(42, Arc::new(flat_terrain_voxels));
     instance.debug_colors = true;
     commands
         .spawn((
@@ -69,7 +69,7 @@ fn spawn_homebase(commands: &mut Commands) -> Entity {
     let (mut instance, config, marker) = VoxelMapInstance::homebase(
         Entity::PLACEHOLDER,
         IVec3::new(8, 4, 8),
-        Arc::new(raised_terrain_sdf),
+        Arc::new(raised_terrain_voxels),
     );
     instance.debug_colors = true;
     commands
@@ -85,7 +85,7 @@ fn spawn_homebase(commands: &mut Commands) -> Entity {
 
 fn spawn_arena(commands: &mut Commands) -> Entity {
     let (mut instance, config, marker) =
-        VoxelMapInstance::arena(1, 99, IVec3::new(10, 4, 10), Arc::new(bowl_terrain_sdf));
+        VoxelMapInstance::arena(1, 99, IVec3::new(10, 4, 10), Arc::new(bowl_terrain_voxels));
     instance.debug_colors = true;
     commands
         .spawn((
@@ -98,18 +98,20 @@ fn spawn_arena(commands: &mut Commands) -> Entity {
         .id()
 }
 
-fn raised_terrain_sdf(chunk_pos: IVec3) -> Vec<f32> {
-    let mut sdf = vec![0.0f32; PaddedChunkShape::USIZE];
+fn raised_terrain_voxels(chunk_pos: IVec3) -> Vec<WorldVoxel> {
+    let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
     for i in 0..PaddedChunkShape::SIZE {
         let [_x, y, _z] = PaddedChunkShape::delinearize(i);
         let world_y = chunk_pos.y * CHUNK_SIZE as i32 + y as i32 - 1;
-        sdf[i as usize] = (world_y - 4) as f32;
+        if world_y < 4 {
+            voxels[i as usize] = WorldVoxel::Solid(0);
+        }
     }
-    sdf
+    voxels
 }
 
-fn bowl_terrain_sdf(chunk_pos: IVec3) -> Vec<f32> {
-    let mut sdf = vec![0.0f32; PaddedChunkShape::USIZE];
+fn bowl_terrain_voxels(chunk_pos: IVec3) -> Vec<WorldVoxel> {
+    let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
     for i in 0..PaddedChunkShape::SIZE {
         let [x, y, z] = PaddedChunkShape::delinearize(i);
         let world_x = (chunk_pos.x * CHUNK_SIZE as i32 + x as i32 - 1) as f32;
@@ -117,9 +119,11 @@ fn bowl_terrain_sdf(chunk_pos: IVec3) -> Vec<f32> {
         let world_z = (chunk_pos.z * CHUNK_SIZE as i32 + z as i32 - 1) as f32;
         let dist = (world_x * world_x + world_z * world_z).sqrt();
         let surface_y = -2.0 + dist * 0.15;
-        sdf[i as usize] = world_y - surface_y;
+        if world_y < surface_y {
+            voxels[i as usize] = WorldVoxel::Solid(0);
+        }
     }
-    sdf
+    voxels
 }
 
 fn teleport_camera(

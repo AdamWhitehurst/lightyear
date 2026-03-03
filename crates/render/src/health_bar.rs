@@ -10,9 +10,9 @@ pub(crate) struct HealthBarForeground;
 #[derive(Component)]
 pub(crate) struct Billboard;
 
-const HEALTH_BAR_WIDTH: f32 = 1.5;
-const HEALTH_BAR_HEIGHT: f32 = 0.15;
-const HEALTH_BAR_Y_OFFSET: f32 = 2.5;
+const HEALTH_BAR_WIDTH: f32 = 3.0;
+const HEALTH_BAR_HEIGHT: f32 = 0.3;
+const HEALTH_BAR_Y_OFFSET: f32 = 5.0;
 const HEALTH_BAR_FG_NORMAL: Color = Color::srgb(0.1, 0.9, 0.1);
 const HEALTH_BAR_FG_INVULN: Color = Color::srgb(0.2, 0.5, 1.0);
 

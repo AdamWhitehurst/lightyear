@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use grid_tree::OctreeI32;
 use std::collections::{HashMap, HashSet};
 
-use crate::config::{SdfGenerator, VoxelMapConfig};
+use crate::config::{VoxelGenerator, VoxelMapConfig};
 use crate::types::{ChunkData, WorldVoxel};
 
 /// Marker: this map is the shared overworld.
@@ -43,7 +43,7 @@ impl VoxelMapInstance {
     }
 
     /// Bundle for an unbounded overworld map.
-    pub fn overworld(seed: u64, generator: SdfGenerator) -> (Self, VoxelMapConfig, Overworld) {
+    pub fn overworld(seed: u64, generator: VoxelGenerator) -> (Self, VoxelMapConfig, Overworld) {
         let tree_height = 5;
         (
             Self::new(tree_height),
@@ -56,7 +56,7 @@ impl VoxelMapInstance {
     pub fn homebase(
         owner: Entity,
         bounds: IVec3,
-        generator: SdfGenerator,
+        generator: VoxelGenerator,
     ) -> (Self, VoxelMapConfig, Homebase) {
         let tree_height = 3;
         let spawning_distance = bounds_to_spawning_distance(bounds);
@@ -78,7 +78,7 @@ impl VoxelMapInstance {
         id: u64,
         seed: u64,
         bounds: IVec3,
-        generator: SdfGenerator,
+        generator: VoxelGenerator,
     ) -> (Self, VoxelMapConfig, Arena) {
         let tree_height = 3;
         let spawning_distance = bounds_to_spawning_distance(bounds);
@@ -110,8 +110,8 @@ mod tests {
     use grid_tree::{NodeKey, VisitCommand};
     use std::sync::Arc;
 
-    fn dummy_generator() -> SdfGenerator {
-        Arc::new(|_| vec![1.0])
+    fn dummy_generator() -> VoxelGenerator {
+        Arc::new(|_| vec![WorldVoxel::Air; 1])
     }
 
     #[test]

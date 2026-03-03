@@ -11,8 +11,8 @@ use crate::ability::{
 };
 use crate::{CharacterMarker, Health, Invulnerable, PlayerId};
 
-pub const MELEE_HITBOX_OFFSET: f32 = 1.5;
-pub const MELEE_HITBOX_HALF_EXTENTS: Vec3 = Vec3::new(0.75, 1.0, 0.5);
+pub const MELEE_HITBOX_OFFSET: f32 = 3.0;
+pub const MELEE_HITBOX_HALF_EXTENTS: Vec3 = Vec3::new(1.5, 2.0, 1.0);
 
 #[derive(PhysicsLayer, Default)]
 pub enum GameLayer {

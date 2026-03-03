@@ -16,10 +16,10 @@ fn test_app() -> App {
 }
 
 fn spawn_map(app: &mut App, spawning_distance: u32) -> Entity {
-    spawn_map_with(app, spawning_distance, Arc::new(flat_terrain_sdf))
+    spawn_map_with(app, spawning_distance, Arc::new(flat_terrain_voxels))
 }
 
-fn spawn_map_with(app: &mut App, spawning_distance: u32, generator: SdfGenerator) -> Entity {
+fn spawn_map_with(app: &mut App, spawning_distance: u32, generator: VoxelGenerator) -> Entity {
     app.world_mut()
         .spawn((
             VoxelMapInstance::new(5),
@@ -100,7 +100,7 @@ fn get_voxel_reads_sdf_for_unmodified() {
 
     app.world_mut()
         .run_system_once(move |vw: VoxelWorld| {
-            // Flat terrain SDF: y < 0 is solid, y >= 0 is air
+            // Flat terrain: y <= 0 is solid, y > 0 is air
             let below = vw.get_voxel(map, IVec3::new(0, -1, 0));
             assert_eq!(below, WorldVoxel::Solid(0));
 
@@ -255,8 +255,8 @@ fn raycast_hits_flat_terrain() {
             let result = vw.raycast(map, ray, 50.0, |v| matches!(v, WorldVoxel::Solid(_)));
             let hit = result.expect("should hit flat terrain");
 
-            // Flat terrain is solid at y < 0, so first hit should be at y = -1
-            assert_eq!(hit.position.y, -1, "should hit at y=-1 (first solid)");
+            // Flat terrain is solid at y <= 0, so first hit should be at y = 0
+            assert_eq!(hit.position.y, 0, "should hit at y=0 (first solid)");
             assert_eq!(hit.voxel, WorldVoxel::Solid(0));
             assert_eq!(hit.normal, Some(Vec3::Y), "should enter from top face");
         })
@@ -348,9 +348,8 @@ fn set_voxel_isolated_between_instances() {
     );
 }
 
-/// Returns an SDF generator that produces all-air chunks (positive values everywhere).
-fn all_air_sdf(_chunk_pos: IVec3) -> Vec<f32> {
-    vec![1.0f32; PaddedChunkShape::USIZE]
+fn all_air_voxels(_chunk_pos: IVec3) -> Vec<WorldVoxel> {
+    vec![WorldVoxel::Air; PaddedChunkShape::USIZE]
 }
 
 /// Test: raycast on one map does not see another map's voxels.
@@ -358,7 +357,7 @@ fn all_air_sdf(_chunk_pos: IVec3) -> Vec<f32> {
 fn raycast_isolated_between_instances() {
     let mut app = test_app();
     let map_a = spawn_map(&mut app, 1);
-    let map_b = spawn_map_with(&mut app, 1, Arc::new(all_air_sdf));
+    let map_b = spawn_map_with(&mut app, 1, Arc::new(all_air_voxels));
     tick(&mut app, 1);
 
     app.world_mut()

@@ -2924,14 +2924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fast-surface-nets"
-version = "0.2.1"
-dependencies = [
- "glam 0.29.3",
- "ndshape",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7618,7 +7610,6 @@ dependencies = [
  "approx",
  "bevy",
  "block-mesh",
- "fast-surface-nets",
  "grid-tree",
  "ndcopy",
  "ndshape",

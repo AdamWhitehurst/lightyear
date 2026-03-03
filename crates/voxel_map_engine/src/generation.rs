@@ -6,8 +6,8 @@ use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use ndshape::ConstShape;
 
-use crate::config::SdfGenerator;
-use crate::meshing::{SurfaceNetsMesher, VoxelMesher};
+use crate::config::VoxelGenerator;
+use crate::meshing::mesh_chunk_greedy;
 use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
 
 /// Result of an async chunk generation task.
@@ -23,11 +23,11 @@ pub struct PendingChunks {
     pub pending_positions: HashSet<IVec3>,
 }
 
-/// Spawn an async task that generates SDF data, applies voxel modifications, and meshes a chunk.
+/// Spawn an async task that generates voxel data, applies modifications, and meshes a chunk.
 pub fn spawn_chunk_gen_task(
     pending: &mut PendingChunks,
     position: IVec3,
-    generator: &SdfGenerator,
+    generator: &VoxelGenerator,
     modified_voxels: &HashMap<IVec3, WorldVoxel>,
 ) {
     let generator = Arc::clone(generator);
@@ -66,18 +66,17 @@ const PADDED_CHUNK_SIZE: i32 = 18;
 
 fn generate_chunk(
     position: IVec3,
-    generator: &SdfGenerator,
+    generator: &VoxelGenerator,
     overrides: &[(IVec3, WorldVoxel)],
 ) -> ChunkGenResult {
-    let mut sdf = generator(position);
-    apply_overrides(&mut sdf, position, overrides);
-    let mesh = SurfaceNetsMesher.mesh_chunk(&sdf);
+    let mut voxels = generator(position);
+    apply_overrides(&mut voxels, position, overrides);
+    let mesh = mesh_chunk_greedy(&voxels);
     ChunkGenResult { position, mesh }
 }
 
-/// Override SDF values for modified voxels.
-/// Solid → large negative (well inside surface), Air → large positive (well outside surface).
-fn apply_overrides(sdf: &mut [f32], chunk_pos: IVec3, overrides: &[(IVec3, WorldVoxel)]) {
+/// Apply voxel overrides directly into the voxel array.
+fn apply_overrides(voxels: &mut [WorldVoxel], chunk_pos: IVec3, overrides: &[(IVec3, WorldVoxel)]) {
     let chunk_origin = chunk_pos * CHUNK_SIZE as i32;
 
     for &(world_pos, voxel) in overrides {
@@ -89,11 +88,8 @@ fn apply_overrides(sdf: &mut [f32], chunk_pos: IVec3, overrides: &[(IVec3, World
         ];
         let index = PaddedChunkShape::linearize(padded) as usize;
 
-        if index < sdf.len() {
-            sdf[index] = match voxel {
-                WorldVoxel::Solid(_) => -1.0,
-                WorldVoxel::Air | WorldVoxel::Unset => 1.0,
-            };
+        if index < voxels.len() {
+            voxels[index] = voxel;
         }
     }
 }

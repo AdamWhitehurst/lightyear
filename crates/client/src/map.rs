@@ -8,7 +8,7 @@ use protocol::{
     VoxelType,
 };
 use voxel_map_engine::prelude::{
-    flat_terrain_sdf, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
+    flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
     WorldVoxel,
 };
 
@@ -46,7 +46,7 @@ fn spawn_overworld(mut commands: Commands, map_world: Res<MapWorld>) {
     let map = commands
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_sdf)),
+            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_voxels)),
             Transform::default(),
         ))
         .id();
@@ -61,7 +61,7 @@ fn attach_chunk_target_to_camera(
     for entity in &cameras {
         commands
             .entity(entity)
-            .insert(ChunkTarget::new(overworld.0, 2));
+            .insert(ChunkTarget::new(overworld.0, 4));
     }
 }
 

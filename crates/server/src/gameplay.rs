@@ -7,12 +7,17 @@ use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 use protocol::*;
 
+use crate::map::{spawn_overworld, OverworldMap};
+
 pub struct ServerGameplayPlugin;
 
 impl Plugin for ServerGameplayPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(handle_connected);
-        app.add_systems(Startup, (spawn_dummy_target, spawn_respawn_points));
+        app.add_systems(
+            Startup,
+            (spawn_dummy_target, spawn_respawn_points).after(spawn_overworld),
+        );
         app.add_systems(FixedUpdate, handle_character_movement);
         app.add_systems(
             FixedUpdate,
@@ -52,7 +57,7 @@ fn sync_ability_manifest(defs: Option<Res<AbilityDefs>>, mut last_len: Local<usi
     }
 }
 
-fn spawn_dummy_target(mut commands: Commands) {
+fn spawn_dummy_target(mut commands: Commands, overworld: Res<OverworldMap>) {
     commands.spawn((
         Name::new("DummyTarget"),
         Position(Vec3::new(3.0, 30.0, 0.0)),
@@ -63,6 +68,7 @@ fn spawn_dummy_target(mut commands: Commands) {
         ColorComponent(css::GRAY.into()),
         CharacterMarker,
         Health::new(100.0),
+        ChunkTarget::new(overworld.0, 1),
         DummyTarget,
     ));
 }
@@ -156,7 +162,7 @@ fn handle_connected(
     mut commands: Commands,
     character_query: Query<Entity, (With<CharacterMarker>, Without<DummyTarget>)>,
     remote_id_query: Query<&RemoteId, With<ClientOf>>,
-    overworld: Res<crate::map::OverworldMap>,
+    overworld: Res<OverworldMap>,
 ) {
     let client_entity = trigger.entity;
     let peer_id = remote_id_query
@@ -177,8 +183,8 @@ fn handle_connected(
     let color = available_colors[num_characters % available_colors.len()];
 
     let angle: f32 = num_characters as f32 * 5.0;
-    let x = 2.0 * angle.cos();
-    let z = 2.0 * angle.sin();
+    let x = 4.0 * angle.cos();
+    let z = 4.0 * angle.sin();
 
     commands.spawn((
         Name::new("Character"),
@@ -197,6 +203,6 @@ fn handle_connected(
         CharacterMarker,
         Health::new(100.0),
         AbilityCooldowns::default(),
-        ChunkTarget::new(overworld.0, 2),
+        ChunkTarget::new(overworld.0, 4),
     ));
 }

@@ -32,8 +32,8 @@ pub const PROTOCOL_ID: u64 = 0;
 pub const PRIVATE_KEY: [u8; 32] = [0; 32];
 pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
 
-pub const CHARACTER_CAPSULE_RADIUS: f32 = 1.0;
-pub const CHARACTER_CAPSULE_HEIGHT: f32 = 1.0;
+pub const CHARACTER_CAPSULE_RADIUS: f32 = 2.0;
+pub const CHARACTER_CAPSULE_HEIGHT: f32 = 2.0;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Hash, Reflect)]
 pub enum PlayerActions {
@@ -302,8 +302,8 @@ pub fn apply_movement(
     position: &Position,
     forces: &mut ForcesItem,
 ) {
-    const MAX_SPEED: f32 = 5.0;
-    const MAX_ACCELERATION: f32 = 20.0;
+    const MAX_SPEED: f32 = 10.0;
+    const MAX_ACCELERATION: f32 = 40.0;
 
     let max_velocity_delta_per_tick = MAX_ACCELERATION * delta_secs;
 
@@ -314,10 +314,10 @@ pub fn apply_movement(
         let filter = &SpatialQueryFilter::from_excluded_entities([entity]);
 
         if spatial_query
-            .cast_ray(ray_cast_origin, Dir3::NEG_Y, 2.0, false, filter)
+            .cast_ray(ray_cast_origin, Dir3::NEG_Y, 4.0, false, filter)
             .is_some()
         {
-            forces.apply_linear_impulse(Vec3::new(0.0, 50.0, 0.0));
+            forces.apply_linear_impulse(Vec3::new(0.0, 400.0, 0.0));
         }
     }
 

@@ -23,8 +23,8 @@ use crate::hit_detection::{
 };
 use crate::{PlayerActions, PlayerId};
 
-const PROJECTILE_SPAWN_OFFSET: f32 = 1.5;
-const BULLET_COLLIDER_RADIUS: f32 = 0.25;
+const PROJECTILE_SPAWN_OFFSET: f32 = 3.0;
+const BULLET_COLLIDER_RADIUS: f32 = 0.5;
 
 const ABILITY_ACTIONS: [PlayerActions; 4] = [
     PlayerActions::Ability1,

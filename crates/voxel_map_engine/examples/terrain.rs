@@ -13,7 +13,7 @@ fn main() {
 }
 
 fn setup(mut commands: Commands) {
-    let generator: SdfGenerator = Arc::new(flat_terrain_sdf);
+    let generator: VoxelGenerator = Arc::new(flat_terrain_voxels);
 
     let mut instance = VoxelMapInstance::new(5);
     instance.debug_colors = true;

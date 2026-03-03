@@ -73,6 +73,31 @@ impl From<WorldVoxel> for VoxelType {
     }
 }
 
+impl block_mesh::Voxel for WorldVoxel {
+    fn get_visibility(&self) -> block_mesh::VoxelVisibility {
+        match self {
+            WorldVoxel::Air | WorldVoxel::Unset => block_mesh::VoxelVisibility::Empty,
+            WorldVoxel::Solid(_) => block_mesh::VoxelVisibility::Opaque,
+        }
+    }
+}
+
+impl block_mesh::MergeVoxel for WorldVoxel {
+    type MergeValue = u8;
+    type MergeValueFacingNeighbour = u8;
+
+    fn merge_value(&self) -> u8 {
+        match self {
+            WorldVoxel::Solid(m) => *m,
+            _ => 0,
+        }
+    }
+
+    fn merge_value_facing_neighbour(&self) -> u8 {
+        self.merge_value()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

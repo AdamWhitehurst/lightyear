@@ -1,8 +1,10 @@
 use bevy::prelude::*;
 use std::sync::Arc;
 
-/// Generation function: given chunk position, returns SDF values for the padded 18^3 array.
-pub type SdfGenerator = Arc<dyn Fn(IVec3) -> Vec<f32> + Send + Sync>;
+use crate::types::WorldVoxel;
+
+/// Generation function: given chunk position, returns voxel data for the padded 18^3 array.
+pub type VoxelGenerator = Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync>;
 
 /// Configuration for a map instance.
 #[derive(Component)]
@@ -11,7 +13,7 @@ pub struct VoxelMapConfig {
     pub spawning_distance: u32,
     pub bounds: Option<IVec3>,
     pub tree_height: u32,
-    pub generator: SdfGenerator,
+    pub generator: VoxelGenerator,
 }
 
 impl VoxelMapConfig {
@@ -20,7 +22,7 @@ impl VoxelMapConfig {
         spawning_distance: u32,
         bounds: Option<IVec3>,
         tree_height: u32,
-        generator: SdfGenerator,
+        generator: VoxelGenerator,
     ) -> Self {
         debug_assert!(tree_height > 0, "VoxelMapConfig: tree_height must be > 0");
         debug_assert!(

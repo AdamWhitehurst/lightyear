@@ -5,7 +5,7 @@ use lightyear::prelude::*;
 pub(crate) fn setup_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 9.0, -18.0).looking_at(Vec3::ZERO, Dir3::Y),
+        Transform::from_xyz(0.0, 18.0, -36.0).looking_at(Vec3::ZERO, Dir3::Y),
     ));
 }
 
@@ -15,7 +15,7 @@ pub(crate) fn setup_lighting(mut commands: Commands) {
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_xyz(4.0, 8.0, 4.0),
+        Transform::from_xyz(8.0, 16.0, 8.0),
     ));
 }
 
@@ -30,7 +30,7 @@ pub(crate) fn follow_player(
         return;
     };
 
-    let offset = Vec3::new(0.0, 9.0, -18.0);
+    let offset = Vec3::new(0.0, 18.0, -36.0);
     camera_transform.translation = **player_pos + offset;
     camera_transform.look_at(**player_pos, Dir3::Y);
 }

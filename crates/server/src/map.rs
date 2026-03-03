@@ -10,7 +10,7 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 use voxel_map_engine::prelude::{
-    flat_terrain_sdf, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld, WorldVoxel,
+    flat_terrain_voxels, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld, WorldVoxel,
 };
 
 /// Plugin managing server-side voxel map functionality
@@ -20,11 +20,11 @@ pub struct ServerMapPlugin;
 #[derive(Resource)]
 pub struct OverworldMap(pub Entity);
 
-fn spawn_overworld(mut commands: Commands, map_world: Res<MapWorld>) {
+pub fn spawn_overworld(mut commands: Commands, map_world: Res<MapWorld>) {
     let map = commands
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_sdf)),
+            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_voxels)),
             Transform::default(),
         ))
         .id();

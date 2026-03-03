@@ -18,7 +18,7 @@ pub struct VoxelWorld<'w, 's> {
 impl VoxelWorld<'_, '_> {
     /// Get the voxel at a world-space integer position on a specific map instance.
     ///
-    /// Checks `modified_voxels` first, then evaluates the SDF generator.
+    /// Checks `modified_voxels` first, then evaluates the voxel generator.
     pub fn get_voxel(&self, map: Entity, pos: IVec3) -> WorldVoxel {
         let Ok((instance, config)) = self.maps.get(map) else {
             warn!("get_voxel: entity {map:?} has no VoxelMapInstance");
@@ -29,7 +29,7 @@ impl VoxelWorld<'_, '_> {
             return voxel;
         }
 
-        evaluate_sdf_at(pos, &config.generator)
+        evaluate_voxel_at(pos, &config.generator)
     }
 
     /// Queue a voxel write. Applied during `flush_write_buffer` system.
@@ -66,8 +66,7 @@ impl VoxelWorld<'_, '_> {
         let start = ray.origin;
         let end = ray.origin + *ray.direction * max_distance;
 
-        // Cache the last chunk's SDF to avoid re-generating for adjacent voxels
-        let mut cached_chunk: Option<(IVec3, Vec<f32>)> = None;
+        let mut cached_chunk: Option<(IVec3, Vec<WorldVoxel>)> = None;
 
         let mut result = None;
 
@@ -81,7 +80,7 @@ impl VoxelWorld<'_, '_> {
                     voxel,
                     t,
                 });
-                return false; // stop traversal
+                return false;
             }
             true
         });
@@ -90,12 +89,12 @@ impl VoxelWorld<'_, '_> {
     }
 }
 
-/// Look up a voxel at a world position, using the SDF cache for efficiency.
+/// Look up a voxel at a world position, using a chunk cache for efficiency.
 fn lookup_voxel(
     voxel_pos: IVec3,
     instance: &VoxelMapInstance,
-    generator: &crate::config::SdfGenerator,
-    cached_chunk: &mut Option<(IVec3, Vec<f32>)>,
+    generator: &crate::config::VoxelGenerator,
+    cached_chunk: &mut Option<(IVec3, Vec<WorldVoxel>)>,
 ) -> WorldVoxel {
     if let Some(&voxel) = instance.modified_voxels.get(&voxel_pos) {
         return voxel;
@@ -111,20 +110,20 @@ fn lookup_voxel(
         *cached_chunk = Some((chunk_pos, generator(chunk_pos)));
     }
 
-    let (_, sdf) = cached_chunk.as_ref().unwrap();
-    sdf_to_voxel(sdf, voxel_pos, chunk_pos)
+    let (_, voxels) = cached_chunk.as_ref().unwrap();
+    lookup_voxel_in_chunk(voxels, voxel_pos, chunk_pos)
 }
 
-/// Evaluate the SDF at a single world-space position and return a WorldVoxel.
-fn evaluate_sdf_at(pos: IVec3, generator: &crate::config::SdfGenerator) -> WorldVoxel {
+/// Evaluate the voxel generator at a single world-space position.
+fn evaluate_voxel_at(pos: IVec3, generator: &crate::config::VoxelGenerator) -> WorldVoxel {
     let chunk_pos = voxel_to_chunk_pos(pos);
-    let sdf = generator(chunk_pos);
-    sdf_to_voxel(&sdf, pos, chunk_pos)
+    let voxels = generator(chunk_pos);
+    lookup_voxel_in_chunk(&voxels, pos, chunk_pos)
 }
 
-fn sdf_to_voxel(sdf: &[f32], voxel_pos: IVec3, chunk_pos: IVec3) -> WorldVoxel {
+/// Index into a voxel array to get the voxel at a world position within the given chunk.
+fn lookup_voxel_in_chunk(voxels: &[WorldVoxel], voxel_pos: IVec3, chunk_pos: IVec3) -> WorldVoxel {
     let local = voxel_pos - chunk_pos * CHUNK_SIZE as i32;
-    // +1 for padding offset
     let padded = [
         (local.x + 1) as u32,
         (local.y + 1) as u32,
@@ -132,10 +131,10 @@ fn sdf_to_voxel(sdf: &[f32], voxel_pos: IVec3, chunk_pos: IVec3) -> WorldVoxel {
     ];
     let index = PaddedChunkShape::linearize(padded) as usize;
 
-    if index < sdf.len() && sdf[index] < 0.0 {
-        WorldVoxel::Solid(0)
+    if index < voxels.len() {
+        voxels[index]
     } else {
-        WorldVoxel::Air
+        WorldVoxel::Unset
     }
 }
 
@@ -160,32 +159,28 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_sdf_flat_terrain() {
-        use crate::meshing::flat_terrain_sdf;
+    fn evaluate_voxel_flat_terrain() {
+        use crate::meshing::flat_terrain_voxels;
         use std::sync::Arc;
-        let generator: crate::config::SdfGenerator = Arc::new(flat_terrain_sdf);
+        let generator: crate::config::VoxelGenerator = Arc::new(flat_terrain_voxels);
 
-        // Below surface → solid
-        let voxel = evaluate_sdf_at(IVec3::new(0, -1, 0), &generator);
+        let voxel = evaluate_voxel_at(IVec3::new(0, -1, 0), &generator);
         assert_eq!(voxel, WorldVoxel::Solid(0));
 
-        // Above surface → air
-        let voxel = evaluate_sdf_at(IVec3::new(0, 1, 0), &generator);
+        let voxel = evaluate_voxel_at(IVec3::new(0, 1, 0), &generator);
         assert_eq!(voxel, WorldVoxel::Air);
     }
 
     #[test]
-    fn sdf_to_voxel_roundtrip() {
-        use crate::meshing::flat_terrain_sdf;
+    fn lookup_voxel_in_chunk_roundtrip() {
+        use crate::meshing::flat_terrain_voxels;
         let chunk_pos = IVec3::ZERO;
-        let sdf = flat_terrain_sdf(chunk_pos);
+        let voxels = flat_terrain_voxels(chunk_pos);
 
-        // Voxel at y=-1 in chunk 0 should be solid (sdf = -1)
-        let voxel = sdf_to_voxel(&sdf, IVec3::new(0, -1, 0), chunk_pos);
+        let voxel = lookup_voxel_in_chunk(&voxels, IVec3::new(0, -1, 0), chunk_pos);
         assert_eq!(voxel, WorldVoxel::Solid(0));
 
-        // Voxel at y=5 in chunk 0 should be air (sdf = 5)
-        let voxel = sdf_to_voxel(&sdf, IVec3::new(0, 5, 0), chunk_pos);
+        let voxel = lookup_voxel_in_chunk(&voxels, IVec3::new(0, 5, 0), chunk_pos);
         assert_eq!(voxel, WorldVoxel::Air);
     }
 }
