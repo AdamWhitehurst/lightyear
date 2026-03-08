@@ -14,12 +14,12 @@ test-wasm = "make test-wasm"
 
 [build]
 incremental = true
+jobs = 8
 
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--cfg", "web_sys_unstable_apis",
     "-C", "target-feature=+reference-types",
-    "-C", "codegen-units=8",        # Reduce parallelism to lower peak RAM usage
     "-C", "opt-level=z",             # Optimize for size to reduce memory pressure
 ]
 

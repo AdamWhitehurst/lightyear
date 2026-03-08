@@ -1,4 +1,7 @@
 use ::client::network::{ClientNetworkConfig, ClientNetworkPlugin, ClientTransport};
+use ::server::map::{
+    handle_map_switch_requests, tick_transition_unfreeze, MapTransitioning, RoomRegistry,
+};
 use ::server::network::{ServerNetworkConfig, ServerNetworkPlugin, ServerTransport};
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
@@ -8,10 +11,13 @@ use lightyear::prelude::server as lightyear_server;
 use lightyear::prelude::*;
 use lightyear_client::*;
 use lightyear_server::*;
+use protocol::map::{MapChannel, MapSwitchTarget, MapTransitionStart, PlayerMapSwitchRequest};
 use protocol::*;
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use voxel_map_engine::prelude::{flat_terrain_voxels, VoxelMapConfig, VoxelMapInstance};
 
 /// Simplified test stepper for crossbeam transport testing
 /// Based on lightyear's ClientServerStepper pattern
@@ -37,6 +43,7 @@ impl CrossbeamTestStepper {
             tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
         });
         server_app.add_plugins(ProtocolPlugin);
+        server_app.add_plugins(lightyear::prelude::RoomPlugin);
 
         // Setup client app
         let mut client_app = App::new();
@@ -800,4 +807,245 @@ fn test_crossbeam_event_triggers() {
     );
 
     info!("✓ Event/trigger test passed!");
+}
+
+fn add_server_map_systems(stepper: &mut CrossbeamTestStepper) {
+    stepper.server_app.init_resource::<MapRegistry>();
+    stepper.server_app.init_resource::<RoomRegistry>();
+    stepper.server_app.init_resource::<MapWorld>();
+    stepper.server_app.add_systems(
+        Update,
+        (handle_map_switch_requests, tick_transition_unfreeze),
+    );
+}
+
+fn register_overworld_on_server(stepper: &mut CrossbeamTestStepper) -> Entity {
+    let map = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            VoxelMapInstance::new(3),
+            VoxelMapConfig::new(0, 1, None, 3, Arc::new(flat_terrain_voxels)),
+            Transform::default(),
+            MapInstanceId::Overworld,
+        ))
+        .id();
+    stepper
+        .server_app
+        .world_mut()
+        .resource_mut::<MapRegistry>()
+        .insert(MapInstanceId::Overworld, map);
+    map
+}
+
+fn spawn_server_character(stepper: &mut CrossbeamTestStepper, client_of_entity: Entity) -> Entity {
+    stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            CharacterMarker,
+            MapInstanceId::Overworld,
+            ControlledBy {
+                owner: client_of_entity,
+                lifetime: Default::default(),
+            },
+        ))
+        .id()
+}
+
+/// Verify the C2S→S2C map switch roundtrip: client sends `PlayerMapSwitchRequest`,
+/// server processes it, client receives `MapTransitionStart`.
+#[test]
+fn map_switch_request_triggers_transition_start() {
+    let mut stepper = CrossbeamTestStepper::new();
+
+    // Add map systems and resources before plugin init completes
+    add_server_map_systems(&mut stepper);
+    stepper
+        .client_app
+        .init_resource::<MessageBuffer<MapTransitionStart>>();
+    stepper
+        .client_app
+        .add_systems(Update, collect_messages::<MapTransitionStart>);
+
+    stepper.init();
+    stepper.wait_for_connection();
+
+    let overworld_map = register_overworld_on_server(&mut stepper);
+
+    // Add RemoteId to client_of_entity so handle_map_switch_requests can resolve the target map id
+    let client_of = stepper.client_of_entity;
+    stepper
+        .server_app
+        .world_mut()
+        .entity_mut(client_of)
+        .insert(RemoteId(PeerId::Netcode(42)));
+
+    let character = spawn_server_character(&mut stepper, client_of);
+
+    // Add character to overworld room via RoomRegistry
+    let overworld_room = stepper
+        .server_app
+        .world_mut()
+        .resource_mut::<RoomRegistry>()
+        .0
+        .get(&MapInstanceId::Overworld)
+        .copied();
+    if let Some(room) = overworld_room {
+        stepper.server_app.world_mut().trigger(RoomEvent {
+            room,
+            target: RoomTarget::AddEntity(character),
+        });
+    }
+
+    // Give character a ChunkTarget pointing at the overworld map
+    stepper.server_app.world_mut().entity_mut(character).insert(
+        voxel_map_engine::prelude::ChunkTarget::new(overworld_map, 4),
+    );
+
+    // Client sends map switch request (ClientToServer direction)
+    let client_entity = stepper.client_entity;
+    stepper
+        .client_app
+        .world_mut()
+        .entity_mut(client_entity)
+        .get_mut::<MessageSender<PlayerMapSwitchRequest>>()
+        .expect("client entity must have MessageSender<PlayerMapSwitchRequest>")
+        .send::<MapChannel>(PlayerMapSwitchRequest {
+            target: MapSwitchTarget::Homebase,
+        });
+
+    // Poll until character gets MapTransitioning (message delivery is async via crossbeam ticks)
+    let mut got_transitioning = false;
+    for _ in 0..30 {
+        stepper.tick_step(1);
+        if stepper
+            .server_app
+            .world()
+            .get::<MapTransitioning>(character)
+            .is_some()
+        {
+            got_transitioning = true;
+            break;
+        }
+    }
+    assert!(
+        got_transitioning,
+        "Character should have MapTransitioning marker after request"
+    );
+
+    // Poll until client receives MapTransitionStart
+    let mut got_message = false;
+    for _ in 0..10 {
+        stepper.tick_step(1);
+        if stepper
+            .client_app
+            .world()
+            .resource::<MessageBuffer<MapTransitionStart>>()
+            .messages
+            .len()
+            >= 1
+        {
+            got_message = true;
+            break;
+        }
+    }
+    assert!(got_message, "Client should receive MapTransitionStart");
+
+    let buffer = stepper
+        .client_app
+        .world()
+        .resource::<MessageBuffer<MapTransitionStart>>();
+    assert_eq!(
+        buffer.messages.len(),
+        1,
+        "Client should receive exactly one MapTransitionStart"
+    );
+    assert!(
+        matches!(buffer.messages[0].1.target, MapInstanceId::Homebase { .. }),
+        "Transition target should be a Homebase"
+    );
+}
+
+/// Verify the server ignores a second map switch request when the player is already transitioning.
+#[test]
+fn duplicate_switch_request_ignored() {
+    let mut stepper = CrossbeamTestStepper::new();
+
+    add_server_map_systems(&mut stepper);
+    stepper
+        .client_app
+        .init_resource::<MessageBuffer<MapTransitionStart>>();
+    stepper
+        .client_app
+        .add_systems(Update, collect_messages::<MapTransitionStart>);
+
+    stepper.init();
+    stepper.wait_for_connection();
+
+    register_overworld_on_server(&mut stepper);
+
+    let client_of = stepper.client_of_entity;
+    stepper
+        .server_app
+        .world_mut()
+        .entity_mut(client_of)
+        .insert(RemoteId(PeerId::Netcode(42)));
+
+    let client_entity = stepper.client_entity;
+    let character = spawn_server_character(&mut stepper, client_of);
+
+    // First request — should be processed (ClientToServer direction)
+    stepper
+        .client_app
+        .world_mut()
+        .entity_mut(client_entity)
+        .get_mut::<MessageSender<PlayerMapSwitchRequest>>()
+        .expect("client entity must have MessageSender<PlayerMapSwitchRequest>")
+        .send::<MapChannel>(PlayerMapSwitchRequest {
+            target: MapSwitchTarget::Homebase,
+        });
+
+    // Poll until MapTransitioning is applied — ensures deferred commands are flushed
+    // before sending the second request, so the guard check is reliable
+    let mut transitioning = false;
+    for _ in 0..30 {
+        stepper.tick_step(1);
+        if stepper
+            .server_app
+            .world()
+            .get::<MapTransitioning>(character)
+            .is_some()
+        {
+            transitioning = true;
+            break;
+        }
+    }
+    assert!(
+        transitioning,
+        "Character must be MapTransitioning before sending duplicate request"
+    );
+
+    // Second request while already transitioning — should be ignored
+    stepper
+        .client_app
+        .world_mut()
+        .entity_mut(client_entity)
+        .get_mut::<MessageSender<PlayerMapSwitchRequest>>()
+        .expect("client entity must have MessageSender<PlayerMapSwitchRequest>")
+        .send::<MapChannel>(PlayerMapSwitchRequest {
+            target: MapSwitchTarget::Homebase,
+        });
+
+    stepper.tick_step(10);
+
+    let buffer = stepper
+        .client_app
+        .world()
+        .resource::<MessageBuffer<MapTransitionStart>>();
+    assert_eq!(
+        buffer.messages.len(),
+        1,
+        "Client should receive only one MapTransitionStart; duplicate request must be ignored"
+    );
 }

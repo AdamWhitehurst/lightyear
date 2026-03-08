@@ -1,19 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use avian3d::prelude::RigidBodyDisabled;
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use lightyear::prelude::{
-    Connected, MessageReceiver, MessageSender, NetworkTarget, Room, RoomEvent, RoomTarget, Server,
-    ServerMultiMessageSender,
+    Connected, ControlledBy, DisableRollback, MessageReceiver, MessageSender, NetworkTarget,
+    RemoteId, Room, RoomEvent, RoomTarget, Server, ServerMultiMessageSender,
 };
+use protocol::map::{MapChannel, MapSwitchTarget, MapTransitionStart, PlayerMapSwitchRequest};
 use protocol::{
-    MapInstanceId, MapRegistry, MapWorld, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest,
-    VoxelStateSync, VoxelType,
+    CharacterMarker, MapInstanceId, MapRegistry, MapWorld, VoxelChannel, VoxelEditBroadcast,
+    VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 use serde::{Deserialize, Serialize};
 use voxel_map_engine::prelude::{
-    flat_terrain_voxels, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld, WorldVoxel,
+    flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
+    WorldVoxel,
 };
 
 /// Plugin managing server-side voxel map functionality
@@ -32,6 +35,14 @@ impl RoomRegistry {
         })
     }
 }
+
+/// Marker: player is currently transitioning maps. Prevents double-transitions.
+#[derive(Component)]
+pub struct MapTransitioning;
+
+/// Timer-based unfreeze until client confirmation is implemented.
+#[derive(Component)]
+pub struct TransitionUnfreezeTimer(pub Timer);
 
 /// Resource tracking the primary overworld map entity.
 #[derive(Resource)]
@@ -61,7 +72,7 @@ fn load_voxel_world(
     overworld: Res<OverworldMap>,
     mut voxel_world: VoxelWorld,
 ) {
-    let loaded_mods = load_voxel_world_from_disk_at(&map_world, &save_path.0);
+    let loaded_mods = load_voxel_world_from_disk_at(&*map_world, &save_path.0);
 
     if loaded_mods.is_empty() {
         return;
@@ -96,7 +107,7 @@ fn save_voxel_world_debounced(
 
     if should_save {
         if let Err(e) =
-            save_voxel_world_to_disk_at(&modifications.modifications, &map_world, &save_path.0)
+            save_voxel_world_to_disk_at(&modifications.modifications, &*map_world, &save_path.0)
         {
             error!("Failed to save voxel world: {}", e);
         }
@@ -121,7 +132,7 @@ pub fn save_voxel_world_on_shutdown(
     if dirty_state.is_dirty {
         info!("Saving voxel world on shutdown...");
         if let Err(e) =
-            save_voxel_world_to_disk_at(&modifications.modifications, &map_world, &save_path.0)
+            save_voxel_world_to_disk_at(&modifications.modifications, &*map_world, &save_path.0)
         {
             error!("Failed to save voxel world on shutdown: {}", e);
         }
@@ -158,7 +169,12 @@ impl Plugin for ServerMapPlugin {
             .add_systems(Startup, (spawn_overworld, load_voxel_world).chain())
             .add_systems(
                 Update,
-                (handle_voxel_edit_requests, protocol::attach_chunk_colliders),
+                (
+                    handle_voxel_edit_requests,
+                    handle_map_switch_requests,
+                    tick_transition_unfreeze,
+                    protocol::attach_chunk_colliders,
+                ),
             )
             .add_systems(Update, save_voxel_world_debounced)
             .add_systems(Last, save_voxel_world_on_shutdown)
@@ -389,4 +405,189 @@ fn send_initial_voxel_state(
     message_sender.send::<VoxelChannel>(VoxelStateSync {
         modifications: modifications.modifications.clone(),
     });
+}
+
+pub fn handle_map_switch_requests(
+    mut commands: Commands,
+    mut receivers: Query<(Entity, &mut MessageReceiver<PlayerMapSwitchRequest>)>,
+    mut senders: Query<&mut MessageSender<MapTransitionStart>>,
+    controlled_query: Query<(Entity, &ControlledBy, &MapInstanceId), With<CharacterMarker>>,
+    transitioning: Query<(), With<MapTransitioning>>,
+    remote_ids: Query<&RemoteId>,
+    mut registry: ResMut<MapRegistry>,
+    mut room_registry: ResMut<RoomRegistry>,
+    map_world: Res<MapWorld>,
+) {
+    for (client_entity, mut receiver) in &mut receivers {
+        for request in receiver.receive() {
+            let (player_entity, _controlled_by, current_map_id) = controlled_query
+                .iter()
+                .find(|(_, ctrl, _)| ctrl.owner == client_entity)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "No character entity found for client {client_entity:?} during map switch"
+                    )
+                });
+
+            if transitioning.get(player_entity).is_ok() {
+                warn!("Player {player_entity:?} already transitioning, ignoring request");
+                continue;
+            }
+
+            let remote_id = remote_ids
+                .get(client_entity)
+                .expect("Client entity must have RemoteId during map switch");
+            let target_map_id = resolve_switch_target(&request.target, remote_id.0.to_bits());
+
+            if *current_map_id == target_map_id {
+                warn!("Player {player_entity:?} already on target map {target_map_id:?}");
+                continue;
+            }
+
+            execute_server_transition(
+                &mut commands,
+                player_entity,
+                client_entity,
+                current_map_id,
+                &target_map_id,
+                &mut *registry,
+                &mut *room_registry,
+                &*map_world,
+                &mut senders,
+            );
+        }
+    }
+}
+
+/// Resolves a `MapSwitchTarget` to a `MapInstanceId` using the client's stable PeerId bits.
+fn resolve_switch_target(target: &MapSwitchTarget, client_id_bits: u64) -> MapInstanceId {
+    match target {
+        MapSwitchTarget::Overworld => MapInstanceId::Overworld,
+        MapSwitchTarget::Homebase => MapInstanceId::Homebase {
+            owner: client_id_bits,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_server_transition(
+    commands: &mut Commands,
+    player_entity: Entity,
+    client_entity: Entity,
+    current_map_id: &MapInstanceId,
+    target_map_id: &MapInstanceId,
+    registry: &mut MapRegistry,
+    room_registry: &mut RoomRegistry,
+    map_world: &MapWorld,
+    senders: &mut Query<&mut MessageSender<MapTransitionStart>>,
+) {
+    info!("Transitioning player {player_entity:?} from {current_map_id:?} to {target_map_id:?}");
+
+    commands
+        .entity(player_entity)
+        .insert((RigidBodyDisabled, DisableRollback, MapTransitioning));
+
+    let old_room = room_registry.get_or_create(current_map_id, commands);
+    let new_room = room_registry.get_or_create(target_map_id, commands);
+
+    commands.trigger(RoomEvent {
+        room: old_room,
+        target: RoomTarget::RemoveEntity(player_entity),
+    });
+    commands.trigger(RoomEvent {
+        room: old_room,
+        target: RoomTarget::RemoveSender(client_entity),
+    });
+    commands.trigger(RoomEvent {
+        room: new_room,
+        target: RoomTarget::AddEntity(player_entity),
+    });
+    commands.trigger(RoomEvent {
+        room: new_room,
+        target: RoomTarget::AddSender(client_entity),
+    });
+
+    commands.entity(player_entity).insert(target_map_id.clone());
+
+    let map_entity = ensure_map_exists(commands, target_map_id, registry, map_world);
+    commands
+        .entity(player_entity)
+        .insert(ChunkTarget::new(map_entity, 4));
+
+    commands.entity(player_entity).insert((
+        avian3d::prelude::Position(Vec3::new(0.0, 30.0, 0.0)),
+        avian3d::prelude::LinearVelocity(Vec3::ZERO),
+    ));
+
+    let (seed, bounds) = match target_map_id {
+        MapInstanceId::Overworld => (map_world.seed, None),
+        MapInstanceId::Homebase { owner } => (*owner, Some(IVec3::new(4, 4, 4))),
+    };
+
+    let mut sender = senders
+        .get_mut(client_entity)
+        .expect("Client entity must have MessageSender<MapTransitionStart>");
+    sender.send::<MapChannel>(MapTransitionStart {
+        target: target_map_id.clone(),
+        seed,
+        generation_version: map_world.generation_version,
+        bounds,
+    });
+
+    commands
+        .entity(player_entity)
+        .insert(TransitionUnfreezeTimer(Timer::from_seconds(
+            3.0,
+            TimerMode::Once,
+        )));
+}
+
+fn ensure_map_exists(
+    commands: &mut Commands,
+    map_id: &MapInstanceId,
+    registry: &mut MapRegistry,
+    _map_world: &MapWorld,
+) -> Entity {
+    if let Some(&entity) = registry.0.get(map_id) {
+        return entity;
+    }
+
+    match map_id {
+        MapInstanceId::Overworld => {
+            panic!("Overworld must already be registered in MapRegistry");
+        }
+        MapInstanceId::Homebase { owner } => {
+            let bounds = IVec3::new(4, 4, 4);
+            let entity = commands
+                .spawn((
+                    VoxelMapInstance::new(3),
+                    VoxelMapConfig::new(*owner, 4, Some(bounds), 3, Arc::new(flat_terrain_voxels)),
+                    Transform::default(),
+                    map_id.clone(),
+                ))
+                .id();
+            registry.insert(map_id.clone(), entity);
+            info!("Spawned server homebase for owner {owner}: {entity:?}");
+            entity
+        }
+    }
+}
+
+pub fn tick_transition_unfreeze(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut TransitionUnfreezeTimer)>,
+) {
+    for (entity, mut timer) in &mut query {
+        timer.0.tick(time.delta());
+        if timer.0.is_finished() {
+            info!("Unfreezing player {entity:?} after transition timer");
+            commands.entity(entity).remove::<(
+                RigidBodyDisabled,
+                DisableRollback,
+                MapTransitioning,
+                TransitionUnfreezeTimer,
+            )>();
+        }
+    }
 }

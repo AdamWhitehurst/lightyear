@@ -12,7 +12,8 @@ pub struct Overworld;
 /// Marker: this map is a player's homebase.
 #[derive(Component)]
 pub struct Homebase {
-    pub owner: Entity,
+    /// PeerId bits — using u64 because voxel_map_engine doesn't depend on lightyear.
+    pub owner: u64,
 }
 
 /// Marker: this map is a competition arena.
@@ -54,7 +55,7 @@ impl VoxelMapInstance {
 
     /// Bundle for a player's bounded homebase map.
     pub fn homebase(
-        owner: Entity,
+        owner_id: u64,
         bounds: IVec3,
         generator: VoxelGenerator,
     ) -> (Self, VoxelMapConfig, Homebase) {
@@ -63,13 +64,13 @@ impl VoxelMapInstance {
         (
             Self::new(tree_height),
             VoxelMapConfig::new(
-                seed_from_entity(owner),
+                seed_from_id(owner_id),
                 spawning_distance,
                 Some(bounds),
                 tree_height,
                 generator,
             ),
-            Homebase { owner },
+            Homebase { owner: owner_id },
         )
     }
 
@@ -100,8 +101,8 @@ fn bounds_to_spawning_distance(bounds: IVec3) -> u32 {
     bounds.max_element().max(1) as u32
 }
 
-fn seed_from_entity(entity: Entity) -> u64 {
-    entity.to_bits()
+fn seed_from_id(id: u64) -> u64 {
+    id
 }
 
 #[cfg(test)]
@@ -154,15 +155,15 @@ mod tests {
 
     #[test]
     fn homebase_bundle_has_correct_config() {
-        let owner = Entity::from_bits(7);
+        let owner_id: u64 = 7;
         let bounds = IVec3::new(4, 8, 6);
         let (instance, config, marker) =
-            VoxelMapInstance::homebase(owner, bounds, dummy_generator());
-        assert_eq!(config.seed, owner.to_bits());
+            VoxelMapInstance::homebase(owner_id, bounds, dummy_generator());
+        assert_eq!(config.seed, owner_id);
         assert_eq!(config.tree_height, 3);
         assert_eq!(config.spawning_distance, 8);
         assert_eq!(config.bounds, Some(bounds));
-        assert_eq!(marker.owner, owner);
+        assert_eq!(marker.owner, owner_id);
         assert!(instance.loaded_chunks.is_empty());
     }
 

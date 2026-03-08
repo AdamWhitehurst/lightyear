@@ -6,9 +6,10 @@ use bevy::prelude::*;
 pub use components::*;
 use lightyear::netcode::Key;
 use lightyear::prelude::client::*;
-use lightyear::prelude::Authentication;
-use protocol::{PRIVATE_KEY, PROTOCOL_ID};
-pub use state::ClientState;
+use lightyear::prelude::{Authentication, MessageSender, Predicted};
+use protocol::map::{MapChannel, MapSwitchTarget, PlayerMapSwitchRequest};
+use protocol::{CharacterMarker, MapInstanceId, PRIVATE_KEY, PROTOCOL_ID};
+pub use state::{ClientState, MapTransitionState};
 use std::net::SocketAddr;
 
 /// Lightweight client config for UI - mirrors essential fields from client::ClientNetworkConfig
@@ -44,6 +45,12 @@ impl Plugin for UiPlugin {
         // Initialize state management
         app.init_state::<ClientState>();
 
+        app.add_sub_state::<MapTransitionState>();
+        app.add_systems(
+            OnEnter(MapTransitionState::Transitioning),
+            setup_transition_loading_screen,
+        );
+
         // State transition systems
         app.add_systems(
             OnEnter(ClientState::Connecting),
@@ -70,7 +77,12 @@ impl Plugin for UiPlugin {
         app.add_systems(OnEnter(ClientState::InGame), setup_ingame_hud);
         app.add_systems(
             Update,
-            ingame_button_interaction.run_if(in_state(ClientState::InGame)),
+            (
+                ingame_button_interaction,
+                map_switch_button_interaction,
+                update_map_switch_button_label,
+            )
+                .run_if(in_state(ClientState::InGame)),
         );
 
         info!("UiPlugin initialized");
@@ -328,6 +340,33 @@ fn setup_ingame_hud(mut commands: Commands) {
             DespawnOnExit(ClientState::InGame),
         ))
         .with_children(|parent| {
+            // Map Switch Button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        width: Val::Px(150.0),
+                        height: Val::Px(50.0),
+                        border: UiRect::all(Val::Px(3.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgba(0.2, 0.2, 0.2, 0.8)),
+                    MapSwitchButton,
+                ))
+                .with_children(|parent| {
+                    parent.spawn((
+                        Text::new("Homebase"),
+                        TextFont {
+                            font_size: 24.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
             // Main Menu Button
             parent
                 .spawn((
@@ -422,4 +461,87 @@ fn ingame_button_interaction(
             exit_writer.write(AppExit::Success);
         }
     }
+}
+
+fn map_switch_button_interaction(
+    switch_query: Query<&Interaction, (Changed<Interaction>, With<MapSwitchButton>)>,
+    player_query: Query<&MapInstanceId, (With<Predicted>, With<CharacterMarker>)>,
+    mut senders: Query<&mut MessageSender<PlayerMapSwitchRequest>>,
+    transition_state: Res<State<MapTransitionState>>,
+) {
+    if *transition_state.get() == MapTransitionState::Transitioning {
+        return;
+    }
+
+    for interaction in &switch_query {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+
+        let current_map = player_query
+            .single()
+            .expect("Predicted player must exist when pressing map switch button");
+
+        let target = match current_map {
+            MapInstanceId::Overworld => MapSwitchTarget::Homebase,
+            MapInstanceId::Homebase { .. } => MapSwitchTarget::Overworld,
+        };
+
+        info!("Map switch button pressed, requesting {target:?}");
+        for mut sender in &mut senders {
+            sender.send::<MapChannel>(PlayerMapSwitchRequest {
+                target: target.clone(),
+            });
+        }
+    }
+}
+
+fn update_map_switch_button_label(
+    player_query: Query<&MapInstanceId, (With<Predicted>, With<CharacterMarker>)>,
+    button_query: Query<&Children, With<MapSwitchButton>>,
+    mut text_query: Query<&mut Text>,
+) {
+    let Ok(map_id) = player_query.single() else {
+        return;
+    };
+    let Ok(children) = button_query.single() else {
+        return;
+    };
+
+    let label = match map_id {
+        MapInstanceId::Overworld => "Homebase",
+        MapInstanceId::Homebase { .. } => "Overworld",
+    };
+
+    for child in children.iter() {
+        if let Ok(mut text) = text_query.get_mut(child) {
+            text.0 = label.to_string();
+        }
+    }
+}
+
+fn setup_transition_loading_screen(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+            GlobalZIndex(100),
+            DespawnOnExit(MapTransitionState::Transitioning),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Loading..."),
+                TextFont {
+                    font_size: 48.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+        });
 }

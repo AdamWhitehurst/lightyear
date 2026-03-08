@@ -15,3 +15,7 @@ pub struct MainMenuButton;
 /// Marker for Cancel button in connecting screen
 #[derive(Component)]
 pub struct CancelButton;
+
+/// Marker for the map switch toggle button in in-game HUD
+#[derive(Component)]
+pub struct MapSwitchButton;

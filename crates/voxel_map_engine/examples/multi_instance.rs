@@ -66,11 +66,8 @@ fn spawn_overworld(commands: &mut Commands) -> Entity {
 }
 
 fn spawn_homebase(commands: &mut Commands) -> Entity {
-    let (mut instance, config, marker) = VoxelMapInstance::homebase(
-        Entity::PLACEHOLDER,
-        IVec3::new(8, 4, 8),
-        Arc::new(raised_terrain_voxels),
-    );
+    let (mut instance, config, marker) =
+        VoxelMapInstance::homebase(0, IVec3::new(8, 4, 8), Arc::new(raised_terrain_voxels));
     instance.debug_colors = true;
     commands
         .spawn((

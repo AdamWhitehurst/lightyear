@@ -100,6 +100,30 @@ pub struct VoxelStateSync {
     pub modifications: Vec<(IVec3, VoxelType)>,
 }
 
+/// Channel for map transition messages
+pub struct MapChannel;
+
+/// Client requests to switch maps
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Reflect, Message)]
+pub struct PlayerMapSwitchRequest {
+    pub target: MapSwitchTarget,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub enum MapSwitchTarget {
+    Overworld,
+    Homebase,
+}
+
+/// Server tells client to begin transition
+#[derive(Serialize, Deserialize, Clone, Debug, Reflect, Message)]
+pub struct MapTransitionStart {
+    pub target: MapInstanceId,
+    pub seed: u64,
+    pub generation_version: u32,
+    pub bounds: Option<IVec3>,
+}
+
 /// Attaches trimesh colliders to voxel chunks whenever their mesh changes.
 /// Inherits `MapInstanceId` from the parent map entity.
 pub fn attach_chunk_colliders(

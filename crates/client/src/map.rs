@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
+use avian3d::prelude::RigidBodyDisabled;
 use bevy::{prelude::*, window::PrimaryWindow};
 use leafwing_input_manager::prelude::*;
-use lightyear::prelude::{Controlled, MessageReceiver, MessageSender, Predicted};
+use lightyear::prelude::{Controlled, DisableRollback, MessageReceiver, MessageSender, Predicted};
+use protocol::map::MapTransitionStart;
 use protocol::{
     CharacterMarker, MapInstanceId, MapRegistry, MapWorld, PlayerActions, VoxelChannel,
     VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
+use ui::MapTransitionState;
 use voxel_map_engine::prelude::{
-    flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
-    WorldVoxel,
+    flat_terrain_voxels, ChunkTarget, PendingChunks, VoxelMapConfig, VoxelMapInstance, VoxelPlugin,
+    VoxelWorld, WorldVoxel,
 };
 
 const RAYCAST_MAX_DISTANCE: f32 = 100.0;
@@ -35,6 +38,11 @@ impl Plugin for ClientMapPlugin {
             .add_systems(
                 PostUpdate,
                 handle_voxel_input.after(TransformSystems::Propagate),
+            )
+            .add_systems(Update, handle_map_transition_start)
+            .add_systems(
+                Update,
+                check_transition_chunks_loaded.run_if(in_state(MapTransitionState::Transitioning)),
             );
     }
 }
@@ -174,4 +182,121 @@ pub fn send_voxel_edit(
         debug!("Sending voxel edit request to server: {:?}", position);
         sender.send::<VoxelChannel>(VoxelEditRequest { position, voxel });
     }
+}
+
+/// Tracks which map we're transitioning to
+#[derive(Resource)]
+pub struct PendingTransition(pub MapInstanceId);
+
+fn handle_map_transition_start(
+    mut commands: Commands,
+    mut receivers: Query<&mut MessageReceiver<MapTransitionStart>>,
+    mut next_transition: ResMut<NextState<MapTransitionState>>,
+    mut registry: ResMut<MapRegistry>,
+    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>)>,
+) {
+    for mut receiver in &mut receivers {
+        for transition in receiver.receive() {
+            info!("Received MapTransitionStart for {:?}", transition.target);
+
+            let player = player_query
+                .single()
+                .expect("Predicted player must exist when receiving MapTransitionStart");
+            commands
+                .entity(player)
+                .insert((RigidBodyDisabled, DisableRollback));
+
+            if !registry.0.contains_key(&transition.target) {
+                let generator = generator_for_map(&transition.target);
+                let map_entity = spawn_map_instance(
+                    &mut commands,
+                    &transition.target,
+                    transition.seed,
+                    transition.bounds,
+                    generator,
+                );
+                registry.insert(transition.target.clone(), map_entity);
+            }
+
+            let map_entity = registry.get(&transition.target);
+            commands
+                .entity(player)
+                .insert(ChunkTarget::new(map_entity, 4));
+
+            next_transition.set(MapTransitionState::Transitioning);
+            commands.insert_resource(PendingTransition(transition.target.clone()));
+        }
+    }
+}
+
+fn generator_for_map(
+    map_id: &MapInstanceId,
+) -> Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync> {
+    match map_id {
+        MapInstanceId::Overworld => Arc::new(flat_terrain_voxels),
+        MapInstanceId::Homebase { .. } => Arc::new(flat_terrain_voxels),
+    }
+}
+
+fn spawn_map_instance(
+    commands: &mut Commands,
+    map_id: &MapInstanceId,
+    seed: u64,
+    bounds: Option<IVec3>,
+    generator: Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync>,
+) -> Entity {
+    let tree_height = match map_id {
+        MapInstanceId::Overworld => 5,
+        MapInstanceId::Homebase { .. } => 3,
+    };
+    let spawning_distance = bounds.map(|b| b.max_element().max(1) as u32).unwrap_or(10);
+
+    let entity = commands
+        .spawn((
+            VoxelMapInstance::new(tree_height),
+            VoxelMapConfig::new(seed, spawning_distance, bounds, tree_height, generator),
+            Transform::default(),
+            map_id.clone(),
+        ))
+        .id();
+
+    info!("Spawned client map instance for {map_id:?}: {entity:?}");
+    entity
+}
+
+pub fn check_transition_chunks_loaded(
+    mut commands: Commands,
+    pending: Option<Res<PendingTransition>>,
+    registry: Res<MapRegistry>,
+    maps: Query<(&VoxelMapInstance, &PendingChunks)>,
+    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>)>,
+    mut next_transition: ResMut<NextState<MapTransitionState>>,
+) {
+    let Some(pending) = pending else { return };
+    let map_entity = registry.get(&pending.0);
+    let (map, pending_chunks) = maps
+        .get(map_entity)
+        .expect("Pending transition map must exist in ECS");
+
+    if map.loaded_chunks.is_empty()
+        || !pending_chunks.tasks.is_empty()
+        || !pending_chunks.pending_positions.is_empty()
+    {
+        return;
+    }
+
+    info!(
+        "Transition chunks loaded for {:?}, resuming play",
+        pending.0
+    );
+
+    let player = player_query
+        .single()
+        .expect("Predicted player must exist when completing transition");
+    commands
+        .entity(player)
+        .remove::<(RigidBodyDisabled, DisableRollback)>();
+
+    next_transition.set(MapTransitionState::Playing);
+    commands.remove_resource::<PendingTransition>();
 }

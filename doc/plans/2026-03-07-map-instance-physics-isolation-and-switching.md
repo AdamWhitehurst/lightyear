@@ -1384,8 +1384,8 @@ fn client_transitions_to_playing_after_chunks_load() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-native`
-- [ ] `cargo check-all` passes
+- [x] All tests pass: `cargo test-native`
+- [x] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
 
@@ -1840,3 +1840,16 @@ Every `expect()` message in the plan describes the invariant being violated. The
 - HUD buttons: [crates/ui/src/lib.rs:312-425](crates/ui/src/lib.rs#L312-L425)
 - UI components: [crates/ui/src/components.rs](crates/ui/src/components.rs)
 - ClientState: [crates/ui/src/state.rs:4-13](crates/ui/src/state.rs#L4-L13)
+
+
+## Deviations from Plan
+All deviations resolved:
+1. ~~No client-side integration tests~~ — Fixed: `crates/client/tests/map_transition.rs` created with `stays_transitioning_while_chunks_loading` and `transitions_to_playing_after_chunks_load` tests.
+2. ~~No CrossbeamTestStepper roundtrip test~~ — Fixed: `map_switch_request_triggers_transition_start` and `duplicate_switch_request_ignored` added to `crates/server/tests/integration.rs`.
+3. ~~resolve_switch_target uses Entity::to_bits()~~ — Fixed: now uses `RemoteId(PeerId).to_bits()` (stable netcode client ID).
+4. Minor: `timer.0.is_finished()` — kept as-is; is the newer Bevy API, functionally equivalent.
+
+## Potential Issues (Resolved)
+1. ~~Homebase owner identity~~ — Resolved by deviation #3 fix. Homebase owner is now PeerId::Netcode bits (stable per client_id at connection time).
+2. ~~No DespawnOnExit import verification~~ — Verified working via UI tests.
+3. check_transition_chunks_loaded race — Accepted limitation. The `loaded_chunks.is_empty()` guard prevents false-positive completion. The 3-second server-side timer is a safety net. See research doc Section 19.
