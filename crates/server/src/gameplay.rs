@@ -67,6 +67,7 @@ fn spawn_dummy_target(mut commands: Commands, overworld: Res<OverworldMap>) {
         CharacterPhysicsBundle::default(),
         ColorComponent(css::GRAY.into()),
         CharacterMarker,
+        MapInstanceId::Overworld,
         Health::new(100.0),
         ChunkTarget::new(overworld.0, 1),
         DummyTarget,
@@ -76,6 +77,7 @@ fn spawn_dummy_target(mut commands: Commands, overworld: Res<OverworldMap>) {
 fn handle_character_movement(
     time: Res<Time>,
     spatial_query: SpatialQuery,
+    map_ids: Query<&MapInstanceId>,
     mut query: Query<
         (
             Entity,
@@ -83,11 +85,12 @@ fn handle_character_movement(
             &ComputedMass,
             &Position,
             Forces,
+            Option<&MapInstanceId>,
         ),
         With<CharacterMarker>,
     >,
 ) {
-    for (entity, action_state, mass, position, mut forces) in &mut query {
+    for (entity, action_state, mass, position, mut forces, player_map_id) in &mut query {
         apply_movement(
             entity,
             mass,
@@ -96,6 +99,8 @@ fn handle_character_movement(
             action_state,
             position,
             &mut forces,
+            player_map_id,
+            &map_ids,
         );
     }
 }
@@ -201,6 +206,7 @@ fn handle_connected(
         CharacterPhysicsBundle::default(),
         ColorComponent(color.into()),
         CharacterMarker,
+        MapInstanceId::Overworld,
         Health::new(100.0),
         AbilityCooldowns::default(),
         ChunkTarget::new(overworld.0, 4),

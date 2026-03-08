@@ -10,6 +10,7 @@ pub mod ability;
 pub mod app_state;
 pub mod hit_detection;
 pub mod map;
+pub mod physics;
 
 pub use ability::{
     ability_action_to_slot, AbilityBulletOf, AbilityBullets, AbilityCooldowns, AbilityDef,
@@ -24,8 +25,8 @@ pub use hit_detection::{
     terrain_collision_layers, GameLayer,
 };
 pub use map::{
-    attach_chunk_colliders, ChunkTarget, MapWorld, VoxelChannel, VoxelChunk, VoxelEditBroadcast,
-    VoxelEditRequest, VoxelStateSync, VoxelType,
+    attach_chunk_colliders, ChunkTarget, MapInstanceId, MapRegistry, MapWorld, VoxelChannel,
+    VoxelChunk, VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 
 pub const PROTOCOL_ID: u64 = 0;
@@ -166,6 +167,9 @@ impl Plugin for ProtocolPlugin {
         // Voxel map components
         app.register_component::<ChunkTarget>().add_map_entities();
 
+        // Map instance identity
+        app.register_component::<MapInstanceId>();
+
         // Marker components
         app.register_component::<PlayerId>();
         app.register_component::<ColorComponent>().add_prediction();
@@ -241,6 +245,7 @@ impl Plugin for SharedGameplayPlugin {
 
         app.add_plugins(
             PhysicsPlugins::default()
+                .with_collision_hooks::<physics::MapCollisionHooks>()
                 .build()
                 .disable::<PhysicsTransformPlugin>()
                 .disable::<PhysicsInterpolationPlugin>()
@@ -301,6 +306,8 @@ pub fn apply_movement(
     action_state: &ActionState<PlayerActions>,
     position: &Position,
     forces: &mut ForcesItem,
+    player_map_id: Option<&MapInstanceId>,
+    map_ids: &Query<&MapInstanceId>,
 ) {
     const MAX_SPEED: f32 = 10.0;
     const MAX_ACCELERATION: f32 = 40.0;
@@ -311,10 +318,20 @@ pub fn apply_movement(
     if action_state.just_pressed(&PlayerActions::Jump) {
         let ray_cast_origin = position.0;
 
-        let filter = &SpatialQueryFilter::from_excluded_entities([entity]);
+        let filter = SpatialQueryFilter::from_excluded_entities([entity]);
 
         if spatial_query
-            .cast_ray(ray_cast_origin, Dir3::NEG_Y, 4.0, false, filter)
+            .cast_ray_predicate(
+                ray_cast_origin,
+                Dir3::NEG_Y,
+                4.0,
+                false,
+                &filter,
+                &|hit_entity| match (player_map_id, map_ids.get(hit_entity).ok()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                },
+            )
             .is_some()
         {
             forces.apply_linear_impulse(Vec3::new(0.0, 400.0, 0.0));

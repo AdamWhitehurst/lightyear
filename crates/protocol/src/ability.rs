@@ -21,6 +21,7 @@ use bevy::asset::LoadedFolder;
 use crate::hit_detection::{
     hitbox_collision_layers, MELEE_HITBOX_HALF_EXTENTS, MELEE_HITBOX_OFFSET,
 };
+use crate::map::MapInstanceId;
 use crate::{PlayerActions, PlayerId};
 
 const PROJECTILE_SPAWN_OFFSET: f32 = 3.0;
@@ -1006,7 +1007,7 @@ pub fn apply_on_tick_effects(
         &ActiveAbility,
         Option<&OnHitEffects>,
     )>,
-    mut caster_query: Query<(&mut Position, &Rotation)>,
+    mut caster_query: Query<(&mut Position, &Rotation, &MapInstanceId)>,
 ) {
     let tick = timeline.tick();
     for (entity, effects, active, on_hit_effects) in &query {
@@ -1099,9 +1100,9 @@ fn spawn_melee_hitbox(
     ability_entity: Entity,
     active: &ActiveAbility,
     on_hit_effects: Option<&OnHitEffects>,
-    caster_query: &Query<(&mut Position, &Rotation)>,
+    caster_query: &Query<(&mut Position, &Rotation, &MapInstanceId)>,
 ) {
-    let Ok((caster_pos, caster_rot)) = caster_query.get(active.caster) else {
+    let Ok((caster_pos, caster_rot, caster_map_id)) = caster_query.get(active.caster) else {
         warn!(
             "Melee hitbox spawn: caster {:?} missing Position/Rotation",
             active.caster
@@ -1133,6 +1134,7 @@ fn spawn_melee_hitbox(
     if let Some(on_hit) = on_hit_effects {
         cmd.insert(on_hit.clone());
     }
+    cmd.insert(caster_map_id.clone());
 }
 
 fn spawn_aoe_hitbox(
@@ -1140,13 +1142,13 @@ fn spawn_aoe_hitbox(
     ability_entity: Entity,
     active: &ActiveAbility,
     on_hit_effects: Option<&OnHitEffects>,
-    caster_query: &Query<(&mut Position, &Rotation)>,
+    caster_query: &Query<(&mut Position, &Rotation, &MapInstanceId)>,
     radius: f32,
     spawn_tick: Tick,
     duration_ticks: u16,
 ) {
     info!("Spawning AoE hitbox with {duration_ticks:?} lifetime");
-    let Ok((caster_pos, caster_rot)) = caster_query.get(active.caster) else {
+    let Ok((caster_pos, caster_rot, caster_map_id)) = caster_query.get(active.caster) else {
         warn!(
             "AoE hitbox spawn: caster {:?} missing Position/Rotation",
             active.caster
@@ -1175,6 +1177,7 @@ fn spawn_aoe_hitbox(
     if let Some(on_hit) = on_hit_effects {
         cmd.insert(on_hit.clone());
     }
+    cmd.insert(caster_map_id.clone());
 }
 
 /// Apply WhileActive effects each tick (e.g. SetVelocity for dashes).
@@ -1324,11 +1327,11 @@ pub fn apply_on_input_effects(
 }
 
 fn apply_teleport(
-    caster_query: &mut Query<(&mut Position, &Rotation)>,
+    caster_query: &mut Query<(&mut Position, &Rotation, &MapInstanceId)>,
     caster: Entity,
     distance: f32,
 ) {
-    if let Ok((mut position, rotation)) = caster_query.get_mut(caster) {
+    if let Ok((mut position, rotation, _)) = caster_query.get_mut(caster) {
         let direction = facing_direction(rotation);
         position.0 += direction * distance;
     } else {
@@ -1397,13 +1400,13 @@ pub fn ability_projectile_spawn(
         &ActiveAbility,
         Option<&OnHitEffects>,
     )>,
-    caster_query: Query<(&Position, &Rotation)>,
+    caster_query: Query<(&Position, &Rotation, &MapInstanceId)>,
     server_query: Query<&ControlledBy>,
 ) {
     let tick = timeline.tick();
 
     for (ability_entity, request, active, on_hit_effects) in &query {
-        let Ok((position, rotation)) = caster_query.get(active.caster) else {
+        let Ok((position, rotation, caster_map_id)) = caster_query.get(active.caster) else {
             warn!(
                 "Projectile spawn: caster {:?} missing Position/Rotation",
                 active.caster
@@ -1431,6 +1434,7 @@ pub fn ability_projectile_spawn(
         if let Some(on_hit) = on_hit_effects {
             cmd.insert(on_hit.clone());
         }
+        cmd.insert(caster_map_id.clone());
 
         if let Ok(controlled_by) = server_query.get(active.caster) {
             cmd.insert((
@@ -1450,11 +1454,16 @@ pub fn ability_projectile_spawn(
 pub fn handle_ability_projectile_spawn(
     mut commands: Commands,
     spawn_query: Query<
-        (Entity, &AbilityProjectileSpawn, Option<&OnHitEffects>),
+        (
+            Entity,
+            &AbilityProjectileSpawn,
+            Option<&OnHitEffects>,
+            &MapInstanceId,
+        ),
         Without<AbilityBullets>,
     >,
 ) {
-    for (spawn_entity, spawn_info, on_hit_effects) in &spawn_query {
+    for (spawn_entity, spawn_info, on_hit_effects, spawn_map_id) in &spawn_query {
         info!("Spawning ability bullet from {:?}", spawn_info.ability_id);
         let mut bullet_cmd = commands.spawn((
             Position(spawn_info.position),
@@ -1473,6 +1482,7 @@ pub fn handle_ability_projectile_spawn(
         if let Some(on_hit) = on_hit_effects {
             bullet_cmd.insert(on_hit.clone());
         }
+        bullet_cmd.insert(spawn_map_id.clone());
     }
 }
 

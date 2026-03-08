@@ -587,8 +587,70 @@ The ability system runs in `FixedUpdate` at a fixed tick rate. Animations run in
 
 If an ability's startup is 3 ticks at 64Hz = ~47ms, the animation clip for that ability's startup should be authored to roughly match that duration. But exact synchronization isn't needed — the animation is cosmetic, the hitbox timing is authoritative.
 
-## Open Questions
+## Resolved Design Decisions (Follow-up)
 
-1. **Billboard implementation** — How exactly to billboard sprite rigs in a 3D world. Options: (a) a system that sets each rig root's rotation to face the camera each frame, (b) a custom shader/material, (c) Bevy's built-in billboard support if it exists for sprites. Needs investigation.
-2. **Animation clip hot-reload** — When a `*.anim.ron` file changes, the shared `AnimationClip` needs to be rebuilt. How does the `AssetEvent::Modified` flow work with derived/built assets? Need to ensure the rebuild pipeline works with Bevy's asset system.
-3. **Facing direction** — In a 2.5D brawler, characters face left or right. How does facing interact with billboarding? Likely `flip_x` on all bone sprites, but this needs to compose correctly with bone rotations.
+8. **Billboard implementation** — Use **option A**: a system that sets each rig root's rotation to face the camera each frame. Simple and sufficient for now. Can be upgraded to a shader approach later if needed.
+
+9. **Animation clip hot-reload** — See detailed analysis below.
+
+10. **Facing direction** — Use `flip_x` on all bone sprites based on the character's facing direction. A `Facing` component on the character root drives `Sprite.flip_x` on all bone child entities.
+
+---
+
+## Follow-up Research: Animation Clip Hot-Reload
+
+### The Problem
+
+When a `*.anim.ron` file changes on disk, the `SpriteAnimAsset` is hot-reloaded by Bevy's `AssetServer`. But the derived `AnimationClip` (built programmatically from the RON data) must also be rebuilt.
+
+### Solution: Manual AssetEvent Listener
+
+Bevy has no built-in "derived asset" abstraction. The correct pattern is to listen for `AssetEvent::Modified` on the source asset and rebuild the derived asset in-place.
+
+```rust
+fn rebuild_animation_clips(
+    mut ev: EventReader<AssetEvent<SpriteAnimAsset>>,
+    source_assets: Res<Assets<SpriteAnimAsset>>,
+    mut clips: ResMut<Assets<AnimationClip>>,
+    mut registry: ResMut<BuiltAnimations>, // maps source AssetId -> derived Handle<AnimationClip>
+) {
+    for event in ev.read() {
+        if let AssetEvent::Modified { id } = event {
+            let source = source_assets.get(*id).unwrap();
+            let new_clip = build_clip_from(source);
+            let clip_handle = registry.get(*id);
+            // Replace in-place — all entities holding this handle see the new data
+            clips.insert(clip_handle.id(), new_clip);
+        }
+    }
+}
+```
+
+### Key Details
+
+- **No feedback loop**: Reading `Assets<SpriteAnimAsset>` and writing `Assets<AnimationClip>` are different type collections, so no re-triggered `Modified` events.
+- **Handle stability**: `Handle<AnimationClip>` is just an `AssetId` wrapper. Calling `clips.insert(id, new_clip)` replaces the data at that ID. All entities holding that handle automatically resolve to the new clip on next access.
+- **`AssetChanged<T>` filter**: Bevy provides `Query<..., AssetChanged<AnimationClip>>` to react to replaced assets. Fires the frame after modification.
+- **Initial build**: On `AssetEvent::LoadedWithDependencies`, use `clips.add(clip)` to get the initial handle. Store it in the registry.
+- **No dependency propagation**: [PR #20575](https://github.com/bevyengine/bevy/pull/20575) for auto-propagating Modified events is unmerged. Must listen on the source type directly.
+
+### Build Pipeline Summary
+
+```
+[*.anim.ron on disk]
+    | (AssetServer hot-reload)
+    v
+Assets<SpriteAnimAsset>
+    | AssetEvent::LoadedWithDependencies → build_clip_from(), clips.add()
+    | AssetEvent::Modified → build_clip_from(), clips.insert(existing_id)
+    v
+Assets<AnimationClip>  (derived, in-place replacement)
+    |
+    v
+Entities with Handle<AnimationClip> (transparently see updated data)
+```
+
+Sources:
+- [Bevy Cheat Book: Asset Events](https://bevy-cheatbook.github.io/assets/assetevent.html)
+- [Bevy Derived Assets Discussion #9296](https://github.com/bevyengine/bevy/discussions/9296)
+- [AssetChanged PR #16810](https://github.com/bevyengine/bevy/pull/16810)

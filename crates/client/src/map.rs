@@ -4,8 +4,8 @@ use bevy::{prelude::*, window::PrimaryWindow};
 use leafwing_input_manager::prelude::*;
 use lightyear::prelude::{Controlled, MessageReceiver, MessageSender};
 use protocol::{
-    MapWorld, PlayerActions, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync,
-    VoxelType,
+    MapInstanceId, MapRegistry, MapWorld, PlayerActions, VoxelChannel, VoxelEditBroadcast,
+    VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 use voxel_map_engine::prelude::{
     flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
@@ -21,6 +21,7 @@ impl Plugin for ClientMapPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(VoxelPlugin)
             .init_resource::<MapWorld>()
+            .init_resource::<MapRegistry>()
             .add_systems(Startup, spawn_overworld)
             .add_systems(
                 Update,
@@ -42,15 +43,21 @@ impl Plugin for ClientMapPlugin {
 #[derive(Resource)]
 pub struct OverworldMap(pub Entity);
 
-fn spawn_overworld(mut commands: Commands, map_world: Res<MapWorld>) {
+fn spawn_overworld(
+    mut commands: Commands,
+    map_world: Res<MapWorld>,
+    mut registry: ResMut<MapRegistry>,
+) {
     let map = commands
         .spawn((
             VoxelMapInstance::new(5),
             VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_voxels)),
             Transform::default(),
+            MapInstanceId::Overworld,
         ))
         .id();
     commands.insert_resource(OverworldMap(map));
+    registry.insert(MapInstanceId::Overworld, map);
 }
 
 fn attach_chunk_target_to_camera(

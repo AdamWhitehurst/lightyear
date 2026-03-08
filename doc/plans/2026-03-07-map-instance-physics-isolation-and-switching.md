@@ -109,9 +109,11 @@ pub struct MapCollisionHooks<'w, 's> {
 
 impl CollisionHooks for MapCollisionHooks<'_, '_> {
     fn filter_pairs(&self, entity1: Entity, entity2: Entity, _commands: &mut Commands) -> bool {
-        match (self.map_ids.get(entity1).ok(), self.map_ids.get(entity2).ok()) {
+        let entity1_id = self.map_ids.get(entity1).ok();
+        let entity2_id = self.map_ids.get(entity2).ok();
+        match (entity1_id, entity2_id) {
             (Some(a), Some(b)) => a == b,
-            _ => true, // entities without MapInstanceId interact with everything
+            _ => panic!("Entity missing MapInstanceId. Entity {entity1:?}: {entity1_id:?}. Entity {entity2:?}: {entity2_id:?}"),
         }
     }
 }
@@ -446,8 +448,8 @@ fn chunk_colliders_inherit_map_instance_id() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
-- [ ] `cargo check-all` passes
+- [ ] All tests pass: `cargo test-native`
+- [x] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
 
@@ -591,7 +593,7 @@ fn player_entity_drives_chunk_loading() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [ ] All tests pass: `cargo test-native`
 - [ ] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
@@ -812,7 +814,7 @@ fn same_frame_room_transfer_preserves_visibility() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [ ] All tests pass: `cargo test-native`
 - [ ] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
@@ -1382,7 +1384,7 @@ fn client_transitions_to_playing_after_chunks_load() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [ ] All tests pass: `cargo test-native`
 - [ ] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
@@ -1594,7 +1596,7 @@ fn map_switch_button_label_shows_overworld_when_on_homebase() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [ ] All tests pass: `cargo test-native`
 - [ ] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
@@ -1628,7 +1630,9 @@ pub struct Homebase {
 To:
 ```rust
 pub struct Homebase {
-    pub owner: u64, // ClientId bits — Entity is not network-stable
+    /// `lightyear` `ClientId` bits, raw `u64` because voxel_map_engine doesn't depend on lightyear
+    /// `ClientId` bits because Entity is not network-stable
+    pub owner: u64, 
 }
 ```
 
@@ -1766,7 +1770,7 @@ fn different_homebase_owners_produce_different_seeds() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [ ] All tests pass: `cargo test-native`
 - [ ] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`

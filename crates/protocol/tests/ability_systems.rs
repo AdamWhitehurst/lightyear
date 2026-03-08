@@ -217,6 +217,7 @@ fn spawn_character(world: &mut World) -> Entity {
             avian3d::prelude::Position(Vec3::ZERO),
             avian3d::prelude::Rotation::default(),
             avian3d::prelude::LinearVelocity(Vec3::ZERO),
+            protocol::map::MapInstanceId::Overworld,
         ))
         .id()
 }
@@ -905,6 +906,7 @@ fn spawn_target(world: &mut World, pos: Vec3) -> Entity {
             avian3d::prelude::Position(pos),
             avian3d::prelude::Rotation::default(),
             avian3d::prelude::LinearVelocity(Vec3::ZERO),
+            protocol::map::MapInstanceId::Overworld,
         ))
         .id()
 }
@@ -1048,6 +1050,7 @@ fn shield_absorbs_damage() {
             ActiveShield { remaining: 50.0 },
             avian3d::prelude::Position(Vec3::new(1.0, 0.0, 0.0)),
             avian3d::prelude::LinearVelocity(Vec3::ZERO),
+            protocol::map::MapInstanceId::Overworld,
         ))
         .id();
 
@@ -1133,6 +1136,7 @@ fn shield_overflow_damages_health() {
             ActiveShield { remaining: 20.0 },
             avian3d::prelude::Position(Vec3::new(1.0, 0.0, 0.0)),
             avian3d::prelude::LinearVelocity(Vec3::ZERO),
+            protocol::map::MapInstanceId::Overworld,
         ))
         .id();
 

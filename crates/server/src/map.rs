@@ -6,7 +6,8 @@ use lightyear::prelude::{
     Connected, MessageReceiver, MessageSender, NetworkTarget, Server, ServerMultiMessageSender,
 };
 use protocol::{
-    MapWorld, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
+    MapInstanceId, MapRegistry, MapWorld, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest,
+    VoxelStateSync, VoxelType,
 };
 use serde::{Deserialize, Serialize};
 use voxel_map_engine::prelude::{
@@ -20,15 +21,21 @@ pub struct ServerMapPlugin;
 #[derive(Resource)]
 pub struct OverworldMap(pub Entity);
 
-pub fn spawn_overworld(mut commands: Commands, map_world: Res<MapWorld>) {
+pub fn spawn_overworld(
+    mut commands: Commands,
+    map_world: Res<MapWorld>,
+    mut registry: ResMut<MapRegistry>,
+) {
     let map = commands
         .spawn((
             VoxelMapInstance::new(5),
             VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_voxels)),
             Transform::default(),
+            MapInstanceId::Overworld,
         ))
         .id();
     commands.insert_resource(OverworldMap(map));
+    registry.insert(MapInstanceId::Overworld, map);
 }
 
 fn load_voxel_world(
@@ -109,6 +116,7 @@ impl Plugin for ServerMapPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(VoxelPlugin)
             .init_resource::<MapWorld>()
+            .init_resource::<MapRegistry>()
             .init_resource::<VoxelModifications>()
             .init_resource::<VoxelDirtyState>()
             .init_resource::<VoxelSavePath>()
