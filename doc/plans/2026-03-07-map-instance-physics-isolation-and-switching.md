@@ -814,8 +814,8 @@ fn same_frame_room_transfer_preserves_visibility() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-native`
-- [ ] `cargo check-all` passes
+- [x] All tests pass: `cargo test-native`
+- [x] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
 

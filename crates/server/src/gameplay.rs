@@ -169,6 +169,7 @@ fn handle_connected(
     character_query: Query<Entity, (With<CharacterMarker>, Without<DummyTarget>)>,
     remote_id_query: Query<&RemoteId, With<ClientOf>>,
     registry: Res<MapRegistry>,
+    mut room_registry: ResMut<crate::map::RoomRegistry>,
 ) {
     let client_entity = trigger.entity;
     let peer_id = remote_id_query
@@ -212,4 +213,10 @@ fn handle_connected(
         AbilityCooldowns::default(),
         ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 4),
     ));
+
+    let room = room_registry.get_or_create(&MapInstanceId::Overworld, &mut commands);
+    commands.trigger(RoomEvent {
+        room,
+        target: RoomTarget::AddSender(client_entity),
+    });
 }

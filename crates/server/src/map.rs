@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use lightyear::prelude::{
-    Connected, MessageReceiver, MessageSender, NetworkTarget, Server, ServerMultiMessageSender,
+    Connected, MessageReceiver, MessageSender, NetworkTarget, Room, RoomEvent, RoomTarget, Server,
+    ServerMultiMessageSender,
 };
 use protocol::{
     MapInstanceId, MapRegistry, MapWorld, VoxelChannel, VoxelEditBroadcast, VoxelEditRequest,
@@ -16,6 +18,20 @@ use voxel_map_engine::prelude::{
 
 /// Plugin managing server-side voxel map functionality
 pub struct ServerMapPlugin;
+
+/// Maps `MapInstanceId` to lightyear room entities. Server-only.
+#[derive(Resource, Default)]
+pub struct RoomRegistry(pub HashMap<MapInstanceId, Entity>);
+
+impl RoomRegistry {
+    pub fn get_or_create(&mut self, id: &MapInstanceId, commands: &mut Commands) -> Entity {
+        *self.0.entry(id.clone()).or_insert_with(|| {
+            let room = commands.spawn(Room::default()).id();
+            info!("Created room for map {id:?}: {room:?}");
+            room
+        })
+    }
+}
 
 /// Resource tracking the primary overworld map entity.
 #[derive(Resource)]
@@ -112,11 +128,30 @@ pub fn save_voxel_world_on_shutdown(
     }
 }
 
+fn on_map_instance_id_added(
+    trigger: On<Add, MapInstanceId>,
+    mut commands: Commands,
+    map_ids: Query<&MapInstanceId>,
+    mut room_registry: ResMut<RoomRegistry>,
+) {
+    let entity = trigger.entity;
+    let map_id = map_ids
+        .get(entity)
+        .expect("Entity with MapInstanceId trigger must have MapInstanceId");
+    let room = room_registry.get_or_create(map_id, &mut commands);
+    commands.trigger(RoomEvent {
+        room,
+        target: RoomTarget::AddEntity(entity),
+    });
+}
+
 impl Plugin for ServerMapPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(VoxelPlugin)
+        app.add_plugins(lightyear::prelude::RoomPlugin)
+            .add_plugins(VoxelPlugin)
             .init_resource::<MapWorld>()
             .init_resource::<MapRegistry>()
+            .init_resource::<RoomRegistry>()
             .init_resource::<VoxelModifications>()
             .init_resource::<VoxelDirtyState>()
             .init_resource::<VoxelSavePath>()
@@ -127,7 +162,8 @@ impl Plugin for ServerMapPlugin {
             )
             .add_systems(Update, save_voxel_world_debounced)
             .add_systems(Last, save_voxel_world_on_shutdown)
-            .add_observer(send_initial_voxel_state);
+            .add_observer(send_initial_voxel_state)
+            .add_observer(on_map_instance_id_added);
     }
 }
 
