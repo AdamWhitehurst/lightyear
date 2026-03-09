@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use avian3d::prelude::RigidBodyDisabled;
+use avian3d::prelude::{ColliderDisabled, RigidBodyDisabled};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
-use client::map::{check_transition_chunks_loaded, PendingTransition};
-use lightyear::prelude::{DisableRollback, Predicted};
+use client::map::check_transition_chunks_loaded;
+use lightyear::prelude::{Controlled, DisableRollback, Predicted};
+use protocol::PendingTransition;
 use protocol::{CharacterMarker, MapInstanceId, MapRegistry};
 use ui::{ClientState, MapTransitionState};
 use voxel_map_engine::prelude::{
@@ -47,7 +48,9 @@ fn spawn_frozen_player(app: &mut App, map: Entity) -> Entity {
         .spawn((
             CharacterMarker,
             Predicted,
+            Controlled,
             RigidBodyDisabled,
+            ColliderDisabled,
             DisableRollback,
             ChunkTarget::new(map, 0),
             Transform::default(),
@@ -55,8 +58,10 @@ fn spawn_frozen_player(app: &mut App, map: Entity) -> Entity {
         .id()
 }
 
-fn set_transitioning(app: &mut App) {
-    app.insert_resource(PendingTransition(MapInstanceId::Overworld));
+fn set_transitioning(app: &mut App, player: Entity) {
+    app.world_mut()
+        .entity_mut(player)
+        .insert(PendingTransition(MapInstanceId::Overworld));
     app.world_mut()
         .resource_mut::<NextState<MapTransitionState>>()
         .set(MapTransitionState::Transitioning);
@@ -68,7 +73,7 @@ fn stays_transitioning_while_chunks_loading() {
 
     let map = spawn_map(&mut app);
     let player = spawn_frozen_player(&mut app, map);
-    set_transitioning(&mut app);
+    set_transitioning(&mut app, player);
 
     // loaded_chunks is empty — condition not met
     for _ in 0..5 {
@@ -79,10 +84,6 @@ fn stays_transitioning_while_chunks_loading() {
         *app.world().resource::<State<MapTransitionState>>().get(),
         MapTransitionState::Transitioning,
         "Should remain Transitioning while loaded_chunks is empty"
-    );
-    assert!(
-        app.world().get::<RigidBodyDisabled>(player).is_some(),
-        "Player should still be frozen"
     );
 }
 
@@ -101,7 +102,7 @@ fn transitions_to_playing_after_chunks_load() {
         .loaded_chunks
         .insert(IVec3::ZERO);
 
-    set_transitioning(&mut app);
+    set_transitioning(&mut app, player);
 
     for _ in 0..3 {
         app.update();
@@ -113,15 +114,7 @@ fn transitions_to_playing_after_chunks_load() {
         "Should transition to Playing when chunks are loaded"
     );
     assert!(
-        app.world().get_resource::<PendingTransition>().is_none(),
+        app.world().get::<PendingTransition>(player).is_none(),
         "PendingTransition should be cleaned up"
-    );
-    assert!(
-        app.world().get::<RigidBodyDisabled>(player).is_none(),
-        "RigidBodyDisabled should be removed from player"
-    );
-    assert!(
-        app.world().get::<DisableRollback>(player).is_none(),
-        "DisableRollback should be removed from player"
     );
 }

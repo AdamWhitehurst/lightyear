@@ -86,11 +86,14 @@ impl MapRegistry {
 }
 ```
 
-Register `MapInstanceId` with lightyear in `ProtocolPlugin` (no `add_prediction()` — server-authoritative, no rollback):
+Register `MapInstanceId` and `PhysicsFrozen` with lightyear in `ProtocolPlugin` (no `add_prediction()` — server-authoritative, no rollback):
 
 ```rust
 app.register_component::<MapInstanceId>();
+app.register_component::<PhysicsFrozen>();
 ```
+
+Note: `RigidBodyDisabled` and `ColliderDisabled` cannot be registered with lightyear because avian3d does not implement `PartialEq` on them. `PhysicsFrozen` acts as a replication proxy — when it arrives on the client, an observer inserts the Avian components locally.
 
 #### 2. MapCollisionHooks
 **File**: `crates/protocol/src/physics.rs` (new file)
@@ -833,10 +836,17 @@ Implement the full map switching flow: client requests via message, server execu
 
 ### Changes Required:
 
-#### 1. Messages and channel
+#### 1. Messages, channel, and PendingTransition component
 **File**: `crates/protocol/src/map.rs`
 
+`PendingTransition` is defined here as a component so both server and client can use it. On the server it acts as the double-transition guard and carries the target map identity. On the client it serves the same guard role and drives `check_transition_chunks_loaded`.
+
 ```rust
+/// Attached to a player entity while a map transition is in progress.
+/// Acts as the double-transition guard and carries the target map identity.
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PendingTransition(pub MapInstanceId);
+
 /// Channel for map transition messages
 pub struct MapChannel;
 
@@ -901,17 +911,14 @@ app.add_sub_state::<MapTransitionState>();
 #### 3. Server-side transition handler
 **File**: `crates/server/src/map.rs`
 
-```rust
-/// Marker: player is currently transitioning maps. Prevents double-transitions.
-#[derive(Component)]
-pub struct MapTransitioning;
 
+```rust
 fn handle_map_switch_requests(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<PlayerMapSwitchRequest>>,
     mut senders: Query<&mut MessageSender<MapTransitionStart>>,
     controlled_query: Query<(Entity, &ControlledBy, &MapInstanceId), With<CharacterMarker>>,
-    transitioning: Query<(), With<MapTransitioning>>,
+    transitioning: Query<(), With<PendingTransition>>,
     mut registry: ResMut<MapRegistry>,
     mut room_registry: ResMut<RoomRegistry>,
     map_world: Res<MapWorld>,
@@ -974,11 +981,13 @@ fn execute_server_transition(
 ) {
     info!("Transitioning player {player_entity:?} from {current_map_id:?} to {target_map_id:?}");
 
-    // 1. Freeze player physics
+    // 1. Mark player as transitioning and disable rollback.
+    // RigidBodyDisabled is NOT inserted here — inserting it mid-physics-frame (inside Update)
+    // violates Avian's island solver invariant. freeze_on_map_transition runs in PostUpdate
+    // and detects Added<PendingTransition> to insert (RigidBodyDisabled, ColliderDisabled).
     commands.entity(player_entity).insert((
-        RigidBodyDisabled,
         DisableRollback,
-        MapTransitioning,
+        PendingTransition(target_map_id.clone()),
     ));
 
     // 2. Room transitions — remove from old, add to new (same frame = no visibility gap)
@@ -1027,6 +1036,17 @@ fn execute_server_transition(
     commands.entity(player_entity).insert(TransitionUnfreezeTimer(Timer::from_seconds(3.0, TimerMode::Once)));
 }
 
+/// Inserts RigidBodyDisabled + ColliderDisabled on entities that just gained PendingTransition.
+/// Runs in PostUpdate to avoid modifying physics state mid-frame (Avian island solver invariant).
+fn freeze_on_map_transition(
+    mut commands: Commands,
+    query: Query<Entity, Added<PendingTransition>>,
+) {
+    for entity in &query {
+        commands.entity(entity).insert((RigidBodyDisabled, ColliderDisabled));
+    }
+}
+
 /// Timer-based unfreeze until client confirmation is implemented.
 #[derive(Component)]
 pub struct TransitionUnfreezeTimer(pub Timer);
@@ -1040,7 +1060,7 @@ fn tick_transition_unfreeze(
         timer.0.tick(time.delta());
         if timer.0.finished() {
             info!("Unfreezing player {entity:?} after transition timer");
-            commands.entity(entity).remove::<(RigidBodyDisabled, DisableRollback, MapTransitioning, TransitionUnfreezeTimer)>();
+            commands.entity(entity).remove::<(RigidBodyDisabled, ColliderDisabled, DisableRollback, PendingTransition, TransitionUnfreezeTimer)>();
         }
     }
 }
@@ -1049,22 +1069,35 @@ fn tick_transition_unfreeze(
 #### 4. Client-side transition handler
 **File**: `crates/client/src/map.rs`
 
+`PendingTransition` is a component defined in `crates/protocol/src/map.rs` and attached to the player entity. It serves as both the pending-target record and the double-transition guard (via `Has<PendingTransition>`).
+
 ```rust
 fn handle_map_transition_start(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<MapTransitionStart>>,
     mut next_transition: ResMut<NextState<MapTransitionState>>,
     mut registry: ResMut<MapRegistry>,
-    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>)>,
+    player_query: Query<(Entity, Has<PendingTransition>), (With<Predicted>, With<CharacterMarker>)>,
 ) {
     for mut receiver in &mut receivers {
         for (transition, _) in receiver.receive() {
             info!("Received MapTransitionStart for {:?}", transition.target);
 
-            // Freeze local predicted player
-            let player = player_query.get_single()
+            let (player, already_transitioning) = player_query.get_single()
                 .expect("Predicted player must exist when receiving MapTransitionStart");
-            commands.entity(player).insert((RigidBodyDisabled, DisableRollback));
+
+            if already_transitioning {
+                warn!("Received MapTransitionStart while PendingTransition already present — ignoring");
+                continue;
+            }
+
+            // Freeze local predicted player and record target on the entity
+            commands.entity(player).insert((
+                RigidBodyDisabled,
+                ColliderDisabled,
+                DisableRollback,
+                PendingTransition(transition.target.clone()),
+            ));
 
             // Spawn map instance if not in registry
             if !registry.0.contains_key(&transition.target) {
@@ -1085,15 +1118,9 @@ fn handle_map_transition_start(
 
             // Enter transitioning state
             next_transition.set(MapTransitionState::Transitioning);
-
-            // Store pending transition target for completion check
-            commands.insert_resource(PendingTransition(transition.target.clone()));
         }
     }
 }
-
-#[derive(Resource)]
-pub struct PendingTransition(pub MapInstanceId);
 
 fn generator_for_map(map_id: &MapInstanceId) -> VoxelGenerator {
     match map_id {
@@ -1133,13 +1160,12 @@ fn spawn_map_instance(
 ```rust
 fn check_transition_chunks_loaded(
     mut commands: Commands,
-    pending: Option<Res<PendingTransition>>,
     registry: Res<MapRegistry>,
     maps: Query<(&VoxelMapInstance, &PendingChunks)>,
-    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>)>,
+    player_query: Query<(Entity, &PendingTransition), (With<Predicted>, With<CharacterMarker>)>,
     mut next_transition: ResMut<NextState<MapTransitionState>>,
 ) {
-    let Some(pending) = pending else { return };
+    let Ok((player, pending)) = player_query.get_single() else { return };
     let map_entity = registry.get(&pending.0);
     let (map, pending_chunks) = maps.get(map_entity)
         .expect("Pending transition map must exist in ECS");
@@ -1151,18 +1177,34 @@ fn check_transition_chunks_loaded(
 
     info!("Transition chunks loaded for {:?}, resuming play", pending.0);
 
-    // Unfreeze player
-    let player = player_query.get_single()
-        .expect("Predicted player must exist when completing transition");
-    commands.entity(player).remove::<(RigidBodyDisabled, DisableRollback)>();
+    // Unfreeze player and remove transition marker
+    commands.entity(player).remove::<(RigidBodyDisabled, ColliderDisabled, DisableRollback, PendingTransition)>();
 
     // Return to playing
     next_transition.set(MapTransitionState::Playing);
-    commands.remove_resource::<PendingTransition>();
 }
 ```
 
-#### 6. Loading screen UI
+#### 6. PhysicsFrozen observers
+**File**: `crates/protocol/src/map.rs`
+
+```rust
+fn on_physics_frozen_added(
+    trigger: On<Add, PhysicsFrozen>,
+    mut commands: Commands,
+) {
+    commands.entity(trigger.entity()).insert((RigidBodyDisabled, ColliderDisabled, DisableRollback));
+}
+
+fn on_physics_frozen_removed(
+    trigger: On<Remove, PhysicsFrozen>,
+    mut commands: Commands,
+) {
+    commands.entity(trigger.entity()).remove::<(RigidBodyDisabled, ColliderDisabled, DisableRollback)>();
+}
+```
+
+#### 7. Loading screen UI
 **File**: `crates/ui/src/lib.rs`
 
 ```rust
@@ -1193,17 +1235,20 @@ Register:
 app.add_systems(OnEnter(MapTransitionState::Transitioning), setup_transition_loading_screen);
 ```
 
-#### 7. System registration
+#### 8. System registration
 
 **Server** (`crates/server/src/map.rs` plugin):
 ```rust
 app.add_systems(Update, (handle_map_switch_requests, tick_transition_unfreeze));
+app.add_systems(PostUpdate, freeze_on_map_transition);
 ```
 
 **Client** (`crates/client/src/map.rs` plugin):
 ```rust
 app.add_systems(Update, handle_map_transition_start);
 app.add_systems(Update, check_transition_chunks_loaded.run_if(in_state(MapTransitionState::Transitioning)));
+app.add_observer(on_physics_frozen_added);
+app.add_observer(on_physics_frozen_removed);
 ```
 
 ### Tests:
@@ -1273,7 +1318,7 @@ fn map_switch_request_triggers_transition_start() {
     stepper.tick_step(10);
 
     // Server should have:
-    // 1. Inserted RigidBodyDisabled on player
+    // 1. Inserted PendingTransition + DisableRollback on player (RigidBodyDisabled added in PostUpdate)
     // 2. Sent MapTransitionStart to client
     let buffer = stepper.client_app.world().resource::<MessageBuffer<MapTransitionStart>>();
     assert_eq!(buffer.messages.len(), 1, "Client should receive MapTransitionStart");
@@ -1286,7 +1331,7 @@ fn map_switch_request_triggers_transition_start() {
 #[test]
 fn duplicate_switch_request_ignored() {
     // Similar setup to above, but send two requests in quick succession
-    // Second request should be ignored (MapTransitioning marker prevents it)
+    // Second request should be ignored (PendingTransition component prevents it)
     let mut stepper = CrossbeamTestStepper::new();
     // ... (setup as above)
     stepper.init();
@@ -1312,6 +1357,7 @@ fn duplicate_switch_request_ignored() {
     stepper.tick_step(5);
 
     // Client should still have only 1 MapTransitionStart (the first one)
+    // The second request is ignored because the player entity has PendingTransition
     let buffer = stepper.client_app.world().resource::<MessageBuffer<MapTransitionStart>>();
     assert_eq!(buffer.messages.len(), 1, "Second request should be ignored while transitioning");
 }
@@ -1347,19 +1393,20 @@ fn client_transitions_to_playing_after_chunks_load() {
     )).id();
     app.world_mut().resource_mut::<MapRegistry>().insert(MapInstanceId::Overworld, map);
 
-    // Spawn a fake predicted player
+    // Spawn a fake predicted player with transition state already applied
     let player = app.world_mut().spawn((
         CharacterMarker,
         Predicted,
         MapInstanceId::Overworld,
         RigidBodyDisabled,
+        ColliderDisabled,
         DisableRollback,
+        PendingTransition(MapInstanceId::Overworld),
         ChunkTarget { map_entity: map, distance: 0 },
         Transform::default(),
     )).id();
 
-    // Set pending transition and enter transitioning state
-    app.insert_resource(PendingTransition(MapInstanceId::Overworld));
+    // Enter transitioning state
     app.world_mut().resource_mut::<NextState<MapTransitionState>>()
         .set(MapTransitionState::Transitioning);
 
@@ -1371,12 +1418,12 @@ fn client_transitions_to_playing_after_chunks_load() {
     assert_eq!(*state.get(), MapTransitionState::Playing,
         "Should return to Playing after chunks load");
 
-    // PendingTransition resource should be removed
-    assert!(app.world().get_resource::<PendingTransition>().is_none(),
+    // PendingTransition component should be removed from player
+    assert!(app.world().get::<PendingTransition>(player).is_none(),
         "PendingTransition should be cleaned up");
 
-    // RigidBodyDisabled should be removed from player
-    assert!(app.world().get::<RigidBodyDisabled>(player).is_none(),
+    // PhysicsFrozen should be removed from player (observer removes Avian components)
+    assert!(app.world().get::<PhysicsFrozen>(player).is_none(),
         "Player should be unfrozen after transition completes");
 }
 ```
@@ -1769,9 +1816,14 @@ fn different_homebase_owners_produce_different_seeds() {
 
 ### Success Criteria:
 
+#### Notes:
+- `Homebase { owner: u64 }` was already correct in `instance.rs` (done in earlier phase).
+- `ensure_map_exists` now uses `VoxelMapInstance::homebase()` constructor (adds `Homebase` marker).
+- Fixed multi-player panic: `handle_map_transition_start` / `check_transition_chunks_loaded` used `.single()` on `(With<Predicted>, With<CharacterMarker>)` which fails with 2+ clients because `PredictionTarget::to_clients(NetworkTarget::All)` gives all clients a `Predicted` copy of every character. Fixed with `With<Controlled>` filter (which is on the locally-owned entity).
+
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-native`
-- [ ] `cargo check-all` passes
+- [x] All tests pass: `cargo test-native`
+- [x] `cargo check-all` passes
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client`
 
@@ -1798,7 +1850,7 @@ fn different_homebase_owners_produce_different_seeds() {
 | `crates/voxel_map_engine/tests/lifecycle.rs` (extended) | `ChunkTarget` derived from `MapRegistry`, player entity drives chunk loading/unloading | `VoxelPlugin` + `MapRegistry` |
 | `crates/server/tests/rooms.rs` | Entities in different lightyear rooms not replicated to wrong clients. Same-frame room transfer preserves visibility. | `CrossbeamTestStepper` + `Room` |
 | `crates/server/tests/map_transition.rs` | `PlayerMapSwitchRequest` → server processes → client receives `MapTransitionStart`. Duplicate request rejected during transition. Server and client produce identical map configs. | `CrossbeamTestStepper` + server map systems |
-| `crates/client/tests/map_transition.rs` | Client enters `Transitioning` state → chunks load → returns to `Playing`. `PendingTransition` cleaned up. `RigidBodyDisabled` removed. | `VoxelPlugin` + `StatesPlugin` + `MapTransitionState` |
+| `crates/client/tests/map_transition.rs` | Client enters `Transitioning` state → chunks load → returns to `Playing`. `PendingTransition` component removed from player. `RigidBodyDisabled` + `ColliderDisabled` removed. | `VoxelPlugin` + `StatesPlugin` + `MapTransitionState` |
 | `crates/ui/tests/ui_plugin.rs` (extended) | `MapSwitchButton` spawns in HUD. Label shows "Homebase" on Overworld, "Overworld" on Homebase. | `UiPlugin` + `StatesPlugin` + mock player entity |
 
 ### Manual Testing Steps:

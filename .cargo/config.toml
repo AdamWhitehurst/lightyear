@@ -14,14 +14,9 @@ test-wasm = "make test-wasm"
 
 [build]
 incremental = true
-jobs = 8
 
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--cfg", "web_sys_unstable_apis",
     "-C", "target-feature=+reference-types",
 ]
-
-# [target.x86_64-unknown-linux-gnu]
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"
-# ]

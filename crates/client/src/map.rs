@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use avian3d::prelude::RigidBodyDisabled;
+use avian3d::prelude::{ColliderDisabled, RigidBodyDisabled};
 use bevy::{prelude::*, window::PrimaryWindow};
 use leafwing_input_manager::prelude::*;
 use lightyear::prelude::{Controlled, DisableRollback, MessageReceiver, MessageSender, Predicted};
 use protocol::map::MapTransitionStart;
 use protocol::{
-    CharacterMarker, MapInstanceId, MapRegistry, MapWorld, PlayerActions, VoxelChannel,
-    VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
+    CharacterMarker, MapInstanceId, MapRegistry, MapWorld, PendingTransition, PlayerActions,
+    VoxelChannel, VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 use ui::MapTransitionState;
 use voxel_map_engine::prelude::{
@@ -184,16 +184,12 @@ pub fn send_voxel_edit(
     }
 }
 
-/// Tracks which map we're transitioning to
-#[derive(Resource)]
-pub struct PendingTransition(pub MapInstanceId);
-
-fn handle_map_transition_start(
+pub fn handle_map_transition_start(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<MapTransitionStart>>,
     mut next_transition: ResMut<NextState<MapTransitionState>>,
     mut registry: ResMut<MapRegistry>,
-    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>)>,
+    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>, With<Controlled>)>,
 ) {
     for mut receiver in &mut receivers {
         for transition in receiver.receive() {
@@ -204,7 +200,7 @@ fn handle_map_transition_start(
                 .expect("Predicted player must exist when receiving MapTransitionStart");
             commands
                 .entity(player)
-                .insert((RigidBodyDisabled, DisableRollback));
+                .insert((RigidBodyDisabled, ColliderDisabled, DisableRollback));
 
             if !registry.0.contains_key(&transition.target) {
                 let generator = generator_for_map(&transition.target);
@@ -224,7 +220,11 @@ fn handle_map_transition_start(
                 .insert(ChunkTarget::new(map_entity, 4));
 
             next_transition.set(MapTransitionState::Transitioning);
-            commands.insert_resource(PendingTransition(transition.target.clone()));
+            commands.entity(player).insert((
+                ColliderDisabled,
+                RigidBodyDisabled,
+                PendingTransition(transition.target.clone()),
+            ));
         }
     }
 }
@@ -266,17 +266,23 @@ fn spawn_map_instance(
 
 pub fn check_transition_chunks_loaded(
     mut commands: Commands,
-    pending: Option<Res<PendingTransition>>,
+    player_query: Query<(Entity, &PendingTransition), (With<Predicted>, With<CharacterMarker>)>,
     registry: Res<MapRegistry>,
-    maps: Query<(&VoxelMapInstance, &PendingChunks)>,
-    player_query: Query<Entity, (With<Predicted>, With<CharacterMarker>)>,
+    maps: Query<(&VoxelMapInstance, Option<&PendingChunks>)>,
     mut next_transition: ResMut<NextState<MapTransitionState>>,
 ) {
-    let Some(pending) = pending else { return };
+    let (player, pending) = player_query
+        .single()
+        .expect("Only one player expected to have PendingTransition");
     let map_entity = registry.get(&pending.0);
     let (map, pending_chunks) = maps
         .get(map_entity)
         .expect("Pending transition map must exist in ECS");
+
+    // PendingChunks is inserted by VoxelPlugin on the frame after spawn — treat absence as loading
+    let Some(pending_chunks) = pending_chunks else {
+        return;
+    };
 
     if map.loaded_chunks.is_empty()
         || !pending_chunks.tasks.is_empty()
@@ -290,13 +296,12 @@ pub fn check_transition_chunks_loaded(
         pending.0
     );
 
-    let player = player_query
-        .single()
-        .expect("Predicted player must exist when completing transition");
-    commands
-        .entity(player)
-        .remove::<(RigidBodyDisabled, DisableRollback)>();
+    commands.entity(player).remove::<(
+        RigidBodyDisabled,
+        ColliderDisabled,
+        DisableRollback,
+        PendingTransition,
+    )>();
 
     next_transition.set(MapTransitionState::Playing);
-    commands.remove_resource::<PendingTransition>();
 }

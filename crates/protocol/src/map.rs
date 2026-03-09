@@ -115,6 +115,11 @@ pub enum MapSwitchTarget {
     Homebase,
 }
 
+/// Marks a player entity as undergoing a map transition.
+/// Carried on the player entity on both client and server.
+#[derive(Component, Clone, Debug)]
+pub struct PendingTransition(pub MapInstanceId);
+
 /// Server tells client to begin transition
 #[derive(Serialize, Deserialize, Clone, Debug, Reflect, Message)]
 pub struct MapTransitionStart {

@@ -186,4 +186,21 @@ mod tests {
         assert_eq!(bounds_to_spawning_distance(IVec3::new(10, 1, 1)), 10);
         assert_eq!(bounds_to_spawning_distance(IVec3::new(1, 1, 1)), 1);
     }
+
+    #[test]
+    fn homebase_seed_deterministic() {
+        let id: u64 = 12345;
+        let bounds = IVec3::new(4, 4, 4);
+        let (_, config1, _) = VoxelMapInstance::homebase(id, bounds, dummy_generator());
+        let (_, config2, _) = VoxelMapInstance::homebase(id, bounds, dummy_generator());
+        assert_eq!(config1.seed, config2.seed);
+    }
+
+    #[test]
+    fn different_owners_different_seeds() {
+        let bounds = IVec3::new(4, 4, 4);
+        let (_, config1, _) = VoxelMapInstance::homebase(1, bounds, dummy_generator());
+        let (_, config2, _) = VoxelMapInstance::homebase(2, bounds, dummy_generator());
+        assert_ne!(config1.seed, config2.seed);
+    }
 }

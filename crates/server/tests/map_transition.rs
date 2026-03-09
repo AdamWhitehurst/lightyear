@@ -1,8 +1,15 @@
 use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 use lightyear::prelude::{DisableRollback, Room, RoomEvent, RoomPlugin, RoomTarget};
-use protocol::map::MapInstanceId;
-use server::map::{MapTransitioning, RoomRegistry, TransitionUnfreezeTimer};
+use protocol::map::{MapInstanceId, PendingTransition};
+use server::map::{RoomRegistry, TransitionUnfreezeTimer};
+use voxel_map_engine::prelude::{VoxelMapInstance, WorldVoxel};
+
+use std::sync::Arc;
+
+fn dummy_generator() -> Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync> {
+    Arc::new(|_| vec![WorldVoxel::Air; 1])
+}
 
 fn transition_test_app() -> App {
     let mut app = App::new();
@@ -22,7 +29,7 @@ fn unfreeze_timer_removes_components_after_expiry() {
         .spawn((
             avian3d::prelude::RigidBodyDisabled,
             DisableRollback,
-            MapTransitioning,
+            PendingTransition(MapInstanceId::Overworld),
             TransitionUnfreezeTimer(Timer::from_seconds(0.016, TimerMode::Once)),
         ))
         .id();
@@ -44,8 +51,8 @@ fn unfreeze_timer_removes_components_after_expiry() {
         "DisableRollback should be removed after timer expires"
     );
     assert!(
-        app.world().get::<MapTransitioning>(entity).is_none(),
-        "MapTransitioning should be removed after timer expires"
+        app.world().get::<PendingTransition>(entity).is_none(),
+        "PendingTransition should be removed after timer expires"
     );
     assert!(
         app.world().get::<TransitionUnfreezeTimer>(entity).is_none(),
@@ -62,7 +69,7 @@ fn unfreeze_timer_preserves_components_before_expiry() {
         .spawn((
             avian3d::prelude::RigidBodyDisabled,
             DisableRollback,
-            MapTransitioning,
+            PendingTransition(MapInstanceId::Overworld),
             TransitionUnfreezeTimer(Timer::from_seconds(999.0, TimerMode::Once)),
         ))
         .id();
@@ -72,8 +79,8 @@ fn unfreeze_timer_preserves_components_before_expiry() {
     }
 
     assert!(
-        app.world().get::<MapTransitioning>(entity).is_some(),
-        "MapTransitioning should remain before timer expires"
+        app.world().get::<PendingTransition>(entity).is_some(),
+        "PendingTransition should remain before timer expires"
     );
     assert!(
         app.world()
@@ -164,17 +171,31 @@ fn room_transfer_moves_entity_between_rooms() {
 }
 
 #[test]
-fn map_transitioning_marker_can_be_added_and_removed() {
+fn pending_transition_marker_can_be_added_and_removed() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
 
-    let entity = app.world_mut().spawn(MapTransitioning).id();
+    let entity = app
+        .world_mut()
+        .spawn(PendingTransition(MapInstanceId::Overworld))
+        .id();
     app.update();
-    assert!(app.world().get::<MapTransitioning>(entity).is_some());
+    assert!(app.world().get::<PendingTransition>(entity).is_some());
 
     app.world_mut()
         .entity_mut(entity)
-        .remove::<MapTransitioning>();
+        .remove::<PendingTransition>();
     app.update();
-    assert!(app.world().get::<MapTransitioning>(entity).is_none());
+    assert!(app.world().get::<PendingTransition>(entity).is_none());
+}
+
+#[test]
+fn different_homebase_owners_produce_different_seeds() {
+    let bounds = IVec3::new(4, 4, 4);
+    let (_, config_a, _) = VoxelMapInstance::homebase(111, bounds, dummy_generator());
+    let (_, config_b, _) = VoxelMapInstance::homebase(222, bounds, dummy_generator());
+    assert_ne!(
+        config_a.seed, config_b.seed,
+        "Different owners must produce different seeds"
+    );
 }

@@ -5,10 +5,10 @@ use bevy::ecs::message::MessageWriter;
 use bevy::prelude::*;
 pub use components::*;
 use lightyear::netcode::Key;
-use lightyear::prelude::client::*;
+use lightyear::prelude::{client::*, Controlled, Replicated};
 use lightyear::prelude::{Authentication, MessageSender, Predicted};
 use protocol::map::{MapChannel, MapSwitchTarget, PlayerMapSwitchRequest};
-use protocol::{CharacterMarker, MapInstanceId, PRIVATE_KEY, PROTOCOL_ID};
+use protocol::{CharacterMarker, DummyTarget, MapInstanceId, PRIVATE_KEY, PROTOCOL_ID};
 pub use state::{ClientState, MapTransitionState};
 use std::net::SocketAddr;
 
@@ -465,7 +465,16 @@ fn ingame_button_interaction(
 
 fn map_switch_button_interaction(
     switch_query: Query<&Interaction, (Changed<Interaction>, With<MapSwitchButton>)>,
-    player_query: Query<&MapInstanceId, (With<Predicted>, With<CharacterMarker>)>,
+    player_query: Query<
+        &MapInstanceId,
+        (
+            With<Predicted>,
+            With<Replicated>,
+            With<CharacterMarker>,
+            With<Controlled>,
+            Without<DummyTarget>,
+        ),
+    >,
     mut senders: Query<&mut MessageSender<PlayerMapSwitchRequest>>,
     transition_state: Res<State<MapTransitionState>>,
 ) {

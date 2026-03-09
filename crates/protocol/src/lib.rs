@@ -26,8 +26,8 @@ pub use hit_detection::{
 };
 pub use map::{
     attach_chunk_colliders, MapChannel, MapInstanceId, MapRegistry, MapSwitchTarget,
-    MapTransitionStart, MapWorld, PlayerMapSwitchRequest, VoxelChannel, VoxelChunk,
-    VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
+    MapTransitionStart, MapWorld, PendingTransition, PlayerMapSwitchRequest, VoxelChannel,
+    VoxelChunk, VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 
 pub const PROTOCOL_ID: u64 = 0;

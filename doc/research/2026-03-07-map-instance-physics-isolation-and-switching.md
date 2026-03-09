@@ -25,7 +25,7 @@ The project runs a single Avian3d physics world shared by server and client. All
 
 Avian 0.4.1 provides `CollisionHooks` — a `ReadOnlySystemParam`-based trait with `filter_pairs` (broad phase) and `modify_contacts` (narrow phase) methods. A `MapInstanceId` component on every physics entity, combined with a `filter_pairs` implementation that returns `false` for cross-map pairs, achieves physics isolation. However, `filter_pairs` does **not** affect `SpatialQuery` operations — the ground-detection raycast in `apply_movement` requires separate filtering via `cast_ray_predicate`.
 
-Map switching requires: a `MapInstanceId` semantic enum (not Entity-based, to avoid entity mapping issues across network boundaries), a `MapRegistry` resource on each side, a client-side `MapTransitionState` sub-state, `RigidBodyDisabled` during transitions, lightyear room management for entity visibility, and a UI toggle button following existing HUD patterns. `ChunkTarget` should become local-only (not replicated) since each side resolves it independently from `MapInstanceId` + `MapRegistry`.
+Map switching requires: a `MapInstanceId` semantic enum (not Entity-based, to avoid entity mapping issues across network boundaries), a `MapRegistry` resource on each side, a client-side `MapTransitionState` sub-state, a `PendingTransition` component (defined in protocol, attached to the player entity) that records the target map and guards against double-transitions, `RigidBodyDisabled` + `ColliderDisabled` inserted during transitions (deferred to `PostUpdate` on the server to avoid violating Avian's island solver invariant), lightyear room management for entity visibility, and a UI toggle button following existing HUD patterns. `ChunkTarget` is local-only (not replicated) since each side resolves it independently from `MapInstanceId` + `MapRegistry`.
 
 ## Detailed Findings
 
@@ -247,8 +247,9 @@ enum MapTransitionState {
 ```
 
 - Gameplay systems run in `in_state(MapTransitionState::Playing)`
-- `OnEnter(Transitioning)`: show loading UI, insert `RigidBodyDisabled` on player
-- `OnExit(Transitioning)`: hide loading UI, remove `RigidBodyDisabled`
+- `OnEnter(Transitioning)`: show loading UI
+- Physics freezing (`RigidBodyDisabled`, `ColliderDisabled`) is inserted directly onto the player entity by `handle_map_transition_start` when the `MapTransitionStart` message arrives, not via state entry hooks
+- `OnExit(Transitioning)`: hide loading UI
 
 ### 12. RigidBodyDisabled for Transition Pausing
 
@@ -259,6 +260,20 @@ enum MapTransitionState {
 - Does **not** disable collision detection or spatial queries for attached colliders
 
 During transition, gameplay systems (including `apply_movement` raycasts) are gated on `MapTransitionState::Playing`, so raycasts don't run while the player is disabled.
+
+**Replication proxy — `PhysicsFrozen`**: `RigidBodyDisabled` and `ColliderDisabled` cannot be registered directly with lightyear because avian3d does not implement `PartialEq` on them (required for lightyear's change-detection diffing). A `PhysicsFrozen` marker component (defined in protocol, implements `PartialEq`) is registered instead. The server inserts `PhysicsFrozen` alongside the Avian components on the server entity. When `PhysicsFrozen` replicates to the client, an observer fires:
+
+```rust
+fn on_physics_frozen_added(trigger: On<Add, PhysicsFrozen>, mut commands: Commands) {
+    commands.entity(trigger.entity()).insert((RigidBodyDisabled, ColliderDisabled, DisableRollback));
+}
+
+fn on_physics_frozen_removed(trigger: On<Remove, PhysicsFrozen>, mut commands: Commands) {
+    commands.entity(trigger.entity()).remove::<(RigidBodyDisabled, ColliderDisabled, DisableRollback)>();
+}
+```
+
+This keeps the client's Avian state in sync with the server's intent without requiring direct registration of Avian types with lightyear.
 
 ### 13. Lightyear Messages and Channels
 
@@ -324,16 +339,18 @@ pub struct MapTransitionStart {
 
 ### 18. Server-Side Transition
 
-The server handler receives `PlayerMapSwitchRequest`, resolves or spawns the target map, then executes:
+The server handler receives `PlayerMapSwitchRequest`, resolves or spawns the target map, then `execute_server_transition` runs synchronously:
 
-1. Insert `RigidBodyDisabled` + `DisableRollback` on player
+1. Insert `(DisableRollback, PendingTransition(target_map_id))` on player. `RigidBodyDisabled` is **not** inserted here — inserting it inside `Update` (mid-physics-frame) violates Avian's island solver invariant. A separate `freeze_on_map_transition` system runs in `PostUpdate`, detects `Added<PendingTransition>`, and inserts `(RigidBodyDisabled, ColliderDisabled)`.
 2. Room transitions (remove from old, add to new) — both client sender and player entity
 3. Update `MapInstanceId` to new variant (replicates to client)
 4. Update `ChunkTarget.map_entity` to server-local map entity
 5. Set `Position` to new map spawn point, zero `LinearVelocity`
 6. Send `MapTransitionStart` to the client
 
-After client confirms chunks loaded (or timeout): remove `RigidBodyDisabled` + `DisableRollback`.
+The `PendingTransition` component serves as the double-transition guard: `handle_map_switch_requests` checks `With<PendingTransition>` before processing a new request.
+
+After client confirms chunks loaded (or timeout): remove `(RigidBodyDisabled, ColliderDisabled, DisableRollback, PendingTransition, TransitionUnfreezeTimer)`.
 
 For server-initiated transitions (portals, game events), the server calls the same transition function directly, bypassing `PlayerMapSwitchRequest`.
 
@@ -341,17 +358,17 @@ For server-initiated transitions (portals, game events), the server calls the sa
 
 ### 19. Client-Side Transition
 
-1. Receive `MapTransitionStart` → set `MapTransitionState::Transitioning`
-2. `OnEnter(Transitioning)`: insert `RigidBodyDisabled` + `DisableRollback` on player, show loading UI
+1. Receive `MapTransitionStart` → insert `(RigidBodyDisabled, ColliderDisabled, DisableRollback, PendingTransition(target))` on the player entity, then set `MapTransitionState::Transitioning`
+2. `OnEnter(Transitioning)`: show loading UI
 3. Spawn new client-local `VoxelMapInstance` for target map if not already in `MapRegistry`
 4. Register in `MapRegistry`
 5. Update player entity's local `ChunkTarget.map_entity` to new client-local map entity
-6. Wait for chunks to load
+6. Wait for chunks to load — `check_transition_chunks_loaded` queries the player entity for `&PendingTransition` to find the target map; no separate resource is needed
 
 **Chunk loading completion**: The reliable check is `desired_chunks ⊆ loaded_chunks && pending.tasks.is_empty()`. Since `collect_desired_positions` computes the desired set transiently each frame (not persisted), a `desired_chunks` field should be added to `VoxelMapInstance` (or a separate component). `MAX_TASKS_PER_FRAME = 32` means `pending.tasks.is_empty()` can be momentarily true while more chunks still need spawning — checking pending alone is unreliable.
 
-7. When loaded → set `MapTransitionState::Playing`
-8. `OnExit(Transitioning)`: remove `RigidBodyDisabled` + `DisableRollback`, hide loading UI
+7. When loaded → remove `(RigidBodyDisabled, ColliderDisabled, DisableRollback, PendingTransition)` from player, set `MapTransitionState::Playing`
+8. `OnExit(Transitioning)`: hide loading UI
 
 ### 20. Spatial Overlap Between Concurrent Maps
 
@@ -386,8 +403,9 @@ Components registered with lightyear at [lib.rs:167-209](crates/protocol/src/lib
 
 | Component | `add_prediction()` | `add_map_entities()` |
 |-----------|:--:|:--:|
-| `ChunkTarget` | no | **yes** |
 | `PlayerId` | no | no |
+| `MapInstanceId` | no | no |
+| `PendingTransition` | no | no |
 | `CharacterMarker` | **yes** | no |
 | `Health` | **yes** | no |
 | `Position` | **yes** | no |
@@ -396,6 +414,8 @@ Components registered with lightyear at [lib.rs:167-209](crates/protocol/src/lib
 | `AngularVelocity` | **yes** | no |
 | `ActiveAbility` | **yes** | **yes** |
 | `AbilityCooldowns` | **yes** | no |
+
+`ChunkTarget` is no longer registered with lightyear — it is local-only on both sides, derived from `MapInstanceId` + `MapRegistry`.
 
 ## Code References
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use avian3d::prelude::RigidBodyDisabled;
+use avian3d::prelude::{ColliderDisabled, RigidBodyDisabled};
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use lightyear::prelude::{
@@ -10,8 +10,8 @@ use lightyear::prelude::{
 };
 use protocol::map::{MapChannel, MapSwitchTarget, MapTransitionStart, PlayerMapSwitchRequest};
 use protocol::{
-    CharacterMarker, MapInstanceId, MapRegistry, MapWorld, VoxelChannel, VoxelEditBroadcast,
-    VoxelEditRequest, VoxelStateSync, VoxelType,
+    CharacterMarker, MapInstanceId, MapRegistry, MapWorld, PendingTransition, VoxelChannel,
+    VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
 use serde::{Deserialize, Serialize};
 use voxel_map_engine::prelude::{
@@ -35,10 +35,6 @@ impl RoomRegistry {
         })
     }
 }
-
-/// Marker: player is currently transitioning maps. Prevents double-transitions.
-#[derive(Component)]
-pub struct MapTransitioning;
 
 /// Timer-based unfreeze until client confirmation is implemented.
 #[derive(Component)]
@@ -412,7 +408,7 @@ pub fn handle_map_switch_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<PlayerMapSwitchRequest>)>,
     mut senders: Query<&mut MessageSender<MapTransitionStart>>,
     controlled_query: Query<(Entity, &ControlledBy, &MapInstanceId), With<CharacterMarker>>,
-    transitioning: Query<(), With<MapTransitioning>>,
+    pending: Query<(), With<PendingTransition>>,
     remote_ids: Query<&RemoteId>,
     mut registry: ResMut<MapRegistry>,
     mut room_registry: ResMut<RoomRegistry>,
@@ -429,7 +425,7 @@ pub fn handle_map_switch_requests(
                     )
                 });
 
-            if transitioning.get(player_entity).is_ok() {
+            if pending.get(player_entity).is_ok() {
                 warn!("Player {player_entity:?} already transitioning, ignoring request");
                 continue;
             }
@@ -483,9 +479,12 @@ fn execute_server_transition(
 ) {
     info!("Transitioning player {player_entity:?} from {current_map_id:?} to {target_map_id:?}");
 
-    commands
-        .entity(player_entity)
-        .insert((RigidBodyDisabled, DisableRollback, MapTransitioning));
+    commands.entity(player_entity).insert((
+        DisableRollback,
+        ColliderDisabled,
+        RigidBodyDisabled,
+        PendingTransition(target_map_id.clone()),
+    ));
 
     let old_room = room_registry.get_or_create(current_map_id, commands);
     let new_room = room_registry.get_or_create(target_map_id, commands);
@@ -558,10 +557,13 @@ fn ensure_map_exists(
         }
         MapInstanceId::Homebase { owner } => {
             let bounds = IVec3::new(4, 4, 4);
+            let (instance, config, marker) =
+                VoxelMapInstance::homebase(*owner, bounds, Arc::new(flat_terrain_voxels));
             let entity = commands
                 .spawn((
-                    VoxelMapInstance::new(3),
-                    VoxelMapConfig::new(*owner, 4, Some(bounds), 3, Arc::new(flat_terrain_voxels)),
+                    instance,
+                    config,
+                    marker,
                     Transform::default(),
                     map_id.clone(),
                 ))
@@ -584,8 +586,9 @@ pub fn tick_transition_unfreeze(
             info!("Unfreezing player {entity:?} after transition timer");
             commands.entity(entity).remove::<(
                 RigidBodyDisabled,
+                ColliderDisabled,
                 DisableRollback,
-                MapTransitioning,
+                PendingTransition,
                 TransitionUnfreezeTimer,
             )>();
         }

@@ -1,9 +1,9 @@
+use ::client::map::handle_map_transition_start;
 use ::client::network::{ClientNetworkConfig, ClientNetworkPlugin, ClientTransport};
-use ::server::map::{
-    handle_map_switch_requests, tick_transition_unfreeze, MapTransitioning, RoomRegistry,
-};
+use ::server::map::{handle_map_switch_requests, tick_transition_unfreeze, RoomRegistry};
 use ::server::network::{ServerNetworkConfig, ServerNetworkPlugin, ServerTransport};
 use bevy::prelude::*;
+use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use lightyear::connection::client::PeerMetadata;
 use lightyear::prelude::client as lightyear_client;
@@ -17,6 +17,7 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use ui::{ClientState, MapTransitionState};
 use voxel_map_engine::prelude::{flat_terrain_voxels, VoxelMapConfig, VoxelMapInstance};
 
 /// Simplified test stepper for crossbeam transport testing
@@ -915,14 +916,14 @@ fn map_switch_request_triggers_transition_start() {
             target: MapSwitchTarget::Homebase,
         });
 
-    // Poll until character gets MapTransitioning (message delivery is async via crossbeam ticks)
+    // Poll until character gets PendingTransition (message delivery is async via crossbeam ticks)
     let mut got_transitioning = false;
     for _ in 0..30 {
         stepper.tick_step(1);
         if stepper
             .server_app
             .world()
-            .get::<MapTransitioning>(character)
+            .get::<PendingTransition>(character)
             .is_some()
         {
             got_transitioning = true;
@@ -931,7 +932,7 @@ fn map_switch_request_triggers_transition_start() {
     }
     assert!(
         got_transitioning,
-        "Character should have MapTransitioning marker after request"
+        "Character should have PendingTransition marker after request"
     );
 
     // Poll until client receives MapTransitionStart
@@ -1006,7 +1007,7 @@ fn duplicate_switch_request_ignored() {
             target: MapSwitchTarget::Homebase,
         });
 
-    // Poll until MapTransitioning is applied — ensures deferred commands are flushed
+    // Poll until PendingTransition is applied — ensures deferred commands are flushed
     // before sending the second request, so the guard check is reliable
     let mut transitioning = false;
     for _ in 0..30 {
@@ -1014,7 +1015,7 @@ fn duplicate_switch_request_ignored() {
         if stepper
             .server_app
             .world()
-            .get::<MapTransitioning>(character)
+            .get::<PendingTransition>(character)
             .is_some()
         {
             transitioning = true;
@@ -1023,7 +1024,7 @@ fn duplicate_switch_request_ignored() {
     }
     assert!(
         transitioning,
-        "Character must be MapTransitioning before sending duplicate request"
+        "Character must have PendingTransition before sending duplicate request"
     );
 
     // Second request while already transitioning — should be ignored
@@ -1047,5 +1048,225 @@ fn duplicate_switch_request_ignored() {
         buffer.messages.len(),
         1,
         "Client should receive only one MapTransitionStart; duplicate request must be ignored"
+    );
+}
+
+/// Both the server and the client App spawn homebase map entities through their real systems.
+/// Server: handle_map_switch_requests → ensure_map_exists → VoxelMapInstance::homebase()
+/// Client: handle_map_transition_start → spawn_map_instance
+/// Then verify both produce identical VoxelMapConfig (seed, bounds, tree_height).
+#[test]
+fn server_and_client_spawn_matching_homebase_configs() {
+    const TEST_CLIENT_ID: u64 = 42;
+
+    let (crossbeam_client, crossbeam_server) = lightyear_crossbeam::CrossbeamIo::new_pair();
+
+    let mut server_app = App::new();
+    server_app.add_plugins(MinimalPlugins);
+    server_app.add_plugins(ServerPlugins {
+        tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    });
+    server_app.add_plugins(ProtocolPlugin);
+    server_app.add_plugins(lightyear::prelude::RoomPlugin);
+    server_app.init_resource::<MapRegistry>();
+    server_app.init_resource::<RoomRegistry>();
+    server_app.init_resource::<MapWorld>();
+    server_app.add_systems(
+        Update,
+        (handle_map_switch_requests, tick_transition_unfreeze),
+    );
+    server_app.finish();
+    server_app.cleanup();
+
+    let mut client_app = App::new();
+    client_app.add_plugins(MinimalPlugins);
+    client_app.add_plugins(StatesPlugin);
+    client_app.add_plugins(ClientPlugins {
+        tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    });
+    client_app.add_plugins(ProtocolPlugin);
+    client_app.insert_state(ClientState::InGame);
+    client_app.add_sub_state::<MapTransitionState>();
+    client_app.init_resource::<MapRegistry>();
+    client_app.add_systems(Update, handle_map_transition_start);
+    client_app.finish();
+    client_app.cleanup();
+
+    let tick_duration = Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ);
+    let mut current_time = bevy::platform::time::Instant::now();
+    server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+    client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+
+    let server_entity = server_app
+        .world_mut()
+        .spawn((
+            Name::new("Test Server"),
+            Server::default(),
+            RawServer,
+            DeltaManager::default(),
+            crossbeam_server.clone(),
+        ))
+        .id();
+
+    let client_entity = client_app
+        .world_mut()
+        .spawn((
+            Name::new("Test Client"),
+            Client::default(),
+            PingManager::new(PingConfig {
+                ping_interval: Duration::ZERO,
+            }),
+            ReplicationSender::default(),
+            ReplicationReceiver::default(),
+            crossbeam_client.clone(),
+            PredictionManager::default(),
+            RawClient,
+            Linked,
+        ))
+        .id();
+
+    let client_of_entity = server_app
+        .world_mut()
+        .spawn((
+            Name::new("Test ClientOf"),
+            LinkOf {
+                server: server_entity,
+            },
+            PingManager::new(PingConfig {
+                ping_interval: Duration::ZERO,
+            }),
+            ReplicationSender::default(),
+            ReplicationReceiver::default(),
+            Link::new(None),
+            PeerAddr(SocketAddr::from(([127, 0, 0, 1], 9999))),
+            Linked,
+            crossbeam_server,
+        ))
+        .id();
+
+    server_app.world_mut().commands().trigger(Start {
+        entity: server_entity,
+    });
+    server_app.update();
+    client_app.world_mut().commands().trigger(Connect {
+        entity: client_entity,
+    });
+    client_app.update();
+
+    for _ in 0..50 {
+        current_time += tick_duration;
+        server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+        client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+        server_app.update();
+        client_app.update();
+        if client_app.world().get::<Connected>(client_entity).is_some() {
+            break;
+        }
+    }
+    assert!(
+        client_app.world().get::<Connected>(client_entity).is_some(),
+        "Client must connect"
+    );
+
+    let overworld = server_app
+        .world_mut()
+        .spawn((
+            VoxelMapInstance::new(3),
+            VoxelMapConfig::new(0, 1, None, 3, Arc::new(flat_terrain_voxels)),
+            Transform::default(),
+            MapInstanceId::Overworld,
+        ))
+        .id();
+    server_app
+        .world_mut()
+        .resource_mut::<MapRegistry>()
+        .insert(MapInstanceId::Overworld, overworld);
+
+    let character = server_app
+        .world_mut()
+        .spawn((
+            CharacterMarker,
+            MapInstanceId::Overworld,
+            ControlledBy {
+                owner: client_of_entity,
+                lifetime: Default::default(),
+            },
+        ))
+        .id();
+
+    server_app
+        .world_mut()
+        .entity_mut(client_of_entity)
+        .insert(RemoteId(PeerId::Netcode(TEST_CLIENT_ID)));
+
+    // Predicted player required by handle_map_transition_start
+    client_app
+        .world_mut()
+        .spawn((CharacterMarker, Predicted, Controlled));
+
+    client_app
+        .world_mut()
+        .entity_mut(client_entity)
+        .get_mut::<MessageSender<PlayerMapSwitchRequest>>()
+        .expect("client entity must have MessageSender<PlayerMapSwitchRequest>")
+        .send::<MapChannel>(PlayerMapSwitchRequest {
+            target: MapSwitchTarget::Homebase,
+        });
+
+    let _ = character; // used above for spawn; server systems find it via ControlledBy query
+
+    for _ in 0..40 {
+        current_time += tick_duration;
+        server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+        client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+        server_app.update();
+        client_app.update();
+
+        let client_has_homebase = client_app
+            .world()
+            .resource::<MapRegistry>()
+            .0
+            .keys()
+            .any(|id| matches!(id, MapInstanceId::Homebase { .. }));
+        if client_has_homebase {
+            break;
+        }
+    }
+
+    let server_homebase_entity = server_app
+        .world()
+        .resource::<MapRegistry>()
+        .0
+        .iter()
+        .find(|(id, _)| matches!(id, MapInstanceId::Homebase { .. }))
+        .map(|(_, &e)| e)
+        .expect("Server must have spawned homebase");
+
+    let client_homebase_entity = client_app
+        .world()
+        .resource::<MapRegistry>()
+        .0
+        .iter()
+        .find(|(id, _)| matches!(id, MapInstanceId::Homebase { .. }))
+        .map(|(_, &e)| e)
+        .expect("Client must have spawned homebase");
+
+    let server_config = server_app
+        .world()
+        .get::<VoxelMapConfig>(server_homebase_entity)
+        .expect("Server homebase must have VoxelMapConfig");
+    let client_config = client_app
+        .world()
+        .get::<VoxelMapConfig>(client_homebase_entity)
+        .expect("Client homebase must have VoxelMapConfig");
+
+    assert_eq!(server_config.seed, client_config.seed, "seed must match");
+    assert_eq!(
+        server_config.bounds, client_config.bounds,
+        "bounds must match"
+    );
+    assert_eq!(
+        server_config.tree_height, client_config.tree_height,
+        "tree_height must match"
     );
 }
