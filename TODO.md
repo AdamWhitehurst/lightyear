@@ -1,3 +1,7 @@
+- bevi-inspector-egui
+- map as dir saving chunks, entities as files 
+- wave function collapse
+- Overgrowth-style sprite rig animations
 - Extend voxel_map_engine to support inserting pre-authored chunks
 - Extend voxel_map_engine to load full maps for pre-authored instances
 - buff stat modifiers
