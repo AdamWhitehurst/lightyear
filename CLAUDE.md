@@ -29,15 +29,15 @@
 
 ## Code Style
 
-- When comments would be used, try to split code into self-descriptive functions instead
-- Use doc-comments that describe types and functions. Use regular comments sparingly
+- When comments would be used, split code into self-descriptive functions instead
+- Add doc-comments that describe types and functions. Use regular comments sparingly
 - Do not use regional-separation comments
 - Avoid large functions. Break them into smaller, atomic, self-describing functions.
 - **Demand elegance.**
   - For non-trivial tasks: Pause and ask "is there a more elegant way?"
   - Challenge your own work before presenting it.
-- Always log warnings (`warn!`) when an unexpected situation occurs (e.g. entity lookup fails, ability ID not found in defs). Never silently
-  `continue` past a condition that indicates something is wrong.
+- Never silently `return` or `continue` past a condition that indicates something is wrong
+- **[HIGH]** Use `debug_assert!` and `expect()` instead of silently `return`ing or `continue`ing from unexpected situations. These failures need to be caught early during testing.
 
 ## Verification Rules
 
