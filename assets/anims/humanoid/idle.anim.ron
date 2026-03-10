@@ -1,0 +1,27 @@
+#![enable(implicit_some)]
+(
+    name: "idle",
+    duration: 2.0,
+    looping: true,
+    bone_timelines: {
+        "torso": (
+            rotation: [
+                (time: 0.0, value: 0.0,  curve: Linear),
+                (time: 1.0, value: 1.5,  curve: Linear),
+                (time: 2.0, value: 0.0,  curve: Linear),
+            ],
+            translation: [],
+            scale: [],
+        ),
+        "head": (
+            rotation: [
+                (time: 0.0, value: 0.0,  curve: Linear),
+                (time: 1.0, value: -1.0, curve: Linear),
+                (time: 2.0, value: 0.0,  curve: Linear),
+            ],
+            translation: [],
+            scale: [],
+        ),
+    },
+    events: [],
+)

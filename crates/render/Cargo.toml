@@ -8,3 +8,4 @@ avian3d = { workspace = true }
 bevy = { workspace = true, default-features = true }
 lightyear = { workspace = true, features = ["frame_interpolation"] }
 protocol = { workspace = true }
+sprite_rig = { path = "../sprite_rig" }

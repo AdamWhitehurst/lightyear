@@ -61,6 +61,7 @@ bevy-lightyear-template/
 │   ├── client/         # Native client with voxel rendering
 │   ├── web/            # WASM client
 │   ├── render/         # 3D rendering systems
+│   ├── sprite_rig/     # 2D sprite rig animation system
 │   └── ui/             # UI components
 ├── assets/             # Game assets (ability definitions, etc.)
 ├── certificates/       # TLS certificates (generated)

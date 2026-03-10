@@ -1,0 +1,15 @@
+#![enable(implicit_some)]
+(
+    rig: "rigs/humanoid.rig.ron",
+    locomotion: (
+        entries: [
+            (clip: "anims/humanoid/idle.anim.ron", speed_threshold: 0.0),
+            (clip: "anims/humanoid/walk.anim.ron", speed_threshold: 2.0),
+            (clip: "anims/humanoid/run.anim.ron",  speed_threshold: 6.0),
+        ],
+    ),
+    ability_animations: {
+        "punch": "anims/humanoid/punch.anim.ron",
+    },
+    hit_react: None,
+)

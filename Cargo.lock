@@ -6280,6 +6280,7 @@ dependencies = [
  "bevy",
  "lightyear",
  "protocol",
+ "sprite_rig",
 ]
 
 [[package]]
@@ -6902,6 +6903,19 @@ dependencies = [
  "base64ct",
  "der",
  "sha2",
+]
+
+[[package]]
+name = "sprite_rig"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "avian3d",
+ "bevy",
+ "bevy_common_assets",
+ "protocol",
+ "serde",
+ "test-log",
 ]
 
 [[package]]

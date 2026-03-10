@@ -72,6 +72,15 @@ pub struct CharacterMarker;
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DummyTarget;
 
+/// Determines which sprite rig and animation set a character uses on the client.
+#[derive(
+    Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Reflect, Default,
+)]
+pub enum CharacterType {
+    #[default]
+    Humanoid,
+}
+
 /// Marks a respawn location. Server-only, not replicated.
 #[derive(Component, Clone, Debug)]
 pub struct RespawnPoint;
@@ -192,6 +201,7 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<Name>();
         app.register_component::<CharacterMarker>().add_prediction();
         app.register_component::<DummyTarget>().add_prediction();
+        app.register_component::<CharacterType>().add_prediction();
         app.register_component::<Health>().add_prediction();
         app.register_component::<Invulnerable>().add_prediction();
 

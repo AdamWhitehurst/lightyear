@@ -38,6 +38,8 @@ impl Plugin for RenderPlugin {
         app.add_observer(health_bar::on_invulnerable_added);
         app.add_observer(health_bar::on_invulnerable_removed);
 
+        app.add_plugins(sprite_rig::SpriteRigPlugin);
+
         // FrameInterpolationPlugin for visual smoothing between physics ticks
         app.add_plugins(FrameInterpolationPlugin::<Position>::default());
         app.add_plugins(FrameInterpolationPlugin::<avian3d::prelude::Rotation>::default());

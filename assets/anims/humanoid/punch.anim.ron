@@ -1,0 +1,21 @@
+#![enable(implicit_some)]
+(
+    name: "punch",
+    duration: 0.35,
+    looping: false,
+    bone_timelines: {
+        "torso": (
+            rotation: [(time: 0.0, value: -8.0, curve: Linear), (time: 0.1, value: 8.0, curve: Linear), (time: 0.35, value: 0.0, curve: Linear)],
+            translation: [],
+            scale: [],
+        ),
+        "arm_r": (
+            rotation: [(time: 0.0, value: -40.0, curve: Linear), (time: 0.1, value: 20.0, curve: Linear), (time: 0.35, value: 0.0, curve: Linear)],
+            translation: [],
+            scale: [],
+        ),
+    },
+    events: [
+        (time: 0.1, name: "punch_whoosh"),
+    ],
+)

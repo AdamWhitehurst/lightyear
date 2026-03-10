@@ -68,6 +68,7 @@ fn spawn_dummy_target(mut commands: Commands, registry: Res<MapRegistry>) {
         CharacterPhysicsBundle::default(),
         ColorComponent(css::GRAY.into()),
         CharacterMarker,
+        CharacterType::Humanoid,
         MapInstanceId::Overworld,
         Health::new(100.0),
         ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 1),
@@ -193,26 +194,30 @@ fn handle_connected(
     let x = 4.0 * angle.cos();
     let z = 4.0 * angle.sin();
 
-    commands.spawn((
-        Name::new("Character"),
-        PlayerId(peer_id),
-        Position(Vec3::new(x, 30.0, z)),
-        Rotation::default(),
-        ActionState::<PlayerActions>::default(),
-        Replicate::to_clients(NetworkTarget::All),
-        PredictionTarget::to_clients(NetworkTarget::All),
-        ControlledBy {
-            owner: client_entity,
-            lifetime: Default::default(),
-        },
-        CharacterPhysicsBundle::default(),
-        ColorComponent(color.into()),
-        CharacterMarker,
-        MapInstanceId::Overworld,
-        Health::new(100.0),
-        AbilityCooldowns::default(),
-        ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 4),
-    ));
+    commands
+        .spawn((
+            Name::new("Character"),
+            PlayerId(peer_id),
+            Position(Vec3::new(x, 30.0, z)),
+            Rotation::default(),
+            ActionState::<PlayerActions>::default(),
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+            ControlledBy {
+                owner: client_entity,
+                lifetime: Default::default(),
+            },
+            CharacterPhysicsBundle::default(),
+            ColorComponent(color.into()),
+            CharacterMarker,
+            CharacterType::Humanoid,
+            MapInstanceId::Overworld,
+        ))
+        .insert((
+            Health::new(100.0),
+            AbilityCooldowns::default(),
+            ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 4),
+        ));
 
     let room = room_registry.get_or_create(&MapInstanceId::Overworld, &mut commands);
     commands.trigger(RoomEvent {

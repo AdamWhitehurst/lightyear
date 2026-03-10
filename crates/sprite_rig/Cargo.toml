@@ -1,0 +1,15 @@
+[package]
+name = "sprite_rig"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+avian3d = { workspace = true }
+bevy = { workspace = true, features = ["bevy_animation"] }
+bevy_common_assets = { workspace = true }
+protocol = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+approx = { workspace = true }
+test-log = { workspace = true }
