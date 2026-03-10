@@ -33,7 +33,7 @@ Research source: `doc/research/2026-03-07-sprite-rig-animation-overgrowth.md`
 
 Characters visually appear as 2D sprite rigs billboarded in the 3D world. Bone sprites animate
 through idle/walk/run locomotion states driven by velocity. Ability activations trigger corresponding
-animations. Sprites can be flipped horizontally based on facing direction.
+animations. The rig billboard flips horizontally based on facing direction.
 
 ### Verification
 - `cargo client` — characters appear as colored rectangle bone hierarchies (placeholders for real
@@ -80,17 +80,18 @@ crates/render/src/
    rig share clip and graph assets. Per-instance `AnimationPlayer` + `AnimationTransitions` hold
    independent playback state.
 
-2. **Billboard**: system sets rig root rotation to face camera each frame (same pattern as
-   `health_bar::billboard_face_camera`).
+2. **Billboard**: a `RigBillboard` child entity is spawned under the character; all bones are
+   children of the billboard. A system rotates the billboard to face the camera each frame
+   (same pattern as `health_bar::billboard_face_camera`).
 
-3. **Placeholder sprites**: `Sprite { custom_size: Some(Vec2::new(w, h)), color, ..default() }` —
-   no image files required. The 1×1 white fallback image (`Handle::<Image>::default()`) is used.
+3. **Placeholder quads**: `Mesh3d(Plane3d)` + `MeshMaterial3d(StandardMaterial { unlit: true, cull_mode: None })` —
+   colored 3D quads visible in the 3D scene. No image files required for placeholders.
 
 4. **Hot-reload**: `AssetEvent::Modified { id }` on `SpriteAnimAsset` triggers in-place clip
    replacement via `clips.insert(handle.id(), new_clip)`.
 
-5. **Capsule kept**: the 3D capsule mesh remains for now. Sprite rig is added alongside it as a
-   child hierarchy. Capsule removal is a separate cleanup task.
+5. **Capsule removed**: the sprite rig replaces the capsule mesh. The physics collider (capsule)
+   remains but the visual capsule is removed.
 
 ---
 
@@ -118,8 +119,6 @@ serde = { workspace = true, features = ["derive"] }
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-// ── Rig definition ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize, Asset, TypePath)]
 pub struct SpriteRigAsset {
@@ -171,8 +170,6 @@ pub enum SpriteAnchorDef {
     BottomCenter,
 }
 
-// ── Animation definition ─────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize, Asset, TypePath)]
 pub struct SpriteAnimAsset {
     pub name: String,
@@ -223,8 +220,6 @@ pub struct AnimEventKeyframe {
     pub name: String,
 }
 
-// ── Animation set ────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize, Asset, TypePath)]
 pub struct SpriteAnimSetAsset {
     pub rig: String,
@@ -254,12 +249,12 @@ pub struct LocomotionEntry {
 (
     bones: [
         (name: "root",  parent: None,          default_transform: (translation: (0.0, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "torso", parent: Some("root"),  default_transform: (translation: (0.0, 0.6), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "head",  parent: Some("torso"), default_transform: (translation: (0.0, 0.8), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "arm_l", parent: Some("torso"), default_transform: (translation: (-0.35, 0.3), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "arm_r", parent: Some("torso"), default_transform: (translation: (0.35, 0.3), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "leg_l", parent: Some("root"),  default_transform: (translation: (-0.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "leg_r", parent: Some("root"),  default_transform: (translation: (0.2, 0.0),  rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "torso", parent: Some("root"),  default_transform: (translation: (0.0, 1.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "head",  parent: Some("torso"), default_transform: (translation: (0.0, 1.8), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "arm_l", parent: Some("torso"), default_transform: (translation: (-1.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "arm_r", parent: Some("torso"), default_transform: (translation: (1.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "leg_l", parent: Some("root"),  default_transform: (translation: (-0.5, -1.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "leg_r", parent: Some("root"),  default_transform: (translation: (0.5, -1.0),  rotation: 0.0, scale: (1.0, 1.0))),
     ],
     slots: [
         (name: "torso", bone: "torso", z_order: 0.0,  default_attachment: "torso_default"),
@@ -271,10 +266,10 @@ pub struct LocomotionEntry {
     ],
     skins: {
         "default": {
-            "torso_default": (image: "sprites/brawler/torso.png", anchor: Center,       size: (0.5, 0.7)),
-            "head_default":  (image: "sprites/brawler/head.png",  anchor: BottomCenter, size: (0.45, 0.45)),
-            "arm_default":   (image: "sprites/brawler/arm.png",   anchor: TopCenter,    size: (0.22, 0.5)),
-            "leg_default":   (image: "sprites/brawler/leg.png",   anchor: TopCenter,    size: (0.22, 0.6)),
+            "torso_default": (image: "sprites/brawler/torso.png", anchor: Center,       size: (2.0, 2.5)),
+            "head_default":  (image: "sprites/brawler/head.png",  anchor: BottomCenter, size: (1.5, 1.5)),
+            "arm_default":   (image: "sprites/brawler/arm.png",   anchor: TopCenter,    size: (0.8, 2.0)),
+            "leg_default":   (image: "sprites/brawler/leg.png",   anchor: TopCenter,    size: (1.0, 2.5)),
         },
     },
 )
@@ -489,8 +484,8 @@ Add `SpriteRigPlugin` to `RenderPlugin::build`.
 ### Success Criteria — Phase 1
 
 #### Automated Verification
-- [ ] `cargo check-all` passes with no errors
-- [ ] `cargo client` starts, logs show rig/anim assets loaded (no asset errors in console)
+- [x] `cargo check-all` passes with no errors
+- [x] `cargo client` starts, logs show rig/anim assets loaded (no asset errors in console)
 
 ---
 
@@ -535,7 +530,7 @@ Steps:
 5. Spawn bone entities as children. Each bone entity gets:
    - `Name::new(bone_name.clone())`
    - `Transform` built from `BoneDef.default_transform`: `Transform { translation: Vec3::new(x, y, z_order), rotation: Quat::from_rotation_z(degrees.to_radians()), scale: Vec3::new(sx, sy, 1.0) }`
-   - `Sprite { custom_size: Some(bone_display_size(bone_name)), color: placeholder_color(bone_name), ..default() }` — colored rectangles as placeholders
+   - `Mesh3d(Plane3d::new(Vec3::Z, size / 2.0))` + `MeshMaterial3d(StandardMaterial { base_color: color, unlit: true, cull_mode: None })` — unlit 3D quads as placeholders
 6. Insert `BoneEntities` on the character root.
 
 ```rust
@@ -543,15 +538,18 @@ fn spawn_sprite_rigs(
     mut commands: Commands,
     query: Query<(Entity, &SpriteRig), Added<SpriteRig>>,
     rig_assets: Res<Assets<SpriteRigAsset>>,
-    animset_handle: Res<DefaultAnimSetHandle>,
-    animset_assets: Res<Assets<SpriteAnimSetAsset>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for (entity, rig_component) in &query {
         let Some(rig) = rig_assets.get(&rig_component.0) else {
-            warn!(?entity, "SpriteRig asset not loaded at spawn time");
+            debug_assert!(false, "SpriteRig asset not loaded at spawn time");
             continue;
         };
-        let bone_map = spawn_bone_hierarchy(&mut commands, entity, rig);
+        let slot_lookups = build_slot_lookups(rig);
+        let sorted_bones = topological_sort_bones(&rig.bones);
+        let billboard_id = spawn_billboard(&mut commands, entity);
+        let bone_map = spawn_bone_hierarchy(&mut commands, billboard_id, &sorted_bones, &slot_lookups, &mut meshes, &mut materials);
         commands.entity(entity).insert(BoneEntities(bone_map));
     }
 }
@@ -562,21 +560,28 @@ fn spawn_sprite_rigs(
 
 ### 2.3 Billboard system
 
-Each frame, rotate the character root's Transform to face the camera (project onto the XZ plane,
-rotate around Y). Follow the existing `billboard_face_camera` pattern in `health_bar.rs`.
+Each frame, rotate the `RigBillboard` child entity to face the camera (project onto the XZ plane).
+A `RigBillboard` marker component is spawned as a child of the character; all bone entities are
+children of this billboard. Follows the existing `billboard_face_camera` pattern in `health_bar.rs`.
 
 ```rust
 fn billboard_rigs_face_camera(
-    mut rigs: Query<&mut Transform, With<SpriteRig>>,
-    camera: Query<&GlobalTransform, With<Camera3d>>,
+    camera_query: Query<&GlobalTransform, With<Camera3d>>,
+    mut billboard_query: Query<(&GlobalTransform, &mut Transform, &ChildOf), With<RigBillboard>>,
+    parent_query: Query<&GlobalTransform, Without<RigBillboard>>,
 ) {
-    let Ok(cam_transform) = camera.single() else { return };
-    let cam_pos = cam_transform.translation();
-    for mut transform in &mut rigs {
-        let to_cam = (cam_pos - transform.translation).with_y(0.0);
-        if to_cam.length_squared() > 0.0001 {
-            transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, to_cam.normalize());
-        }
+    let Ok(camera_gt) = camera_query.single() else { return };
+    let camera_pos = camera_gt.translation();
+    for (global_transform, mut transform, child_of) in &mut billboard_query {
+        let billboard_pos = global_transform.translation();
+        let direction = (camera_pos - billboard_pos).with_y(0.0);
+        if direction.length_squared() < 0.001 { continue; }
+        let world_rotation = Quat::from_rotation_arc(Vec3::Z, direction.normalize());
+        let parent_rotation = parent_query
+            .get(child_of.parent())
+            .map(|gt| gt.to_scale_rotation_translation().1)
+            .unwrap_or(Quat::IDENTITY);
+        transform.rotation = parent_rotation.inverse() * world_rotation;
     }
 }
 ```
@@ -584,15 +589,20 @@ fn billboard_rigs_face_camera(
 ### 2.4 Facing direction
 
 ```rust
-fn apply_facing_to_rig_sprites(
-    characters: Query<(&Facing, &BoneEntities), Changed<Facing>>,
-    mut sprites: Query<&mut Sprite>,
+fn apply_facing_to_rig(
+    characters: Query<(Entity, &Facing), Changed<Facing>>,
+    children_query: Query<&Children>,
+    mut billboard_query: Query<&mut Transform, With<RigBillboard>>,
 ) {
-    for (facing, bones) in &characters {
-        let flip = *facing == Facing::Left;
-        for &bone_entity in bones.0.values() {
-            if let Ok(mut sprite) = sprites.get_mut(bone_entity) {
-                sprite.flip_x = flip;
+    for (entity, facing) in &characters {
+        let scale_x = match facing {
+            Facing::Left => -1.0,
+            Facing::Right => 1.0,
+        };
+        let Ok(children) = children_query.get(entity) else { continue };
+        for child in children.iter() {
+            if let Ok(mut transform) = billboard_query.get_mut(child) {
+                transform.scale.x = scale_x;
             }
         }
     }
@@ -607,9 +617,9 @@ fn update_facing_from_velocity(
 ) {
     for (mut facing, velocity) in &mut characters {
         if velocity.x > 0.1 {
-            *facing = Facing::Right;
+            facing.set_if_neq(Facing::Right);
         } else if velocity.x < -0.1 {
-            *facing = Facing::Left;
+            facing.set_if_neq(Facing::Left);
         }
     }
 }
@@ -650,7 +660,7 @@ Then `add_character_meshes` takes `Res<DefaultRigHandle>` and inserts `SpriteRig
 ### Success Criteria — Phase 2
 
 #### Automated Verification
-- [ ] `cargo check-all` passes
+- [x] `cargo check-all` passes
 
 #### Manual Verification
 - [ ] `cargo client` — colored rectangle bone hierarchies appear on character entities, facing the camera
@@ -919,7 +929,7 @@ fn select_locomotion_clip<'a>(speed: f32, config: &'a LocomotionConfig) -> &'a s
 ### Success Criteria — Phase 3
 
 #### Automated Verification
-- [ ] `cargo check-all` passes
+- [x] `cargo check-all` passes
 
 #### Manual Verification
 - [ ] `cargo client` — character bone rectangles animate (rotate/oscillate) through idle, walk, run
@@ -1050,7 +1060,7 @@ app.add_systems(Update, (
     spawn_sprite_rigs,
     billboard_rigs_face_camera,
     update_facing_from_velocity,
-    apply_facing_to_rig_sprites,
+    apply_facing_to_rig,
     build_animation_clips,
     build_brawler_anim_graph,
     attach_animation_players,
@@ -1098,8 +1108,8 @@ during implementation if needed.
 
 4. **`AnimationNodeIndex` type**: In Bevy 0.17 this may be a type alias. Verify import path.
 
-5. **Capsule mesh**: The `Mesh3d` capsule is kept in Phase 2-4. Remove it in a follow-up cleanup
-   once sprite rigs are visually confirmed.
+5. **Capsule mesh**: The visual `Mesh3d` capsule is removed; the sprite rig replaces it. The
+   physics capsule collider remains.
 
 6. **WASM**: `bevy_animation` and `bevy_sprite` are already in `web/Cargo.toml`. No changes needed.
    Verify `cargo run web` builds after each phase.

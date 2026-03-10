@@ -169,16 +169,19 @@ Bevy's parent-child entity system is the bone tree. Child `Transform` is local (
 
 ```rust
 commands.spawn((
-    Sprite::from_image(torso_image),
+    Mesh3d(meshes.add(Plane3d::new(Vec3::Z, torso_size / 2.0))),
+    MeshMaterial3d(materials.add(StandardMaterial { base_color: torso_color, unlit: true, cull_mode: None, ..default() })),
     Transform::from_xyz(0.0, 0.0, 0.0),
     children![
         (
-            Sprite::from_image(head_image),
-            Transform::from_xyz(0.0, 16.0, 0.1), // z for draw order
+            Mesh3d(meshes.add(Plane3d::new(Vec3::Z, head_size / 2.0))),
+            MeshMaterial3d(materials.add(StandardMaterial { base_color: head_color, unlit: true, cull_mode: None, ..default() })),
+            Transform::from_xyz(0.0, 1.8, 0.3),
         ),
         (
-            Sprite::from_image(arm_l_image),
-            Transform::from_xyz(-8.0, 4.0, -0.1),
+            Mesh3d(meshes.add(Plane3d::new(Vec3::Z, arm_size / 2.0))),
+            MeshMaterial3d(materials.add(StandardMaterial { base_color: arm_color, unlit: true, cull_mode: None, ..default() })),
+            Transform::from_xyz(-1.2, 0.0, -0.1),
         ),
     ],
 ))
@@ -258,12 +261,12 @@ Defines the bone hierarchy, sprite attachments, and default pose for a character
 (
     bones: [
         (name: "root",    parent: None,           default_transform: (translation: (0.0, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "torso",   parent: Some("root"),   default_transform: (translation: (0.0, 8.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "head",    parent: Some("torso"),   default_transform: (translation: (0.0, 12.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "arm_l",   parent: Some("torso"),   default_transform: (translation: (-6.0, 4.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "arm_r",   parent: Some("torso"),   default_transform: (translation: (6.0, 4.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "leg_l",   parent: Some("root"),   default_transform: (translation: (-3.0, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "leg_r",   parent: Some("root"),   default_transform: (translation: (3.0, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "torso",   parent: Some("root"),   default_transform: (translation: (0.0, 1.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "head",    parent: Some("torso"),  default_transform: (translation: (0.0, 1.8), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "arm_l",   parent: Some("torso"),  default_transform: (translation: (-1.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "arm_r",   parent: Some("torso"),  default_transform: (translation: (1.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "leg_l",   parent: Some("root"),   default_transform: (translation: (-0.5, -1.0), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "leg_r",   parent: Some("root"),   default_transform: (translation: (0.5, -1.0), rotation: 0.0, scale: (1.0, 1.0))),
     ],
     slots: [
         (name: "torso",  bone: "torso",  z_order: 0.0, default_attachment: "torso_default"),
@@ -395,7 +398,7 @@ What each animation state should communicate to a player:
 
 1. Load `SpriteRigAsset` from `*.rig.ron` and `SpriteAnimAsset` from `*.anim.ron` at startup
 2. When spawning a character, read the rig asset → spawn root entity + child entities per bone
-3. Each bone entity gets: `Sprite` (from active skin), `Transform` (from bone default), `AnimationTarget`
+3. Each bone entity gets: `Mesh3d` + `MeshMaterial3d` (unlit 3D quad), `Transform` (from bone default), `AnimationTarget`
 4. Build `AnimationClip`s from loaded `*.anim.ron` assets → populate with `AnimatableCurve`s per bone
 5. Build `AnimationGraph` with blend/clip nodes per the animation set
 6. Spawn `AnimationPlayer` + `AnimationGraphHandle` on root entity
@@ -429,7 +432,7 @@ The sprite rig system directly enables VISION.md features:
 | Vision Feature | Sprite Rig Mechanism |
 |---|---|
 | Stat-driven appearance (muscular, sleek) | Skin swapping: different sprite sets per body type |
-| Alignment hue-shifting | `Sprite.color` tinting on all bone entities |
+| Alignment hue-shifting | `StandardMaterial.base_color` tinting on all bone entities |
 | Inherited phenotypes | Skin selection based on genetic data |
 | Body part customization | Per-slot attachment swapping (independent of skin) |
 | Training-based visual evolution | Gradual skin transitions as stats cross thresholds |
@@ -649,7 +652,7 @@ If an ability's startup is 3 ticks at 64Hz = ~47ms, the animation clip for that 
 
 9. **Animation clip hot-reload** — See detailed analysis below.
 
-10. **Facing direction** — Use `flip_x` on all bone sprites based on the character's facing direction. A `Facing` component on the character root drives `Sprite.flip_x` on all bone child entities.
+10. **Facing direction** — Flip the `RigBillboard` entity's `Transform.scale.x` to -1.0 when facing left. A `Facing` component on the character root drives the billboard's x-scale.
 
 ---
 
