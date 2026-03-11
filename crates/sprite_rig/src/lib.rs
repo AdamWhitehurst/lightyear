@@ -1,4 +1,5 @@
 pub mod animation;
+pub mod animset;
 pub mod asset;
 pub mod spawn;
 
@@ -12,6 +13,7 @@ pub use animation::{
     AnimBoneDefaults, BuiltAnimGraphs, BuiltAnimations, LoadedAnimHandles, LocomotionBlendWeights,
     LocomotionState,
 };
+pub use animset::AnimationEventFired;
 pub use spawn::{AnimSetRef, BoneEntities, Facing, RigBillboard, SpriteRig};
 
 pub struct SpriteRigPlugin;
@@ -28,6 +30,7 @@ impl Plugin for SpriteRigPlugin {
         app.init_resource::<animation::BuiltAnimGraphs>();
         app.init_resource::<animation::AnimBoneDefaults>();
         app.add_systems(Startup, load_rig_assets);
+        app.add_observer(animset::on_animation_event_fired);
         app.add_systems(
             Update,
             (
@@ -40,6 +43,8 @@ impl Plugin for SpriteRigPlugin {
                 animation::attach_animation_players,
                 animation::start_locomotion_blend,
                 animation::update_locomotion_blend_weights,
+                animset::trigger_ability_animations,
+                animset::return_to_locomotion,
                 spawn::billboard_rigs_face_camera,
                 spawn::update_facing_from_velocity,
                 spawn::apply_facing_to_rig,

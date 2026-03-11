@@ -2,7 +2,7 @@
 
 (
     (
-        AbilityId("dive_kick"), 
+        AbilityId("punch"), 
         AbilityId("speed_burst"),
         AbilityId("shockwave"), 
         None,

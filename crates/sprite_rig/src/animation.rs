@@ -254,6 +254,8 @@ fn build_clip_from(anim: &SpriteAnimAsset, bone_defaults: &[BoneAnimDefault]) ->
         }
     }
 
+    crate::animset::add_events_to_clip(&mut clip, &anim.events);
+
     clip
 }
 

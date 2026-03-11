@@ -1383,7 +1383,7 @@ systems.
 ### Success Criteria — Phase 4
 
 #### Automated Verification
-- [ ] `cargo check-all` passes
+- [x] `cargo check-all` passes
 
 #### Manual Verification
 - [ ] `cargo client` — activating the punch ability plays the punch animation, returns to locomotion after
