@@ -1,3 +1,4 @@
+- extract crates' types into `*_types` crates and eliminate all re-exports
 - 90 degree camera rotation, w/ character facing, other characters facing other plane off by some degrees i.e. slightly visible instead 
 - bevi-inspector-egui
 - map as dir saving chunks, entities as files 
