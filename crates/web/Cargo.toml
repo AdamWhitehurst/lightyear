@@ -44,7 +44,7 @@ lightyear = { workspace = true, features = [
     "interpolation",
 ] }
 protocol = { workspace = true }
-client = { path = "../client" }
+client = { path = "../client", default-features = false }
 render = { path = "../render" }
 ui = { path = "../ui" }
 avian3d = { workspace = true }
