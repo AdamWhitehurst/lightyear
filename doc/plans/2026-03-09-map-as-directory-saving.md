@@ -2,13 +2,14 @@
 
 ## Overview
 
-Replace the single flat `world_save/voxel_world.bin` modifications file with a per-map directory structure that saves full chunk terrain data, entity state, and map metadata. Fix the unused octree bug so `VoxelMapInstance.tree` is the source of truth for loaded chunk voxel data. Extend persistence to support all map types (Overworld, Homebase). Replace client-side chunk generation with server-to-client chunk streaming. Add client-side block edit prediction with sequence-number acknowledgment. Add batched multi-block updates.
+Replace the single flat `world_save/voxel_world.bin` modifications file with a per-map directory structure that saves full chunk terrain data, entity state, and map metadata. Fix the unused octree bug so `VoxelMapInstance.tree` is the source of truth for loaded chunk voxel data. Bake voxel edits directly into the octree via `PalettedChunk::set` — eliminating `modified_voxels`, `write_buffer`, and the regenerate-on-edit cycle. Edits mutate chunk data in-place and trigger async remeshing (old mesh stays visible until the new one is ready). Extend persistence to support all map types (Overworld, Homebase). Replace client-side chunk generation with server-to-client chunk streaming. Add client-side block edit prediction with sequence-number acknowledgment. Add batched multi-block updates.
 
 ## Current State Analysis
 
 - **Persistence**: Single bincode file storing `Vec<(IVec3, VoxelType)>` modifications only
 - **Octree**: `VoxelMapInstance.tree: OctreeI32<Option<ChunkData>>` is declared but never read/written at runtime — this is a bug
 - **Chunk pipeline**: Generates voxels → meshes → **discards voxel data**. Lookups re-invoke the generator each time
+- **Edit pipeline**: `set_voxel` → `write_buffer` → `flush_write_buffer` → `modified_voxels` + chunk invalidation → full chunk regeneration with overrides → remesh. Wasteful: evicts chunk from octree and forces full regeneration just to apply one voxel change
 - **Entity persistence**: None. Respawn points hardcoded at `Vec3(0.0, 5.0, 0.0)`
 - **Multi-map**: Only Overworld saved. Homebases are ephemeral
 
@@ -49,6 +50,9 @@ worlds/
 - All map types (Overworld, Homebase) persist independently
 - Per-chunk dirty tracking — only modified chunks re-saved
 - zstd compression on chunk files
+- No `modified_voxels` or `write_buffer` — edits baked directly into octree chunk data via `PalettedChunk::set`
+- No chunk regeneration on edit — mutate in-place + async remesh only
+- Old mesh stays visible until async remesh completes
 
 ### Verification:
 - Server saves world state to directory structure on debounced timer and shutdown
@@ -76,7 +80,7 @@ worlds/
 Eight phases, each building on the previous:
 
 1. **Fix Octree** — retain chunk data after generation, use for lookups (prerequisite for everything)
-2. **Palette-Based Chunk Storage** — compress chunk data in memory and on disk
+2. **Palette-Based Chunk Storage & Direct Mutation** — compress chunk data with palette encoding; eliminate `modified_voxels`/`write_buffer`/`flush_write_buffer`; bake edits directly into octree via `PalettedChunk::set`; add async remesh pipeline (old mesh stays until new one ready)
 3. **Directory Structure & Persistence** — per-map directories, per-chunk terrain files, map metadata (server-only persistence; networking unchanged)
 4. **Entity Persistence** — `MapSaveTarget` marker, respawn point save/load
 5. **Server-to-Client Chunk Streaming** — server sends palette-compressed chunks to clients, client stops generating locally, remove `VoxelStateSync`/`VoxelModifications`/`MapWorld`
@@ -365,10 +369,14 @@ fn classify_fill_type_mixed() {
 
 ---
 
-## Phase 2: Palette-Based Chunk Storage
+## Phase 2: Palette-Based Chunk Storage & Direct Mutation
 
 ### Overview
 Replace `ChunkData`'s flat `Vec<WorldVoxel>` with a `PalettedChunk` that stores a local palette of unique voxel types and packed bit indices. Uniform chunks (all air, all solid) store only the single palette entry with no index array. This reduces memory ~4-23× for typical chunks and produces smaller save files.
+
+Eliminate `modified_voxels`, `write_buffer`, and `flush_write_buffer` entirely. When a voxel edit arrives, mutate the `PalettedChunk` in the octree directly via `PalettedChunk::set`, update neighbor chunk padding for boundary voxels, mark the chunk dirty, and spawn an async remesh task. The old mesh stays visible until the new one is ready. This replaces the wasteful invalidate → regenerate cycle with in-place mutation + remesh.
+
+**Regression note**: Until Phase 3 adds persistence, edits to chunks that are later evicted from the octree are lost (no `modified_voxels` to remember them, no disk save yet). Phase 3 fixes this by saving dirty chunks before eviction.
 
 With only 3 voxel variants (`Air`, `Unset`, `Solid(u8)`) — at most ~257 unique values — most chunks need ≤8 bits/entry. A chunk with 2 distinct voxels uses 1 bit × 4096 = 512 bytes vs 11,664 bytes flat.
 
@@ -592,29 +600,339 @@ let chunk_data = ChunkData::from_voxels(&result.voxels);
 #### 4. Update api.rs voxel lookups to use PalettedChunk
 **File**: `crates/voxel_map_engine/src/api.rs`
 
-In `get_voxel`, when reading from octree, use indexed access instead of slice lookup:
+In `get_voxel`, remove the `modified_voxels` check (no longer exists) and use indexed PalettedChunk access:
 
 ```rust
-if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
-    let local = pos - chunk_pos * CHUNK_SIZE as i32;
-    let padded = [
-        (local.x + 1) as u32,
-        (local.y + 1) as u32,
-        (local.z + 1) as u32,
-    ];
-    let index = PaddedChunkShape::linearize(padded) as usize;
-    return chunk_data.voxels.get(index);
+pub fn get_voxel(&self, map: Entity, pos: IVec3) -> WorldVoxel {
+    let Ok((instance, config)) = self.maps.get(map) else {
+        warn!("get_voxel: entity {map:?} has no VoxelMapInstance");
+        return WorldVoxel::Unset;
+    };
+
+    let chunk_pos = voxel_to_chunk_pos(pos);
+    if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
+        let local = pos - chunk_pos * CHUNK_SIZE as i32;
+        let padded = [
+            (local.x + 1) as u32,
+            (local.y + 1) as u32,
+            (local.z + 1) as u32,
+        ];
+        let index = PaddedChunkShape::linearize(padded) as usize;
+        return chunk_data.voxels.get(index);
+    }
+
+    evaluate_voxel_at(pos, &config.generator)
 }
 ```
 
-Similarly update `lookup_voxel` for raycast.
+Similarly update `lookup_voxel` for raycast — remove `modified_voxels` check, check octree first, fall back to generator with cache.
 
-#### 5. Update generation pipeline
+#### 5. Remove modified_voxels, write_buffer, flush_write_buffer
+**File**: `crates/voxel_map_engine/src/instance.rs`
+
+Remove `modified_voxels` and `write_buffer` fields from `VoxelMapInstance`. Add `chunks_needing_remesh` and `dirty_chunks`:
+
+```rust
+pub struct VoxelMapInstance {
+    pub tree: OctreeI32<Option<ChunkData>>,
+    pub loaded_chunks: HashSet<IVec3>,
+    pub dirty_chunks: HashSet<IVec3>,           // NEW — unsaved changes
+    pub chunks_needing_remesh: HashSet<IVec3>,  // NEW — need async remesh
+    pub debug_colors: bool,
+}
+```
+
+Update all constructors (`new`, `overworld`, `homebase`, `arena`) to remove `modified_voxels`/`write_buffer` and initialize the new fields as empty.
+
+Add `get_chunk_data_mut` method:
+
+```rust
+impl VoxelMapInstance {
+    /// Get a mutable reference to chunk data in the octree.
+    pub fn get_chunk_data_mut(&mut self, chunk_pos: IVec3) -> Option<&mut ChunkData> {
+        let key = NodeKey::new(0, chunk_pos);
+        let relation = self.tree.find_node(key)?;
+        self.tree.get_value_mut(relation.child)?.as_mut()
+    }
+}
+```
+
+**File**: `crates/voxel_map_engine/src/lifecycle.rs`
+
+**Remove** `flush_write_buffer` system entirely.
+
+**File**: `crates/voxel_map_engine/src/lib.rs`
+
+Remove `flush_write_buffer` from the system chain. Add remesh systems (see step 8):
+
+```rust
+(
+    lifecycle::ensure_pending_chunks,
+    lifecycle::update_chunks,
+    lifecycle::poll_chunk_tasks,
+    lifecycle::despawn_out_of_range_chunks,
+    lifecycle::spawn_remesh_tasks,   // NEW — replaces flush_write_buffer
+    lifecycle::poll_remesh_tasks,    // NEW
+)
+    .chain(),
+```
+
+#### 6. Direct octree mutation in VoxelMapInstance
+**File**: `crates/voxel_map_engine/src/instance.rs`
+
+Add `set_voxel` method that mutates the octree in-place and updates neighbor padding:
+
+```rust
+impl VoxelMapInstance {
+    /// Mutate a voxel directly in the octree. Marks the chunk dirty and
+    /// queues it for async remesh. Also updates neighbor chunk padding
+    /// for boundary voxels.
+    ///
+    /// If the chunk is not loaded, the edit is silently dropped (the chunk
+    /// will be regenerated fresh when it comes into view).
+    pub fn set_voxel(&mut self, world_pos: IVec3, voxel: WorldVoxel) {
+        let chunk_pos = voxel_to_chunk_pos(world_pos);
+        let local = world_pos - chunk_pos * CHUNK_SIZE as i32;
+
+        // Mutate owning chunk
+        {
+            let Some(chunk_data) = self.get_chunk_data_mut(chunk_pos) else {
+                trace!(
+                    "set_voxel: chunk {chunk_pos} not loaded, edit at {world_pos} dropped"
+                );
+                return;
+            };
+            let padded = [
+                (local.x + 1) as u32,
+                (local.y + 1) as u32,
+                (local.z + 1) as u32,
+            ];
+            let index = PaddedChunkShape::linearize(padded) as usize;
+            chunk_data.voxels.set(index, voxel);
+        } // tree borrow released
+
+        self.dirty_chunks.insert(chunk_pos);
+        self.chunks_needing_remesh.insert(chunk_pos);
+
+        // Update neighbor chunks' padding for boundary voxels
+        self.update_neighbor_padding(world_pos, chunk_pos, local, voxel);
+    }
+
+    /// For each axis, if the edited voxel sits on a chunk boundary, update the
+    /// neighboring chunk's padding voxel and mark it for remesh.
+    fn update_neighbor_padding(
+        &mut self,
+        _world_pos: IVec3,
+        chunk_pos: IVec3,
+        local: IVec3,
+        voxel: WorldVoxel,
+    ) {
+        for axis in 0..3 {
+            let l = local[axis];
+            if l == 0 {
+                // Negative boundary — neighbor's positive padding
+                let mut neighbor = chunk_pos;
+                neighbor[axis] -= 1;
+                {
+                    if let Some(nd) = self.get_chunk_data_mut(neighbor) {
+                        let mut pl = local;
+                        pl[axis] = CHUNK_SIZE as i32; // padding slot at far end
+                        let padded = [
+                            (pl.x + 1) as u32,
+                            (pl.y + 1) as u32,
+                            (pl.z + 1) as u32,
+                        ];
+                        let idx = PaddedChunkShape::linearize(padded) as usize;
+                        nd.voxels.set(idx, voxel);
+                    }
+                }
+                self.chunks_needing_remesh.insert(neighbor);
+            }
+            if l == CHUNK_SIZE as i32 - 1 {
+                // Positive boundary — neighbor's negative padding
+                let mut neighbor = chunk_pos;
+                neighbor[axis] += 1;
+                {
+                    if let Some(nd) = self.get_chunk_data_mut(neighbor) {
+                        let mut pl = local;
+                        pl[axis] = -1; // padding slot at near end
+                        let padded = [
+                            (pl.x + 1) as u32,
+                            (pl.y + 1) as u32,
+                            (pl.z + 1) as u32,
+                        ];
+                        let idx = PaddedChunkShape::linearize(padded) as usize;
+                        nd.voxels.set(idx, voxel);
+                    }
+                }
+                self.chunks_needing_remesh.insert(neighbor);
+            }
+        }
+    }
+}
+```
+
+#### 7. Update VoxelWorld::set_voxel to use direct mutation
+**File**: `crates/voxel_map_engine/src/api.rs`
+
+Replace the old `set_voxel` (which pushed to write_buffer) with a direct call to the instance:
+
+```rust
+pub fn set_voxel(&mut self, map: Entity, pos: IVec3, voxel: WorldVoxel) {
+    debug_assert!(voxel != WorldVoxel::Unset, "cannot set voxel to Unset");
+    let Ok((mut instance, _)) = self.maps.get_mut(map) else {
+        warn!("set_voxel: entity {map:?} has no VoxelMapInstance");
+        return;
+    };
+    instance.set_voxel(pos, voxel);
+}
+```
+
+#### 8. Async remesh pipeline
+**File**: `crates/voxel_map_engine/src/lifecycle.rs`
+
+Add types and systems for async remeshing. The old mesh stays visible until the new one is ready.
+
+```rust
+use bevy::tasks::Task;
+
+/// A pending async remesh task for a chunk that was mutated in-place.
+struct RemeshTask {
+    chunk_pos: IVec3,
+    task: Task<Option<Mesh>>,
+}
+
+/// Component tracking pending remesh tasks for a map instance.
+#[derive(Component, Default)]
+pub struct PendingRemeshes {
+    tasks: Vec<RemeshTask>,
+}
+```
+
+Register `PendingRemeshes` alongside `PendingChunks` in `ensure_pending_chunks`.
+
+```rust
+/// Drains `chunks_needing_remesh` and spawns async mesh tasks from existing
+/// octree data. Does NOT regenerate chunks — only remeshes the data already
+/// in the octree.
+pub fn spawn_remesh_tasks(
+    mut map_query: Query<(&mut VoxelMapInstance, &mut PendingRemeshes)>,
+) {
+    let pool = AsyncComputeTaskPool::get();
+    for (mut instance, mut pending) in &mut map_query {
+        let positions: Vec<IVec3> = instance.chunks_needing_remesh.drain().collect();
+
+        for chunk_pos in positions {
+            let Some(chunk_data) = instance.get_chunk_data(chunk_pos) else {
+                continue; // chunk was unloaded between edit and remesh
+            };
+            // Expand to flat array for the mesher
+            let voxels = chunk_data.voxels.to_voxels();
+            let task = pool.spawn(async move {
+                mesh_chunk_greedy(&voxels)
+            });
+            pending.tasks.push(RemeshTask { chunk_pos, task });
+        }
+    }
+}
+
+/// Polls completed remesh tasks and swaps the mesh on existing chunk entities.
+/// If the chunk entity was despawned (unloaded during remesh), the result is
+/// discarded. If the chunk had no entity (was all-air before) and now has a mesh,
+/// a new entity is spawned.
+pub fn poll_remesh_tasks(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    default_material: Res<DefaultVoxelMaterial>,
+    mut map_query: Query<(Entity, &VoxelMapInstance, &mut PendingRemeshes)>,
+    chunk_query: Query<(Entity, &VoxelChunk, &ChildOf)>,
+) {
+    for (map_entity, instance, mut pending) in &mut map_query {
+        let mut i = 0;
+        while i < pending.tasks.len() {
+            // Use the same task polling pattern as poll_chunk_tasks
+            let Some(mesh_opt) = check_ready(&mut pending.tasks[i].task) else {
+                i += 1;
+                continue;
+            };
+            let remesh = pending.tasks.swap_remove(i);
+
+            // Skip if chunk was unloaded during remesh
+            if !instance.loaded_chunks.contains(&remesh.chunk_pos) {
+                continue;
+            }
+
+            // Find existing chunk entity for this position under this map
+            let existing = chunk_query.iter().find(|(_, vc, parent)| {
+                vc.position == remesh.chunk_pos && parent.get() == map_entity
+            });
+
+            match (mesh_opt, existing) {
+                (Some(mesh), Some((entity, _, _))) => {
+                    // Replace mesh on existing entity — the visual swap
+                    let handle = meshes.add(mesh);
+                    commands.entity(entity).insert(Mesh3d(handle));
+                }
+                (Some(mesh), None) => {
+                    // Chunk was all-air before, now has geometry — spawn new entity
+                    let handle = meshes.add(mesh);
+                    let offset = chunk_world_offset(remesh.chunk_pos);
+                    let material = select_material(
+                        instance.debug_colors, remesh.chunk_pos,
+                        &mut materials, &default_material,
+                    );
+                    commands.entity(map_entity).with_child((
+                        VoxelChunk { position: remesh.chunk_pos, lod_level: 0 },
+                        Mesh3d(handle),
+                        MeshMaterial3d(material),
+                        Transform::from_translation(offset),
+                    ));
+                }
+                (None, Some((entity, _, _))) => {
+                    // Chunk is now all-air/solid — despawn mesh entity
+                    commands.entity(entity).despawn();
+                }
+                (None, None) => {
+                    // No mesh needed, no entity exists — nothing to do
+                }
+            }
+        }
+    }
+}
+```
+
+#### 9. Remove overrides from generation pipeline
 **File**: `crates/voxel_map_engine/src/generation.rs`
 
-`ChunkGenResult` still carries `voxels: Vec<WorldVoxel>` — the flat array from the generator. Palette compression happens when storing into `ChunkData` (in `handle_completed_chunk`). The generator output remains a flat array since the mesher (`mesh_chunk_greedy`) needs it in that format.
+Remove `collect_chunk_overrides` and `apply_overrides` functions entirely. Update `spawn_chunk_gen_task` to no longer accept `modified_voxels`:
 
-No changes needed to `generation.rs` itself.
+```rust
+pub fn spawn_chunk_gen_task(
+    pending: &mut PendingChunks,
+    position: IVec3,
+    generator: &VoxelGenerator,
+    // modified_voxels parameter removed
+) {
+    let generator = Arc::clone(generator);
+    let pool = AsyncComputeTaskPool::get();
+    let task = pool.spawn(async move { generate_chunk(position, &generator) });
+    pending.tasks.push(task);
+    pending.pending_positions.insert(position);
+}
+```
+
+Update `generate_chunk` — no overrides:
+
+```rust
+fn generate_chunk(position: IVec3, generator: &VoxelGenerator) -> ChunkGenResult {
+    let voxels = generator(position);
+    let mesh = mesh_chunk_greedy(&voxels);
+    ChunkGenResult { position, mesh, voxels }
+}
+```
+
+Update call site in `spawn_missing_chunks` to remove `&instance.modified_voxels` argument.
 
 ### Unit Tests
 
@@ -759,6 +1077,92 @@ mod tests {
 }
 ```
 
+**File**: `crates/voxel_map_engine/src/instance.rs` — extend test module for direct mutation
+
+```rust
+#[test]
+fn set_voxel_mutates_octree_in_place() {
+    let mut instance = VoxelMapInstance::new(5);
+    let chunk_pos = IVec3::ZERO;
+    // Insert a chunk with all air
+    let voxels = vec![WorldVoxel::Air; PADDED_VOLUME];
+    let chunk_data = ChunkData::from_voxels(&voxels);
+    instance.insert_chunk_data(chunk_pos, chunk_data);
+    instance.loaded_chunks.insert(chunk_pos);
+
+    // Edit a voxel
+    let world_pos = IVec3::new(5, 5, 5);
+    instance.set_voxel(world_pos, WorldVoxel::Solid(42));
+
+    // Verify the edit is in the octree
+    let data = instance.get_chunk_data(chunk_pos).unwrap();
+    let local = world_pos - chunk_pos * CHUNK_SIZE as i32;
+    let padded = [(local.x + 1) as u32, (local.y + 1) as u32, (local.z + 1) as u32];
+    let index = PaddedChunkShape::linearize(padded) as usize;
+    assert_eq!(data.voxels.get(index), WorldVoxel::Solid(42));
+
+    // Verify dirty + remesh tracking
+    assert!(instance.dirty_chunks.contains(&chunk_pos));
+    assert!(instance.chunks_needing_remesh.contains(&chunk_pos));
+}
+
+#[test]
+fn set_voxel_on_boundary_updates_neighbor_padding() {
+    let mut instance = VoxelMapInstance::new(5);
+    let chunk_a = IVec3::ZERO;
+    let chunk_b = IVec3::new(1, 0, 0);
+
+    // Insert both chunks with all air
+    for &pos in &[chunk_a, chunk_b] {
+        let voxels = vec![WorldVoxel::Air; PADDED_VOLUME];
+        instance.insert_chunk_data(pos, ChunkData::from_voxels(&voxels));
+        instance.loaded_chunks.insert(pos);
+    }
+
+    // Edit voxel at x=15 (boundary of chunk_a, padding of chunk_b)
+    let world_pos = IVec3::new(CHUNK_SIZE as i32 - 1, 5, 5);
+    instance.set_voxel(world_pos, WorldVoxel::Solid(7));
+
+    // Verify chunk_b's padding was updated
+    let neighbor_data = instance.get_chunk_data(chunk_b).unwrap();
+    // The voxel at chunk_a's x=15 corresponds to chunk_b's padding at x=-1 → padded index x=0
+    let padded = [0u32, (5 + 1) as u32, (5 + 1) as u32];
+    let idx = PaddedChunkShape::linearize(padded) as usize;
+    assert_eq!(neighbor_data.voxels.get(idx), WorldVoxel::Solid(7));
+
+    // Both chunks marked for remesh
+    assert!(instance.chunks_needing_remesh.contains(&chunk_a));
+    assert!(instance.chunks_needing_remesh.contains(&chunk_b));
+}
+
+#[test]
+fn set_voxel_on_unloaded_chunk_is_dropped() {
+    let mut instance = VoxelMapInstance::new(5);
+    // Don't insert any chunks — the edit target is not loaded
+    instance.set_voxel(IVec3::new(5, 5, 5), WorldVoxel::Solid(1));
+    assert!(instance.dirty_chunks.is_empty());
+    assert!(instance.chunks_needing_remesh.is_empty());
+}
+
+#[test]
+fn multiple_edits_same_chunk_single_remesh() {
+    let mut instance = VoxelMapInstance::new(5);
+    let chunk_pos = IVec3::ZERO;
+    let voxels = vec![WorldVoxel::Air; PADDED_VOLUME];
+    instance.insert_chunk_data(chunk_pos, ChunkData::from_voxels(&voxels));
+    instance.loaded_chunks.insert(chunk_pos);
+
+    // Multiple edits to the same chunk
+    instance.set_voxel(IVec3::new(1, 1, 1), WorldVoxel::Solid(1));
+    instance.set_voxel(IVec3::new(2, 2, 2), WorldVoxel::Solid(2));
+    instance.set_voxel(IVec3::new(3, 3, 3), WorldVoxel::Solid(3));
+
+    // chunks_needing_remesh contains just the one chunk (HashSet deduplicates)
+    assert_eq!(instance.chunks_needing_remesh.len(), 1);
+    assert!(instance.chunks_needing_remesh.contains(&chunk_pos));
+}
+```
+
 ### Success Criteria:
 
 #### Automated Verification:
@@ -767,8 +1171,10 @@ mod tests {
 - [ ] Client builds and runs: `cargo client -c 1`
 
 #### Manual Verification:
-- [ ] Voxel lookups work correctly (place/break blocks, walk on terrain)
-- [ ] No visual regressions
+- [ ] Voxel edits work in-game (place/break blocks) — instant visual feedback
+- [ ] Old mesh stays visible until remesh completes (no flicker)
+- [ ] No visual regressions — chunks render identically to before
+- [ ] Boundary edits (voxels at chunk edges) correctly update neighboring chunk meshes
 - [ ] Uniform chunks (air above terrain) consume near-zero memory in the octree
 
 ---
@@ -776,7 +1182,9 @@ mod tests {
 ## Phase 3: Directory Structure, Map Metadata, and Per-Chunk Terrain Persistence
 
 ### Overview
-Create the `worlds/<map>/` directory structure. Save map metadata to `map.meta.bin`. Save full chunk terrain data to per-chunk files with zstd compression. Replace the old single-file save system. Add per-chunk dirty tracking.
+Create the `worlds/<map>/` directory structure. Save map metadata to `map.meta.bin`. Save full chunk terrain data to per-chunk files with zstd compression. Replace the old single-file save system.
+
+Note: Per-chunk dirty tracking (`dirty_chunks`, `chunks_needing_remesh`) was already added to `VoxelMapInstance` in Phase 2. `VoxelMapInstance.set_voxel()` marks chunks dirty on edit. This phase adds the persistence layer that saves dirty chunks to disk (on debounce timer, on eviction, on shutdown).
 
 ### Changes Required:
 
@@ -805,58 +1213,11 @@ pub enum FillType { ... }
 pub struct ChunkData { ... }
 ```
 
-#### 3. Add per-chunk dirty tracking to VoxelMapInstance
-**File**: `crates/voxel_map_engine/src/instance.rs`
+#### 3. Dirty tracking — already done in Phase 2
 
-Add `dirty_chunks` field to `VoxelMapInstance`:
+`dirty_chunks` and `chunks_needing_remesh` were added to `VoxelMapInstance` in Phase 2 (step 5). `VoxelMapInstance::set_voxel()` marks chunks dirty on every edit. No `flush_write_buffer` exists — it was removed in Phase 2. No changes needed here.
 
-```rust
-pub struct VoxelMapInstance {
-    pub tree: OctreeI32<Option<ChunkData>>,
-    pub modified_voxels: HashMap<IVec3, WorldVoxel>,
-    pub write_buffer: Vec<(IVec3, WorldVoxel)>,
-    pub loaded_chunks: HashSet<IVec3>,
-    pub dirty_chunks: HashSet<IVec3>,   // NEW — chunk positions with unsaved changes
-    pub debug_colors: bool,
-}
-```
-
-Update all constructors (`new`, `overworld`, `homebase`, `arena`) to initialize `dirty_chunks: HashSet::new()`.
-
-**File**: `crates/voxel_map_engine/src/lifecycle.rs`
-
-In `flush_write_buffer`, mark invalidated chunks as dirty before removing them from loaded_chunks/octree. This ensures the chunk will be re-generated with the new voxel data baked in, and when it is, the new chunk data will be saved because it's marked dirty:
-
-```rust
-pub fn flush_write_buffer(mut map_query: Query<&mut VoxelMapInstance>) {
-    for mut instance in &mut map_query {
-        if instance.write_buffer.is_empty() {
-            continue;
-        }
-
-        let buffer: Vec<_> = instance.write_buffer.drain(..).collect();
-        let mut invalidated = HashSet::new();
-
-        for (world_pos, voxel) in buffer {
-            instance.modified_voxels.insert(world_pos, voxel);
-            let chunk_pos = voxel_to_chunk_pos(world_pos);
-            invalidated.insert(chunk_pos);
-            invalidate_neighbors(world_pos, chunk_pos, &mut invalidated);
-        }
-
-        for pos in &invalidated {
-            instance.dirty_chunks.insert(*pos);  // NEW — mark dirty before eviction
-        }
-
-        for pos in invalidated {
-            instance.loaded_chunks.remove(&pos);
-            instance.remove_chunk_data(pos);
-        }
-    }
-}
-```
-
-Also, in `handle_completed_chunk`, when a dirty chunk is re-generated (its position is in `dirty_chunks`), the new ChunkData inserted into the octree is the authoritative version with modifications baked in. The dirty flag remains set so it will be saved to disk.
+The persistence systems added below read from `instance.dirty_chunks` to determine which chunks need saving.
 
 #### 4. Add `save_dir` to VoxelMapConfig
 **File**: `crates/voxel_map_engine/src/config.rs`
@@ -1092,9 +1453,9 @@ pub mod persistence;
 - `save_voxel_world_on_shutdown` system (line 115-135)
 - `load_voxel_world` system (line 63-83)
 
-**Keep until Phase 5** (still needed for client sync):
-- `VoxelModifications` resource — still populated on edits, used by `send_initial_voxel_state`
-- `send_initial_voxel_state` observer — still sends modifications to connecting clients
+**Keep until Phase 5** (still needed for client sync during active sessions):
+- `VoxelModifications` resource — populated at runtime from edits (NOT loaded from disk), used by `send_initial_voxel_state` to sync late-joining clients with edits made during the current session. After a server restart, this is empty — clients won't see pre-restart edits until Phase 5 adds chunk streaming.
+- `send_initial_voxel_state` observer — still sends runtime modifications to connecting clients
 - `MapWorld` resource — client uses `seed` for local generation until Phase 5 replaces it
 - `VoxelStateSync` message type and channel registration
 
@@ -1265,18 +1626,16 @@ This requires `update_chunks` (which calls `remove_out_of_range_chunks`) to pass
 #### 8. Load saved chunks during generation
 **File**: `crates/voxel_map_engine/src/generation.rs`
 
-Modify `spawn_chunk_gen_task` to accept an optional save directory. The async task tries loading from disk first, falling back to generation:
+Modify `spawn_chunk_gen_task` to accept an optional save directory. The async task tries loading from disk first, falling back to generation. Note: `modified_voxels` parameter was removed in Phase 2 — no overrides needed since edits are baked into the octree and saved to disk directly.
 
 ```rust
 pub fn spawn_chunk_gen_task(
     pending: &mut PendingChunks,
     position: IVec3,
     generator: &VoxelGenerator,
-    modified_voxels: &HashMap<IVec3, WorldVoxel>,
     save_dir: Option<PathBuf>,
 ) {
     let generator = Arc::clone(generator);
-    let overrides = collect_chunk_overrides(position, modified_voxels);
     let pool = AsyncComputeTaskPool::get();
 
     let task = pool.spawn(async move {
@@ -1297,8 +1656,8 @@ pub fn spawn_chunk_gen_task(
             }
         }
 
-        // Generate from scratch
-        generate_chunk(position, &generator, &overrides)
+        // Generate from scratch (no overrides — edits are baked into chunk data)
+        generate_chunk(position, &generator)
     });
 
     pending.tasks.push(task);
@@ -1323,16 +1682,14 @@ In `generate_chunk`, set `from_disk: false`.
 
 Dirty tracking for completed chunks:
 - `from_disk: true` → clean (already saved)
-- `from_disk: false` with no modified_voxels applied → clean (can be regenerated)
-- After a voxel edit via `flush_write_buffer` → the invalidated chunk positions are marked dirty
-
-Dirty is only set in `flush_write_buffer` when player edits arrive, never in `handle_completed_chunk`.
+- `from_disk: false` → clean (can be regenerated from the generator)
+- Dirty is only set by `VoxelMapInstance::set_voxel()` when player edits arrive, never in `handle_completed_chunk`
 
 **Update call site** in `lifecycle.rs` `spawn_missing_chunks`:
 
 ```rust
 fn spawn_missing_chunks(
-    instance: &mut VoxelMapInstance,
+    instance: &VoxelMapInstance,
     pending: &mut PendingChunks,
     config: &VoxelMapConfig,
     desired: &HashSet<IVec3>,
@@ -1345,8 +1702,7 @@ fn spawn_missing_chunks(
 
         spawn_chunk_gen_task(
             pending, pos, &config.generator,
-            &instance.modified_voxels,
-            config.save_dir.clone(),  // NEW — pass save_dir
+            config.save_dir.clone(),  // load from disk if available
         );
         spawned += 1;
     }
@@ -1366,8 +1722,8 @@ fn handle_voxel_edit_requests(
 ) {
     for (entity, mut receiver) in &mut edit_receivers {
         for edit in receiver.drain::<VoxelEditRequest>() {
-            // Set voxel in VoxelWorld (this pushes to write_buffer, which gets flushed
-            // by flush_write_buffer, which marks dirty_chunks and invalidates)
+            // Set voxel in VoxelWorld — this calls VoxelMapInstance::set_voxel()
+            // which mutates the octree in-place and marks the chunk dirty
             voxel_world.set_voxel(overworld_entity, edit.position, edit.voxel.into());
 
             // Update dirty state for debounced save
@@ -1378,6 +1734,9 @@ fn handle_voxel_edit_requests(
             dirty_state.is_dirty = true;
             dirty_state.last_edit_time = now;
 
+            // Append to runtime VoxelModifications for client sync (kept until Phase 5)
+            modifications.modifications.push((edit.position, edit.voxel));
+
             // Broadcast to all clients (unchanged)
             // ...
         }
@@ -1385,7 +1744,7 @@ fn handle_voxel_edit_requests(
 }
 ```
 
-Note: `VoxelModifications` resource is removed entirely. The modification list is no longer tracked separately — modifications are baked into chunk data in the octree and saved per-chunk.
+Note: `VoxelModifications` is kept as a runtime-only append log for client sync (connecting clients receive it via `send_initial_voxel_state`). It is NOT persisted to disk — edits are baked into chunk data in the octree and saved per-chunk. After server restart, `VoxelModifications` starts empty. Phase 5 removes it entirely (replaced by chunk streaming).
 
 #### 10. Networking — unchanged in this phase
 
@@ -1479,7 +1838,7 @@ app.add_systems(Update, (
 // Last:
 app.add_systems(Last, save_world_on_shutdown);
 
-// Observer — send initial voxel state from modified_voxels (not VoxelModifications):
+// Observer — send initial voxel state from runtime VoxelModifications (kept until Phase 5):
 app.add_observer(send_initial_voxel_state);
 ```
 
@@ -1706,9 +2065,9 @@ fn evicted_dirty_chunk_saved_before_removal() {
 }
 
 #[test]
-fn initial_voxel_state_from_modified_voxels() {
-    // Verify send_initial_voxel_state reads from VoxelMapInstance.modified_voxels
-    // (not the removed VoxelModifications resource)
+fn initial_voxel_state_from_runtime_modifications() {
+    // Verify send_initial_voxel_state reads from runtime VoxelModifications
+    // (populated by handle_voxel_edit_requests, not loaded from disk)
 }
 ```
 
@@ -2435,7 +2794,7 @@ Approach 2 is simpler — client sets `generates_chunks: false`, server sets `tr
 
 **File**: `crates/server/src/map.rs`
 
-- Remove `VoxelModifications` resource
+- Remove `VoxelModifications` resource (was kept as runtime-only sync in Phase 3, now fully replaced by chunk streaming)
 - Remove `send_initial_voxel_state` observer
 - Remove `VoxelModifications.push()` from `handle_voxel_edit_requests`
 
@@ -3442,7 +3801,7 @@ fn full_world_persistence_cycle() {
                 .get(&MapInstanceId::Overworld);
             // ... set_voxel(overworld_entity, IVec3::new(0, 0, 0), WorldVoxel::Solid(42))
         }
-        app.update(); // flush_write_buffer marks chunk dirty
+        app.update(); // set_voxel mutates octree + marks chunk dirty
 
         // Create a homebase
         {
@@ -3539,7 +3898,7 @@ fn full_world_persistence_cycle() {
 
 ### Unit Tests (per phase):
 - Phase 1: Octree insert/get/remove, fill type classification, chunk hash, overwrite behavior
-- Phase 2: PalettedChunk from_voxels/to_voxels roundtrip, single-value optimization, get/set indexed access, set expanding palette, set transitioning from single-value, memory_usage, bits_needed, serde roundtrip
+- Phase 2: PalettedChunk from_voxels/to_voxels roundtrip, single-value optimization, get/set indexed access, set expanding palette, set transitioning from single-value, memory_usage, bits_needed, serde roundtrip. Direct mutation: set_voxel mutates octree in-place, boundary edits update neighbor padding, unloaded chunk edits are dropped, multiple edits to same chunk produce single remesh entry
 - Phase 3: Chunk file save/load roundtrip, zstd compression, filename parsing (positive/negative coords), metadata save/load, directory creation, corrupt file handling, chunk deletion, listing
 - Phase 4: Entity save/load roundtrip, missing file returns empty, overwrite behavior, corrupt file handling, kind serialization roundtrip
 - Phase 5: PalettedChunk network serde roundtrip, ChunkRequest/ChunkDataSync integration, client chunk state management
@@ -3565,6 +3924,8 @@ fn full_world_persistence_cycle() {
 
 ## Performance Considerations
 
+- **No regeneration on edit**: Direct octree mutation + async remesh eliminates the old regenerate-from-scratch cycle. A single voxel edit triggers only a `PalettedChunk::set` (microseconds) + async remesh (same cost as initial meshing, ~1ms off main thread). The old approach evicted the chunk, re-ran the generator with all overrides, then remeshed — substantially more expensive.
+- **Old mesh stays visible**: No visual gap during remesh. The old mesh renders until the async remesh task completes and swaps the mesh handle. This is a significant UX improvement over the old approach where the chunk entity was despawned during regeneration.
 - **zstd level 3**: Fast compression, ~90% size reduction on voxel data. Level 3 is the sweet spot.
 - **Per-chunk dirty tracking**: Only modified chunks are re-saved. Most chunks save once (on generation) and never again unless a player edits them.
 - **Atomic writes**: tmp file + rename prevents partial writes on crash.
@@ -3575,7 +3936,8 @@ fn full_world_persistence_cycle() {
 ## Migration Notes
 
 - The old `world_save/voxel_world.bin` format is abandoned. No migration path — players must start fresh. Acceptable for pre-release.
-- **Phase 3**: `VoxelWorldSave`, `VoxelDirtyState`, `VoxelSavePath` resources are removed. `VoxelModifications`, `VoxelStateSync`, `MapWorld` are kept temporarily for networking.
+- **Phase 2**: `modified_voxels`, `write_buffer`, `flush_write_buffer`, `collect_chunk_overrides`, `apply_overrides` are removed. Voxel edits are baked directly into the octree via `PalettedChunk::set`. Async remesh pipeline replaces chunk regeneration on edit. **Temporary regression**: edits lost on chunk eviction until Phase 3 adds persistence.
+- **Phase 3**: `VoxelWorldSave`, `VoxelDirtyState`, `VoxelSavePath` resources are removed. `VoxelModifications` is kept as runtime-only append log for client sync (NOT loaded from disk). `VoxelStateSync`, `MapWorld` kept temporarily for networking.
 - **Phase 5**: `VoxelModifications`, `VoxelStateSync`, `MapWorld`, `send_initial_voxel_state` are removed. Replaced by chunk streaming (`ChunkDataSync` messages).
 - The `MapWorld` resource's `seed` field is replaced by `DEFAULT_OVERWORLD_SEED` constant (overworld) or `seed_from_id(owner)` (homebases), stored per-map in `VoxelMapConfig.seed`. Its `generation_version` field moves to `VoxelMapConfig.generation_version`, persisted per-map in `MapMeta`.
 - Client-side chunk generation is removed in Phase 5. Clients receive all chunk data from the server.
