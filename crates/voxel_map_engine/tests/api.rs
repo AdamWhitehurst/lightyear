@@ -59,16 +59,15 @@ fn tick_until(app: &mut App, condition: impl Fn(&App) -> bool) {
     panic!("condition not met after {MAX_TICKS} ticks");
 }
 
-/// Test: set_voxel queues to write buffer, flush moves to modified_voxels,
-/// get_voxel returns the written value.
+/// Test: set_voxel mutates octree directly, get_voxel returns the written value.
 #[test]
 fn set_get_voxel_round_trip() {
     let mut app = test_app();
     let map = spawn_map(&mut app, 1);
     spawn_target(&mut app, map, Vec3::ZERO, 0);
 
-    // Tick once so PendingChunks is inserted
-    tick(&mut app, 1);
+    // Wait for chunk at origin to load
+    tick_until(&mut app, |app| has_loaded_chunk(app, map, IVec3::ZERO));
 
     // Use VoxelWorld::set_voxel via a one-shot system
     let edit_pos = IVec3::new(3, 5, 7);
@@ -78,23 +77,13 @@ fn set_get_voxel_round_trip() {
         })
         .unwrap();
 
-    // Verify it's in the write buffer but NOT yet in modified_voxels
+    // Verify the edit is immediately visible in dirty_chunks
     let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
-    assert_eq!(instance.write_buffer.len(), 1);
-    assert!(!instance.modified_voxels.contains_key(&edit_pos));
+    let chunk_pos = IVec3::ZERO; // edit_pos (3,5,7) is in chunk (0,0,0)
+    assert!(instance.dirty_chunks.contains(&chunk_pos));
+    assert!(instance.chunks_needing_remesh.contains(&chunk_pos));
 
-    // Tick to run flush_write_buffer
-    tick(&mut app, 1);
-
-    // Verify write buffer was drained and modified_voxels was populated
-    let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
-    assert!(instance.write_buffer.is_empty());
-    assert_eq!(
-        instance.modified_voxels.get(&edit_pos),
-        Some(&WorldVoxel::Solid(42))
-    );
-
-    // Verify get_voxel returns the written value
+    // Verify get_voxel returns the written value immediately (no flush needed)
     app.world_mut()
         .run_system_once(move |vw: VoxelWorld| {
             let voxel = vw.get_voxel(map, edit_pos);
@@ -130,9 +119,9 @@ fn has_loaded_chunk(app: &App, map: Entity, pos: IVec3) -> bool {
         .contains(&pos)
 }
 
-/// Test: flush_write_buffer invalidates the affected chunk so it gets remeshed.
+/// Test: set_voxel marks the chunk for remesh, and the remesh system processes it.
 #[test]
-fn flush_write_buffer_triggers_remesh() {
+fn set_voxel_triggers_remesh() {
     let mut app = test_app();
     let map = spawn_map(&mut app, 1);
     spawn_target(&mut app, map, Vec3::ZERO, 0);
@@ -144,82 +133,54 @@ fn flush_write_buffer_triggers_remesh() {
     app.world_mut()
         .get_mut::<VoxelMapInstance>(map)
         .unwrap()
-        .write_buffer
-        .push((edit_pos, WorldVoxel::Solid(1)));
+        .set_voxel(edit_pos, WorldVoxel::Solid(1));
 
-    // Tick to run flush_write_buffer - should invalidate chunk (0,0,0)
-    tick(&mut app, 1);
-
+    // Verify chunk is queued for remesh
     let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
     assert!(
-        !instance.loaded_chunks.contains(&IVec3::ZERO),
-        "flush should invalidate the chunk containing the edited voxel"
+        instance.chunks_needing_remesh.contains(&IVec3::ZERO),
+        "edited chunk should be queued for remesh"
     );
 
-    // Wait for chunk to be regenerated
-    tick_until(&mut app, |app| has_loaded_chunk(app, map, IVec3::ZERO));
+    // Tick to process remesh
+    tick(&mut app, 3);
 
+    // After remesh, chunks_needing_remesh should be drained
+    let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
     assert!(
-        has_loaded_chunk(&app, map, IVec3::ZERO),
-        "invalidated chunk should be regenerated"
+        instance.chunks_needing_remesh.is_empty(),
+        "remesh queue should be drained after processing"
+    );
+
+    // Chunk should still be loaded (not invalidated)
+    assert!(
+        instance.loaded_chunks.contains(&IVec3::ZERO),
+        "chunk should remain loaded after in-place edit"
     );
 }
 
-/// Test: modified voxels persist through a chunk despawn/respawn cycle.
+/// Test: edited voxel data persists in the octree after edit (no chunk cycle needed).
 #[test]
-fn modified_voxels_survive_chunk_cycle() {
+fn edited_voxel_persists_in_octree() {
     let mut app = test_app();
     let map = spawn_map(&mut app, 1);
-    let target = spawn_target(&mut app, map, Vec3::ZERO, 0);
+    spawn_target(&mut app, map, Vec3::ZERO, 0);
 
     tick_until(&mut app, |app| has_loaded_chunk(app, map, IVec3::ZERO));
 
-    // Write a voxel edit
     let edit_pos = IVec3::new(8, 8, 8);
     app.world_mut()
         .get_mut::<VoxelMapInstance>(map)
         .unwrap()
-        .write_buffer
-        .push((edit_pos, WorldVoxel::Solid(99)));
+        .set_voxel(edit_pos, WorldVoxel::Solid(99));
 
-    // Flush
-    tick(&mut app, 1);
-
-    let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
-    assert_eq!(
-        instance.modified_voxels.get(&edit_pos),
-        Some(&WorldVoxel::Solid(99))
-    );
-
-    // Move target far away so origin chunk despawns
+    // Verify the edit is readable from the octree
     app.world_mut()
-        .entity_mut(target)
-        .insert(Transform::from_translation(Vec3::new(10000.0, 0.0, 0.0)));
-
-    tick_until(&mut app, |app| !has_loaded_chunk(app, map, IVec3::ZERO));
-
-    // modified_voxels should still have the edit
-    let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
-    assert_eq!(
-        instance.modified_voxels.get(&edit_pos),
-        Some(&WorldVoxel::Solid(99)),
-        "modified_voxels should survive chunk despawn"
-    );
-
-    // Move target back to origin so chunk respawns
-    app.world_mut()
-        .entity_mut(target)
-        .insert(Transform::from_translation(Vec3::ZERO));
-
-    tick_until(&mut app, |app| has_loaded_chunk(app, map, IVec3::ZERO));
-
-    // modified_voxels should still have the edit
-    let instance = app.world().get::<VoxelMapInstance>(map).unwrap();
-    assert_eq!(
-        instance.modified_voxels.get(&edit_pos),
-        Some(&WorldVoxel::Solid(99)),
-        "modified_voxels should survive full chunk cycle"
-    );
+        .run_system_once(move |vw: VoxelWorld| {
+            let voxel = vw.get_voxel(map, edit_pos);
+            assert_eq!(voxel, WorldVoxel::Solid(99));
+        })
+        .unwrap();
 }
 
 /// Test: raycast hits flat terrain from above.
@@ -269,7 +230,11 @@ fn get_voxel_independent_between_instances() {
     let map_b = spawn_map(&mut app, 1);
     spawn_target(&mut app, map_a, Vec3::ZERO, 0);
     spawn_target(&mut app, map_b, Vec3::ZERO, 0);
-    tick(&mut app, 1);
+
+    // Wait for both maps to load the origin chunk
+    tick_until(&mut app, |app| {
+        has_loaded_chunk(app, map_a, IVec3::ZERO) && has_loaded_chunk(app, map_b, IVec3::ZERO)
+    });
 
     let edit_pos = IVec3::new(3, 5, 7);
     app.world_mut()
@@ -277,8 +242,6 @@ fn get_voxel_independent_between_instances() {
             vw.set_voxel(map_a, edit_pos, WorldVoxel::Solid(42));
         })
         .unwrap();
-
-    tick(&mut app, 1);
 
     app.world_mut()
         .run_system_once(move |vw: VoxelWorld| {
@@ -304,7 +267,11 @@ fn set_voxel_isolated_between_instances() {
     let map_b = spawn_map(&mut app, 1);
     spawn_target(&mut app, map_a, Vec3::ZERO, 0);
     spawn_target(&mut app, map_b, Vec3::ZERO, 0);
-    tick(&mut app, 1);
+
+    // Wait for both maps to load the origin chunk
+    tick_until(&mut app, |app| {
+        has_loaded_chunk(app, map_a, IVec3::ZERO) && has_loaded_chunk(app, map_b, IVec3::ZERO)
+    });
 
     let edit_pos = IVec3::new(2, 3, 4);
     app.world_mut()
@@ -313,20 +280,28 @@ fn set_voxel_isolated_between_instances() {
         })
         .unwrap();
 
-    tick(&mut app, 1);
-
     let instance_a = app.world().get::<VoxelMapInstance>(map_a).unwrap();
     assert!(
-        instance_a.modified_voxels.is_empty(),
-        "map_a should have no modified voxels after editing map_b"
+        instance_a.dirty_chunks.is_empty(),
+        "map_a should have no dirty chunks after editing map_b"
     );
 
     let instance_b = app.world().get::<VoxelMapInstance>(map_b).unwrap();
-    assert_eq!(
-        instance_b.modified_voxels.get(&edit_pos),
-        Some(&WorldVoxel::Solid(7)),
-        "map_b should contain the edit"
+    assert!(
+        instance_b.dirty_chunks.contains(&IVec3::ZERO),
+        "map_b should have the edited chunk marked dirty"
     );
+
+    // Verify the voxel is actually in map_b's octree
+    app.world_mut()
+        .run_system_once(move |vw: VoxelWorld| {
+            assert_eq!(
+                vw.get_voxel(map_b, edit_pos),
+                WorldVoxel::Solid(7),
+                "map_b should contain the edit"
+            );
+        })
+        .unwrap();
 }
 
 fn all_air_voxels(_chunk_pos: IVec3) -> Vec<WorldVoxel> {

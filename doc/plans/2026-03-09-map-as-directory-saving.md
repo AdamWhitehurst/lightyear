@@ -1166,7 +1166,7 @@ fn multiple_edits_same_chunk_single_remesh() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [x] All tests pass: `cargo test-all`
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client -c 1`
 

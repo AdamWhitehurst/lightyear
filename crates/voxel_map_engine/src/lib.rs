@@ -6,6 +6,7 @@ pub mod instance;
 pub mod lifecycle;
 pub mod mesh_cache;
 pub mod meshing;
+pub mod palette;
 pub mod raycast;
 pub mod types;
 
@@ -23,7 +24,8 @@ impl Plugin for VoxelPlugin {
                 lifecycle::update_chunks,
                 lifecycle::poll_chunk_tasks,
                 lifecycle::despawn_out_of_range_chunks,
-                lifecycle::flush_write_buffer,
+                lifecycle::spawn_remesh_tasks,
+                lifecycle::poll_remesh_tasks,
             )
                 .chain(),
         );
@@ -40,6 +42,7 @@ pub mod prelude {
     pub use crate::lifecycle::DefaultVoxelMaterial;
     pub use crate::mesh_cache::*;
     pub use crate::meshing::*;
+    pub use crate::palette::*;
     pub use crate::raycast::*;
     pub use crate::types::*;
 }

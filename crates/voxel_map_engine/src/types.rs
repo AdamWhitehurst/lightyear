@@ -1,6 +1,7 @@
 use bevy::prelude::*;
-use ndshape::ConstShape;
 use serde::{Deserialize, Serialize};
+
+use crate::palette::PalettedChunk;
 
 /// 16^3 voxel chunks with 1-voxel padding on each side -> 18^3 padded array
 pub type PaddedChunkShape = ndshape::ConstShape3u32<18, 18, 18>;
@@ -23,7 +24,7 @@ impl Default for WorldVoxel {
 }
 
 /// How a chunk is filled (optimization for uniform chunks)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FillType {
     Empty,
     Mixed,
@@ -31,17 +32,18 @@ pub enum FillType {
 }
 
 /// Voxel data for one chunk (16^3 with 1-voxel padding = 18^3)
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ChunkData {
-    pub voxels: Vec<WorldVoxel>,
+    pub voxels: PalettedChunk,
     pub fill_type: FillType,
     pub hash: u64,
 }
 
 impl ChunkData {
+    /// Create an empty chunk (all air).
     pub fn new_empty() -> Self {
         Self {
-            voxels: vec![WorldVoxel::Air; PaddedChunkShape::SIZE as usize],
+            voxels: PalettedChunk::SingleValue(WorldVoxel::Air),
             fill_type: FillType::Empty,
             hash: 0,
         }
@@ -51,8 +53,9 @@ impl ChunkData {
     pub fn from_voxels(voxels: &[WorldVoxel]) -> Self {
         let fill_type = classify_fill_type(voxels);
         let hash = compute_chunk_hash(voxels);
+        let palettized = PalettedChunk::from_voxels(voxels);
         Self {
-            voxels: voxels.to_vec(),
+            voxels: palettized,
             fill_type,
             hash,
         }
@@ -132,6 +135,7 @@ impl block_mesh::MergeVoxel for WorldVoxel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndshape::ConstShape;
 
     #[test]
     fn padded_chunk_shape_size() {
@@ -149,9 +153,9 @@ mod tests {
     #[test]
     fn chunk_data_new_empty() {
         let chunk = ChunkData::new_empty();
-        assert_eq!(chunk.voxels.len(), PaddedChunkShape::USIZE);
+        assert!(chunk.voxels.is_uniform());
+        assert_eq!(chunk.voxels.get(0), WorldVoxel::Air);
         assert_eq!(chunk.fill_type, FillType::Empty);
-        assert!(chunk.voxels.iter().all(|v| *v == WorldVoxel::Air));
     }
 
     #[test]
@@ -200,7 +204,7 @@ mod tests {
         let voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
         let chunk = ChunkData::from_voxels(&voxels);
         assert_eq!(chunk.fill_type, FillType::Empty);
-        assert_eq!(chunk.voxels.len(), PaddedChunkShape::USIZE);
+        assert!(chunk.voxels.is_uniform());
 
         let mut mixed = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
         mixed[0] = WorldVoxel::Solid(1);

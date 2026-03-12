@@ -1,11 +1,11 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+use ndshape::ConstShape;
 
 use crate::config::VoxelMapConfig;
 use crate::instance::VoxelMapInstance;
 use crate::raycast::{VoxelRaycastResult, voxel_line_traversal};
 use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
-use ndshape::ConstShape;
 
 /// SystemParam for reading/writing voxels on any map instance.
 ///
@@ -18,26 +18,29 @@ pub struct VoxelWorld<'w, 's> {
 impl VoxelWorld<'_, '_> {
     /// Get the voxel at a world-space integer position on a specific map instance.
     ///
-    /// Checks `modified_voxels` first, then octree, then evaluates the voxel generator.
+    /// Checks the octree first, then evaluates the voxel generator as fallback.
     pub fn get_voxel(&self, map: Entity, pos: IVec3) -> WorldVoxel {
         let Ok((instance, config)) = self.maps.get(map) else {
             warn!("get_voxel: entity {map:?} has no VoxelMapInstance");
             return WorldVoxel::Unset;
         };
 
-        if let Some(&voxel) = instance.modified_voxels.get(&pos) {
-            return voxel;
-        }
-
         let chunk_pos = voxel_to_chunk_pos(pos);
         if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
-            return lookup_voxel_in_chunk(&chunk_data.voxels, pos, chunk_pos);
+            let local = pos - chunk_pos * CHUNK_SIZE as i32;
+            let padded = [
+                (local.x + 1) as u32,
+                (local.y + 1) as u32,
+                (local.z + 1) as u32,
+            ];
+            let index = PaddedChunkShape::linearize(padded) as usize;
+            return chunk_data.voxels.get(index);
         }
 
         evaluate_voxel_at(pos, &config.generator)
     }
 
-    /// Queue a voxel write. Applied during `flush_write_buffer` system.
+    /// Mutate a voxel directly in the octree. Marks the chunk dirty and queues remesh.
     pub fn set_voxel(&mut self, map: Entity, pos: IVec3, voxel: WorldVoxel) {
         debug_assert!(
             voxel != WorldVoxel::Unset,
@@ -49,7 +52,7 @@ impl VoxelWorld<'_, '_> {
             return;
         };
 
-        instance.write_buffer.push((pos, voxel));
+        instance.set_voxel(pos, voxel);
     }
 
     /// Raycast against a specific map instance.
@@ -101,14 +104,17 @@ fn lookup_voxel(
     generator: &crate::config::VoxelGenerator,
     cached_chunk: &mut Option<(IVec3, Vec<WorldVoxel>)>,
 ) -> WorldVoxel {
-    if let Some(&voxel) = instance.modified_voxels.get(&voxel_pos) {
-        return voxel;
-    }
-
     let chunk_pos = voxel_to_chunk_pos(voxel_pos);
 
     if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
-        return lookup_voxel_in_chunk(&chunk_data.voxels, voxel_pos, chunk_pos);
+        let local = voxel_pos - chunk_pos * CHUNK_SIZE as i32;
+        let padded = [
+            (local.x + 1) as u32,
+            (local.y + 1) as u32,
+            (local.z + 1) as u32,
+        ];
+        let index = PaddedChunkShape::linearize(padded) as usize;
+        return chunk_data.voxels.get(index);
     }
 
     let needs_generate = match cached_chunk.as_ref() {
@@ -130,7 +136,7 @@ fn evaluate_voxel_at(pos: IVec3, generator: &crate::config::VoxelGenerator) -> W
     lookup_voxel_in_chunk(&voxels, pos, chunk_pos)
 }
 
-/// Index into a voxel array to get the voxel at a world position within the given chunk.
+/// Index into a flat voxel array to get the voxel at a world position within the given chunk.
 fn lookup_voxel_in_chunk(voxels: &[WorldVoxel], voxel_pos: IVec3, chunk_pos: IVec3) -> WorldVoxel {
     let local = voxel_pos - chunk_pos * CHUNK_SIZE as i32;
     let padded = [

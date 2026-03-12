@@ -1,11 +1,13 @@
 use bevy::prelude::*;
 use bevy::tasks::futures::check_ready;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 use std::collections::HashSet;
 
 use crate::chunk::{ChunkTarget, VoxelChunk};
 use crate::config::VoxelMapConfig;
 use crate::generation::{PendingChunks, spawn_chunk_gen_task};
 use crate::instance::VoxelMapInstance;
+use crate::meshing::mesh_chunk_greedy;
 use crate::types::{CHUNK_SIZE, ChunkData};
 
 const MAX_TASKS_PER_FRAME: usize = 32;
@@ -27,13 +29,29 @@ pub fn init_default_material(
     commands.insert_resource(DefaultVoxelMaterial(handle));
 }
 
-/// Auto-insert `PendingChunks` on map entities that lack it.
+/// A pending async remesh task for a chunk mutated in-place.
+struct RemeshTask {
+    chunk_pos: IVec3,
+    task: Task<Option<Mesh>>,
+}
+
+/// Component tracking pending remesh tasks for a map instance.
+#[derive(Component, Default)]
+pub struct PendingRemeshes {
+    tasks: Vec<RemeshTask>,
+}
+
+/// Auto-insert `PendingChunks` and `PendingRemeshes` on map entities that lack them.
 pub fn ensure_pending_chunks(
     mut commands: Commands,
-    query: Query<Entity, (With<VoxelMapInstance>, Without<PendingChunks>)>,
+    chunks_query: Query<Entity, (With<VoxelMapInstance>, Without<PendingChunks>)>,
+    remesh_query: Query<Entity, (With<VoxelMapInstance>, Without<PendingRemeshes>)>,
 ) {
-    for entity in &query {
+    for entity in &chunks_query {
         commands.entity(entity).insert(PendingChunks::default());
+    }
+    for entity in &remesh_query {
+        commands.entity(entity).insert(PendingRemeshes::default());
     }
 }
 
@@ -133,7 +151,7 @@ fn spawn_missing_chunks(
             continue;
         }
 
-        spawn_chunk_gen_task(pending, pos, &config.generator, &instance.modified_voxels);
+        spawn_chunk_gen_task(pending, pos, &config.generator);
         spawned += 1;
     }
 }
@@ -169,9 +187,9 @@ pub fn poll_chunk_tasks(
                 handle_completed_chunk(
                     &mut commands,
                     &mut instance,
-                    &mut meshes,
-                    &mut materials,
-                    &default_material,
+                    &mut *meshes,
+                    &mut *materials,
+                    &*default_material,
                     map_entity,
                     result,
                 );
@@ -268,65 +286,86 @@ pub fn despawn_out_of_range_chunks(
     }
 }
 
-/// Drain the write buffer, apply modifications, and invalidate affected chunks.
-pub fn flush_write_buffer(mut map_query: Query<&mut VoxelMapInstance>) {
-    for mut instance in &mut map_query {
-        if instance.write_buffer.is_empty() {
-            continue;
-        }
+/// Drains `chunks_needing_remesh` and spawns async mesh tasks from existing octree data.
+pub fn spawn_remesh_tasks(mut map_query: Query<(&mut VoxelMapInstance, &mut PendingRemeshes)>) {
+    let pool = AsyncComputeTaskPool::get();
+    for (mut instance, mut pending) in &mut map_query {
+        let positions: Vec<IVec3> = instance.chunks_needing_remesh.drain().collect();
 
-        let buffer: Vec<_> = instance.write_buffer.drain(..).collect();
-        let mut invalidated = HashSet::new();
-
-        for (world_pos, voxel) in buffer {
-            instance.modified_voxels.insert(world_pos, voxel);
-            let chunk_pos = voxel_to_chunk_pos(world_pos);
-            debug_assert_eq!(
-                voxel_to_chunk_pos(chunk_pos * CHUNK_SIZE as i32),
-                chunk_pos,
-                "flush_write_buffer: world→chunk conversion not reversible for {world_pos}"
-            );
-            invalidated.insert(chunk_pos);
-            invalidate_neighbors(world_pos, chunk_pos, &mut invalidated);
-        }
-
-        for pos in invalidated {
-            instance.loaded_chunks.remove(&pos);
-            instance.remove_chunk_data(pos);
+        for chunk_pos in positions {
+            let Some(chunk_data) = instance.get_chunk_data(chunk_pos) else {
+                trace!("spawn_remesh_tasks: chunk {chunk_pos} no longer in octree, skipping");
+                continue;
+            };
+            let voxels = chunk_data.voxels.to_voxels();
+            let task = pool.spawn(async move { mesh_chunk_greedy(&voxels) });
+            pending.tasks.push(RemeshTask { chunk_pos, task });
         }
     }
 }
 
-fn voxel_to_chunk_pos(voxel_pos: IVec3) -> IVec3 {
-    IVec3::new(
-        voxel_pos.x.div_euclid(CHUNK_SIZE as i32),
-        voxel_pos.y.div_euclid(CHUNK_SIZE as i32),
-        voxel_pos.z.div_euclid(CHUNK_SIZE as i32),
-    )
-}
+/// Polls completed remesh tasks and swaps meshes on existing chunk entities.
+pub fn poll_remesh_tasks(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    default_material: Res<DefaultVoxelMaterial>,
+    mut map_query: Query<(Entity, &VoxelMapInstance, &mut PendingRemeshes)>,
+    chunk_query: Query<(Entity, &VoxelChunk, &ChildOf)>,
+) {
+    for (map_entity, instance, mut pending) in &mut map_query {
+        let mut i = 0;
+        while i < pending.tasks.len() {
+            let Some(mesh_opt) = check_ready(&mut pending.tasks[i].task) else {
+                i += 1;
+                continue;
+            };
+            let remesh = pending.tasks.swap_remove(i);
 
-/// If a voxel is on a chunk boundary, the adjacent chunk also needs regeneration
-/// because of the 1-voxel padding overlap.
-fn invalidate_neighbors(voxel_pos: IVec3, chunk_pos: IVec3, invalidated: &mut HashSet<IVec3>) {
-    let local = voxel_pos - chunk_pos * CHUNK_SIZE as i32;
+            if !instance.loaded_chunks.contains(&remesh.chunk_pos) {
+                continue;
+            }
 
-    if local.x == 0 {
-        invalidated.insert(chunk_pos - IVec3::X);
-    }
-    if local.x == CHUNK_SIZE as i32 - 1 {
-        invalidated.insert(chunk_pos + IVec3::X);
-    }
-    if local.y == 0 {
-        invalidated.insert(chunk_pos - IVec3::Y);
-    }
-    if local.y == CHUNK_SIZE as i32 - 1 {
-        invalidated.insert(chunk_pos + IVec3::Y);
-    }
-    if local.z == 0 {
-        invalidated.insert(chunk_pos - IVec3::Z);
-    }
-    if local.z == CHUNK_SIZE as i32 - 1 {
-        invalidated.insert(chunk_pos + IVec3::Z);
+            let existing = chunk_query
+                .iter()
+                .find(|(_, vc, parent)| vc.position == remesh.chunk_pos && parent.0 == map_entity);
+
+            match (mesh_opt, existing) {
+                (Some(mesh), Some((entity, _, _))) => {
+                    let handle = meshes.add(mesh);
+                    commands.entity(entity).insert(Mesh3d(handle));
+                }
+                (Some(mesh), None) => {
+                    let handle = meshes.add(mesh);
+                    let offset = chunk_world_offset(remesh.chunk_pos);
+                    let material = if instance.debug_colors {
+                        materials.add(StandardMaterial {
+                            base_color: color_from_chunk_pos(remesh.chunk_pos),
+                            perceptual_roughness: 0.9,
+                            ..default()
+                        })
+                    } else {
+                        default_material.0.clone()
+                    };
+                    let chunk_entity = commands
+                        .spawn((
+                            VoxelChunk {
+                                position: remesh.chunk_pos,
+                                lod_level: 0,
+                            },
+                            Mesh3d(handle),
+                            MeshMaterial3d(material),
+                            Transform::from_translation(offset),
+                        ))
+                        .id();
+                    commands.entity(map_entity).add_child(chunk_entity);
+                }
+                (None, Some((entity, _, _))) => {
+                    commands.entity(entity).despawn();
+                }
+                (None, None) => {}
+            }
+        }
     }
 }
 
@@ -344,13 +383,6 @@ mod tests {
     fn world_to_chunk_pos_negative() {
         let pos = world_to_chunk_pos(Vec3::new(-1.0, -17.0, 0.0));
         assert_eq!(pos, IVec3::new(-1, -2, 0));
-    }
-
-    #[test]
-    fn voxel_to_chunk_pos_basic() {
-        assert_eq!(voxel_to_chunk_pos(IVec3::new(0, 0, 0)), IVec3::ZERO);
-        assert_eq!(voxel_to_chunk_pos(IVec3::new(16, 0, 0)), IVec3::X);
-        assert_eq!(voxel_to_chunk_pos(IVec3::new(-1, 0, 0)), -IVec3::X);
     }
 
     #[test]

@@ -7768,6 +7768,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "bevy",
+ "bincode 1.3.3",
  "block-mesh",
  "grid-tree",
  "ndcopy",
