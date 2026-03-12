@@ -46,6 +46,37 @@ impl ChunkData {
             hash: 0,
         }
     }
+
+    /// Construct from a flat voxel array (generation output).
+    pub fn from_voxels(voxels: &[WorldVoxel]) -> Self {
+        let fill_type = classify_fill_type(voxels);
+        let hash = compute_chunk_hash(voxels);
+        Self {
+            voxels: voxels.to_vec(),
+            fill_type,
+            hash,
+        }
+    }
+}
+
+fn classify_fill_type(voxels: &[WorldVoxel]) -> FillType {
+    let first = voxels.first().copied().unwrap_or(WorldVoxel::Air);
+    if voxels.iter().all(|&v| v == first) {
+        if first == WorldVoxel::Air {
+            FillType::Empty
+        } else {
+            FillType::Uniform(first)
+        }
+    } else {
+        FillType::Mixed
+    }
+}
+
+fn compute_chunk_hash(voxels: &[WorldVoxel]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    voxels.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Network-serializable voxel type (mirrors WorldVoxel without Unset)
@@ -140,5 +171,41 @@ mod tests {
     fn world_voxel_unset_maps_to_air() {
         let vt: VoxelType = WorldVoxel::Unset.into();
         assert_eq!(vt, VoxelType::Air);
+    }
+
+    #[test]
+    fn classify_fill_type_empty() {
+        let voxels = vec![WorldVoxel::Air; 100];
+        assert_eq!(classify_fill_type(&voxels), FillType::Empty);
+    }
+
+    #[test]
+    fn classify_fill_type_uniform_solid() {
+        let voxels = vec![WorldVoxel::Solid(5); 100];
+        assert_eq!(
+            classify_fill_type(&voxels),
+            FillType::Uniform(WorldVoxel::Solid(5))
+        );
+    }
+
+    #[test]
+    fn classify_fill_type_mixed() {
+        let mut voxels = vec![WorldVoxel::Air; 100];
+        voxels[0] = WorldVoxel::Solid(1);
+        assert_eq!(classify_fill_type(&voxels), FillType::Mixed);
+    }
+
+    #[test]
+    fn from_voxels_sets_fill_type_and_hash() {
+        let voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+        let chunk = ChunkData::from_voxels(&voxels);
+        assert_eq!(chunk.fill_type, FillType::Empty);
+        assert_eq!(chunk.voxels.len(), PaddedChunkShape::USIZE);
+
+        let mut mixed = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+        mixed[0] = WorldVoxel::Solid(1);
+        let chunk = ChunkData::from_voxels(&mixed);
+        assert_eq!(chunk.fill_type, FillType::Mixed);
+        assert_ne!(chunk.hash, 0);
     }
 }

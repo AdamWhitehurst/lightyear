@@ -18,7 +18,7 @@ pub struct VoxelWorld<'w, 's> {
 impl VoxelWorld<'_, '_> {
     /// Get the voxel at a world-space integer position on a specific map instance.
     ///
-    /// Checks `modified_voxels` first, then evaluates the voxel generator.
+    /// Checks `modified_voxels` first, then octree, then evaluates the voxel generator.
     pub fn get_voxel(&self, map: Entity, pos: IVec3) -> WorldVoxel {
         let Ok((instance, config)) = self.maps.get(map) else {
             warn!("get_voxel: entity {map:?} has no VoxelMapInstance");
@@ -27,6 +27,11 @@ impl VoxelWorld<'_, '_> {
 
         if let Some(&voxel) = instance.modified_voxels.get(&pos) {
             return voxel;
+        }
+
+        let chunk_pos = voxel_to_chunk_pos(pos);
+        if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
+            return lookup_voxel_in_chunk(&chunk_data.voxels, pos, chunk_pos);
         }
 
         evaluate_voxel_at(pos, &config.generator)
@@ -89,7 +94,7 @@ impl VoxelWorld<'_, '_> {
     }
 }
 
-/// Look up a voxel at a world position, using a chunk cache for efficiency.
+/// Look up a voxel at a world position, checking octree first then generator cache.
 fn lookup_voxel(
     voxel_pos: IVec3,
     instance: &VoxelMapInstance,
@@ -101,6 +106,10 @@ fn lookup_voxel(
     }
 
     let chunk_pos = voxel_to_chunk_pos(voxel_pos);
+
+    if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
+        return lookup_voxel_in_chunk(&chunk_data.voxels, voxel_pos, chunk_pos);
+    }
 
     let needs_generate = match cached_chunk.as_ref() {
         Some((cached_pos, _)) if *cached_pos == chunk_pos => false,

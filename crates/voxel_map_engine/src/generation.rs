@@ -14,6 +14,7 @@ use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
 pub struct ChunkGenResult {
     pub position: IVec3,
     pub mesh: Option<Mesh>,
+    pub voxels: Vec<WorldVoxel>,
 }
 
 /// Pending async chunk generation tasks for a map entity.
@@ -72,7 +73,11 @@ fn generate_chunk(
     let mut voxels = generator(position);
     apply_overrides(&mut voxels, position, overrides);
     let mesh = mesh_chunk_greedy(&voxels);
-    ChunkGenResult { position, mesh }
+    ChunkGenResult {
+        position,
+        mesh,
+        voxels,
+    }
 }
 
 /// Apply voxel overrides directly into the voxel array.

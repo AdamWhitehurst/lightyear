@@ -6,7 +6,7 @@ use crate::chunk::{ChunkTarget, VoxelChunk};
 use crate::config::VoxelMapConfig;
 use crate::generation::{PendingChunks, spawn_chunk_gen_task};
 use crate::instance::VoxelMapInstance;
-use crate::types::CHUNK_SIZE;
+use crate::types::{CHUNK_SIZE, ChunkData};
 
 const MAX_TASKS_PER_FRAME: usize = 32;
 
@@ -102,7 +102,16 @@ fn is_within_bounds(pos: IVec3, bounds: Option<IVec3>) -> bool {
 }
 
 fn remove_out_of_range_chunks(instance: &mut VoxelMapInstance, desired: &HashSet<IVec3>) {
-    instance.loaded_chunks.retain(|pos| desired.contains(pos));
+    let removed: Vec<IVec3> = instance
+        .loaded_chunks
+        .iter()
+        .filter(|pos| !desired.contains(pos))
+        .copied()
+        .collect();
+    for pos in removed {
+        instance.loaded_chunks.remove(&pos);
+        instance.remove_chunk_data(pos);
+    }
 }
 
 fn spawn_missing_chunks(
@@ -192,6 +201,9 @@ fn handle_completed_chunk(
 ) {
     instance.loaded_chunks.insert(result.position);
 
+    let chunk_data = ChunkData::from_voxels(&result.voxels);
+    instance.insert_chunk_data(result.position, chunk_data);
+
     let Some(mesh) = result.mesh else {
         return;
     };
@@ -280,6 +292,7 @@ pub fn flush_write_buffer(mut map_query: Query<&mut VoxelMapInstance>) {
 
         for pos in invalidated {
             instance.loaded_chunks.remove(&pos);
+            instance.remove_chunk_data(pos);
         }
     }
 }

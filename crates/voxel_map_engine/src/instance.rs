@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use grid_tree::OctreeI32;
+use grid_tree::{NodeKey, OctreeI32, VisitCommand};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{VoxelGenerator, VoxelMapConfig};
@@ -97,6 +97,38 @@ impl VoxelMapInstance {
     }
 }
 
+/// Octree chunk data operations.
+impl VoxelMapInstance {
+    /// Insert chunk data into the octree at the given chunk position.
+    pub fn insert_chunk_data(&mut self, chunk_pos: IVec3, data: ChunkData) {
+        let key = NodeKey::new(0, chunk_pos);
+        self.tree.fill_path_to_node_from_root(key, |_key, entry| {
+            entry.or_insert_with(|| None);
+            VisitCommand::Continue
+        });
+        let relation = self.tree.find_node(key).expect("just created path");
+        *self
+            .tree
+            .get_value_mut(relation.child)
+            .expect("just created node") = Some(data);
+    }
+
+    /// Remove chunk data from the octree. Returns the data if it existed.
+    pub fn remove_chunk_data(&mut self, chunk_pos: IVec3) -> Option<ChunkData> {
+        let key = NodeKey::new(0, chunk_pos);
+        let relation = self.tree.find_node(key)?;
+        let value = self.tree.get_value_mut(relation.child)?;
+        value.take()
+    }
+
+    /// Get a reference to chunk data in the octree.
+    pub fn get_chunk_data(&self, chunk_pos: IVec3) -> Option<&ChunkData> {
+        let key = NodeKey::new(0, chunk_pos);
+        let relation = self.tree.find_node(key)?;
+        self.tree.get_value(relation.child)?.as_ref()
+    }
+}
+
 fn bounds_to_spawning_distance(bounds: IVec3) -> u32 {
     bounds.max_element().max(1) as u32
 }
@@ -108,7 +140,7 @@ fn seed_from_id(id: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grid_tree::{NodeKey, VisitCommand};
+    use crate::types::FillType;
     use std::sync::Arc;
 
     fn dummy_generator() -> VoxelGenerator {
@@ -202,5 +234,56 @@ mod tests {
         let (_, config1, _) = VoxelMapInstance::homebase(1, bounds, dummy_generator());
         let (_, config2, _) = VoxelMapInstance::homebase(2, bounds, dummy_generator());
         assert_ne!(config1.seed, config2.seed);
+    }
+
+    #[test]
+    fn insert_and_retrieve_chunk_data() {
+        let mut instance = VoxelMapInstance::new(5);
+        let pos = IVec3::new(1, 0, 2);
+        let chunk = ChunkData::new_empty();
+        instance.insert_chunk_data(pos, chunk);
+        assert!(instance.get_chunk_data(pos).is_some());
+        assert_eq!(
+            instance.get_chunk_data(pos).unwrap().fill_type,
+            FillType::Empty
+        );
+    }
+
+    #[test]
+    fn remove_chunk_data_returns_data() {
+        let mut instance = VoxelMapInstance::new(5);
+        let pos = IVec3::ZERO;
+        instance.insert_chunk_data(pos, ChunkData::new_empty());
+        let removed = instance.remove_chunk_data(pos);
+        assert!(removed.is_some());
+        assert!(instance.get_chunk_data(pos).is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent_chunk_returns_none() {
+        let mut instance = VoxelMapInstance::new(5);
+        assert!(instance.remove_chunk_data(IVec3::ZERO).is_none());
+    }
+
+    #[test]
+    fn get_nonexistent_chunk_returns_none() {
+        let instance = VoxelMapInstance::new(5);
+        assert!(instance.get_chunk_data(IVec3::new(99, 99, 99)).is_none());
+    }
+
+    #[test]
+    fn overwrite_chunk_data() {
+        let mut instance = VoxelMapInstance::new(5);
+        let pos = IVec3::ZERO;
+        instance.insert_chunk_data(pos, ChunkData::new_empty());
+
+        let mut solid_chunk = ChunkData::new_empty();
+        solid_chunk.voxels[0] = WorldVoxel::Solid(1);
+        solid_chunk.fill_type = FillType::Mixed;
+        instance.insert_chunk_data(pos, solid_chunk);
+
+        let data = instance.get_chunk_data(pos).unwrap();
+        assert_eq!(data.fill_type, FillType::Mixed);
+        assert_eq!(data.voxels[0], WorldVoxel::Solid(1));
     }
 }
