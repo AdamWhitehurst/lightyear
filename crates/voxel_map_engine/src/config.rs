@@ -1,5 +1,7 @@
-use bevy::prelude::*;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use bevy::prelude::*;
 
 use crate::types::WorldVoxel;
 
@@ -10,15 +12,20 @@ pub type VoxelGenerator = Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync>;
 #[derive(Component)]
 pub struct VoxelMapConfig {
     pub seed: u64,
+    /// Tracks the version of the generation algorithm for save compatibility.
+    pub generation_version: u32,
     pub spawning_distance: u32,
     pub bounds: Option<IVec3>,
     pub tree_height: u32,
     pub generator: VoxelGenerator,
+    /// Directory for persisting chunk data. `None` means no persistence.
+    pub save_dir: Option<PathBuf>,
 }
 
 impl VoxelMapConfig {
     pub fn new(
         seed: u64,
+        generation_version: u32,
         spawning_distance: u32,
         bounds: Option<IVec3>,
         tree_height: u32,
@@ -37,10 +44,12 @@ impl VoxelMapConfig {
         }
         Self {
             seed,
+            generation_version,
             spawning_distance,
             bounds,
             tree_height,
             generator,
+            save_dir: None,
         }
     }
 }

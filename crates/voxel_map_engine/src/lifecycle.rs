@@ -70,7 +70,7 @@ pub fn update_chunks(
     for (map_entity, mut instance, config, mut pending, map_transform) in &mut map_query {
         let desired = collect_desired_positions(map_entity, map_transform, config, &target_query);
 
-        remove_out_of_range_chunks(&mut instance, &desired);
+        remove_out_of_range_chunks(&mut instance, &desired, config.save_dir.as_deref());
         spawn_missing_chunks(&mut instance, &mut pending, config, &desired);
     }
 }
@@ -119,7 +119,11 @@ fn is_within_bounds(pos: IVec3, bounds: Option<IVec3>) -> bool {
     }
 }
 
-fn remove_out_of_range_chunks(instance: &mut VoxelMapInstance, desired: &HashSet<IVec3>) {
+fn remove_out_of_range_chunks(
+    instance: &mut VoxelMapInstance,
+    desired: &HashSet<IVec3>,
+    save_dir: Option<&std::path::Path>,
+) {
     let removed: Vec<IVec3> = instance
         .loaded_chunks
         .iter()
@@ -127,6 +131,15 @@ fn remove_out_of_range_chunks(instance: &mut VoxelMapInstance, desired: &HashSet
         .copied()
         .collect();
     for pos in removed {
+        if instance.dirty_chunks.remove(&pos) {
+            if let Some(dir) = save_dir {
+                if let Some(chunk_data) = instance.get_chunk_data(pos) {
+                    if let Err(e) = crate::persistence::save_chunk(dir, pos, chunk_data) {
+                        error!("Failed to save evicted dirty chunk at {pos}: {e}");
+                    }
+                }
+            }
+        }
         instance.loaded_chunks.remove(&pos);
         instance.remove_chunk_data(pos);
     }
@@ -151,7 +164,7 @@ fn spawn_missing_chunks(
             continue;
         }
 
-        spawn_chunk_gen_task(pending, pos, &config.generator);
+        spawn_chunk_gen_task(pending, pos, &config.generator, config.save_dir.clone());
         spawned += 1;
     }
 }

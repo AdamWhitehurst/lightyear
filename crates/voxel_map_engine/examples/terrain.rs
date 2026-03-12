@@ -21,13 +21,7 @@ fn setup(mut commands: Commands) {
     let map_entity = commands
         .spawn((
             instance,
-            VoxelMapConfig {
-                seed: 0,
-                spawning_distance: 5,
-                bounds: None,
-                tree_height: 5,
-                generator,
-            },
+            VoxelMapConfig::new(0, 0, 5, None, 5, generator),
             PendingChunks::default(),
             Transform::default(),
         ))

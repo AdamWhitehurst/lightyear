@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use avian3d::prelude::{ColliderDisabled, RigidBodyDisabled};
@@ -16,13 +17,15 @@ use protocol::{
     CharacterMarker, MapInstanceId, MapRegistry, MapWorld, PendingTransition, VoxelChannel,
     VoxelEditBroadcast, VoxelEditRequest, VoxelStateSync, VoxelType,
 };
-use serde::{Deserialize, Serialize};
 use voxel_map_engine::prelude::{
     flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
     WorldVoxel,
 };
 
-/// Plugin managing server-side voxel map functionality
+use crate::persistence::{load_map_meta, map_save_dir, save_map_meta, MapMeta, WorldSavePath};
+use voxel_map_engine::persistence as chunk_persist;
+
+/// Plugin managing server-side voxel map functionality.
 pub struct ServerMapPlugin;
 
 /// Maps `MapInstanceId` to lightyear room entities. Server-only.
@@ -43,15 +46,61 @@ impl RoomRegistry {
 #[derive(Resource)]
 pub struct OverworldMap(pub Entity);
 
+const DEFAULT_OVERWORLD_SEED: u64 = 999;
+const GENERATION_VERSION: u32 = 0;
+const SAVE_DEBOUNCE_SECONDS: f64 = 1.0;
+const MAX_DIRTY_SECONDS: f64 = 5.0;
+
+/// Tracks all voxel modifications for state sync (kept until Phase 5).
+#[derive(Resource, Default)]
+pub struct VoxelModifications {
+    pub modifications: Vec<(IVec3, VoxelType)>,
+}
+
+/// Tracks whether any map has unsaved dirty chunks.
+#[derive(Resource)]
+pub struct WorldDirtyState {
+    pub is_dirty: bool,
+    pub last_edit_time: f64,
+    pub first_dirty_time: Option<f64>,
+}
+
+impl Default for WorldDirtyState {
+    fn default() -> Self {
+        Self {
+            is_dirty: false,
+            last_edit_time: 0.0,
+            first_dirty_time: None,
+        }
+    }
+}
+
 pub fn spawn_overworld(
     mut commands: Commands,
-    map_world: Res<MapWorld>,
     mut registry: ResMut<MapRegistry>,
+    save_path: Res<WorldSavePath>,
 ) {
+    let map_dir = map_save_dir(&save_path.0, &MapInstanceId::Overworld);
+
+    let (seed, generation_version) = match load_map_meta(&map_dir) {
+        Ok(Some(meta)) => (meta.seed, meta.generation_version),
+        _ => (DEFAULT_OVERWORLD_SEED, GENERATION_VERSION),
+    };
+
+    let mut config = VoxelMapConfig::new(
+        seed,
+        generation_version,
+        2,
+        None,
+        5,
+        Arc::new(flat_terrain_voxels),
+    );
+    config.save_dir = Some(map_dir);
+
     let map = commands
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_voxels)),
+            config,
             Transform::default(),
             MapInstanceId::Overworld,
         ))
@@ -60,34 +109,10 @@ pub fn spawn_overworld(
     registry.insert(MapInstanceId::Overworld, map);
 }
 
-fn load_voxel_world(
-    mut modifications: ResMut<VoxelModifications>,
-    map_world: Res<MapWorld>,
-    save_path: Res<VoxelSavePath>,
-    overworld: Res<OverworldMap>,
-    mut voxel_world: VoxelWorld,
-) {
-    let loaded_mods = load_voxel_world_from_disk_at(&*map_world, &save_path.0);
-
-    if loaded_mods.is_empty() {
-        return;
-    }
-
-    modifications.modifications = loaded_mods.clone();
-
-    for &(pos, voxel_type) in &loaded_mods {
-        voxel_world.set_voxel(overworld.0, pos, WorldVoxel::from(voxel_type));
-    }
-
-    info!("Loaded {} voxel modifications", loaded_mods.len());
-}
-
-fn save_voxel_world_debounced(
-    modifications: Res<VoxelModifications>,
-    map_world: Res<MapWorld>,
-    mut dirty_state: ResMut<VoxelDirtyState>,
-    save_path: Res<VoxelSavePath>,
+fn save_dirty_chunks_debounced(
     time: Res<Time>,
+    mut dirty_state: ResMut<WorldDirtyState>,
+    mut map_query: Query<(&mut VoxelMapInstance, &VoxelMapConfig, &MapInstanceId)>,
 ) {
     if !dirty_state.is_dirty {
         return;
@@ -100,38 +125,77 @@ fn save_voxel_world_debounced(
     let should_save =
         time_since_edit >= SAVE_DEBOUNCE_SECONDS || time_since_first_dirty >= MAX_DIRTY_SECONDS;
 
-    if should_save {
-        if let Err(e) =
-            save_voxel_world_to_disk_at(&modifications.modifications, &*map_world, &save_path.0)
-        {
-            error!("Failed to save voxel world: {}", e);
-        }
+    if !should_save {
+        return;
+    }
 
-        dirty_state.is_dirty = false;
-        dirty_state.first_dirty_time = None;
+    for (mut instance, config, map_id) in &mut map_query {
+        let Some(map_dir) = config.save_dir.as_deref() else {
+            trace!("save_dirty_chunks_debounced: no save_dir for {map_id:?}, skipping");
+            continue;
+        };
+
+        save_dirty_chunks_for_instance(&mut instance, map_dir);
+
+        let meta = MapMeta {
+            version: 1,
+            seed: config.seed,
+            generation_version: config.generation_version,
+            spawn_points: vec![], // Phase 4 will populate from RespawnPoint entities
+        };
+        if let Err(e) = save_map_meta(map_dir, &meta) {
+            error!("Failed to save map meta for {map_id:?}: {e}");
+        }
+    }
+
+    dirty_state.is_dirty = false;
+    dirty_state.first_dirty_time = None;
+}
+
+/// Drain dirty chunks from an instance and persist them to disk.
+pub fn save_dirty_chunks_for_instance(instance: &mut VoxelMapInstance, map_dir: &Path) {
+    let dirty: Vec<IVec3> = instance.dirty_chunks.drain().collect();
+    for chunk_pos in dirty {
+        if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
+            if let Err(e) = chunk_persist::save_chunk(map_dir, chunk_pos, chunk_data) {
+                error!("Failed to save chunk at {chunk_pos}: {e}");
+                instance.dirty_chunks.insert(chunk_pos);
+            }
+        }
     }
 }
 
-pub fn save_voxel_world_on_shutdown(
+pub fn save_world_on_shutdown(
     mut exit_reader: MessageReader<AppExit>,
-    modifications: Res<VoxelModifications>,
-    map_world: Res<MapWorld>,
-    save_path: Res<VoxelSavePath>,
-    dirty_state: Res<VoxelDirtyState>,
+    mut map_query: Query<(&mut VoxelMapInstance, &VoxelMapConfig, &MapInstanceId)>,
+    dirty_state: Res<WorldDirtyState>,
 ) {
     if exit_reader.is_empty() {
         return;
     }
     exit_reader.clear();
 
-    if dirty_state.is_dirty {
-        info!("Saving voxel world on shutdown...");
-        if let Err(e) =
-            save_voxel_world_to_disk_at(&modifications.modifications, &*map_world, &save_path.0)
-        {
-            error!("Failed to save voxel world on shutdown: {}", e);
+    if !dirty_state.is_dirty {
+        return;
+    }
+
+    for (mut instance, config, map_id) in &mut map_query {
+        let Some(map_dir) = config.save_dir.as_deref() else {
+            continue;
+        };
+        save_dirty_chunks_for_instance(&mut instance, map_dir);
+
+        let meta = MapMeta {
+            version: 1,
+            seed: config.seed,
+            generation_version: config.generation_version,
+            spawn_points: vec![],
+        };
+        if let Err(e) = save_map_meta(map_dir, &meta) {
+            error!("Failed to save meta on shutdown for {map_id:?}: {e}");
         }
     }
+    info!("World saved on shutdown");
 }
 
 fn on_map_instance_id_added(
@@ -155,192 +219,27 @@ impl Plugin for ServerMapPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(lightyear::prelude::RoomPlugin)
             .add_plugins(VoxelPlugin)
-            .init_resource::<MapWorld>()
+            .init_resource::<MapWorld>() // Keep until Phase 5
             .init_resource::<MapRegistry>()
             .init_resource::<RoomRegistry>()
-            .init_resource::<VoxelModifications>()
-            .init_resource::<VoxelDirtyState>()
-            .init_resource::<VoxelSavePath>()
-            .add_systems(Startup, (spawn_overworld, load_voxel_world).chain())
+            .init_resource::<VoxelModifications>() // Keep until Phase 5
+            .init_resource::<WorldDirtyState>()
+            .init_resource::<WorldSavePath>()
+            .add_systems(Startup, spawn_overworld)
             .add_systems(
                 Update,
                 (
                     handle_voxel_edit_requests,
+                    save_dirty_chunks_debounced,
                     handle_map_switch_requests,
                     handle_map_transition_ready,
                     protocol::attach_chunk_colliders,
                 ),
             )
-            .add_systems(Update, save_voxel_world_debounced)
-            .add_systems(Last, save_voxel_world_on_shutdown)
+            .add_systems(Last, save_world_on_shutdown)
             .add_observer(send_initial_voxel_state)
             .add_observer(on_map_instance_id_added);
     }
-}
-
-/// Tracks all voxel modifications for state sync
-#[derive(Resource, Default)]
-pub struct VoxelModifications {
-    pub modifications: Vec<(IVec3, VoxelType)>,
-}
-
-#[derive(Resource)]
-pub struct VoxelDirtyState {
-    pub is_dirty: bool,
-    pub last_edit_time: f64,
-    pub first_dirty_time: Option<f64>,
-}
-
-impl Default for VoxelDirtyState {
-    fn default() -> Self {
-        Self {
-            is_dirty: false,
-            last_edit_time: 0.0,
-            first_dirty_time: None,
-        }
-    }
-}
-
-const SAVE_DEBOUNCE_SECONDS: f64 = 1.0;
-const MAX_DIRTY_SECONDS: f64 = 5.0;
-
-#[derive(Serialize, Deserialize)]
-struct VoxelWorldSave {
-    version: u32,
-    generation_seed: u64,
-    generation_version: u32,
-    modifications: Vec<(IVec3, VoxelType)>,
-}
-
-const SAVE_VERSION: u32 = 1;
-const DEFAULT_SAVE_PATH: &str = "world_save/voxel_world.bin";
-
-#[derive(Resource)]
-pub struct VoxelSavePath(pub String);
-
-impl Default for VoxelSavePath {
-    fn default() -> Self {
-        Self(DEFAULT_SAVE_PATH.to_string())
-    }
-}
-
-pub fn save_voxel_world_to_disk_at(
-    modifications: &[(IVec3, VoxelType)],
-    map_world: &MapWorld,
-    path: &str,
-) -> std::io::Result<()> {
-    use std::fs;
-    use std::path::Path;
-
-    let save_data = VoxelWorldSave {
-        version: SAVE_VERSION,
-        generation_seed: map_world.seed,
-        generation_version: map_world.generation_version,
-        modifications: modifications.to_vec(),
-    };
-
-    // Create directory if it doesn't exist
-    if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Serialize to bytes
-    let bytes = bincode::serialize(&save_data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-    // Atomic write: temp file + rename
-    let temp_path = format!("{}.tmp", path);
-    fs::write(&temp_path, bytes)?;
-    fs::rename(temp_path, path)?;
-
-    info!(
-        "Saved {} voxel modifications to {}",
-        modifications.len(),
-        path
-    );
-    Ok(())
-}
-
-pub fn load_voxel_world_from_disk_at(
-    map_world: &MapWorld,
-    save_path: &str,
-) -> Vec<(IVec3, VoxelType)> {
-    use std::fs;
-    use std::path::Path;
-
-    let path = Path::new(save_path);
-
-    // File doesn't exist - normal for first run
-    if !path.exists() {
-        info!(
-            "No save file found at {}, starting with empty world",
-            save_path
-        );
-        return Vec::new();
-    }
-
-    // Read file
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            error!("Error reading save file: {}, starting with empty world", e);
-            return Vec::new();
-        }
-    };
-
-    // Deserialize
-    let save_data: VoxelWorldSave = match bincode::deserialize(&bytes) {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Error deserializing save file: {}", e);
-            // Backup corrupt file
-            let backup_path = format!("{}.corrupt", save_path);
-            if let Err(e) = fs::rename(path, &backup_path) {
-                error!("Failed to backup corrupt file: {}", e);
-            } else {
-                info!("Backed up corrupt file to {}", backup_path);
-            }
-            info!("Starting with empty world");
-            return Vec::new();
-        }
-    };
-
-    // Check save file version
-    if save_data.version != SAVE_VERSION {
-        warn!(
-            "Save file version mismatch (expected {}, got {}), starting with empty world",
-            SAVE_VERSION, save_data.version
-        );
-        return Vec::new();
-    }
-
-    // Check generation compatibility
-    if save_data.generation_seed != map_world.seed {
-        warn!(
-            "Save file generation seed mismatch (saved: {}, current: {})",
-            save_data.generation_seed, map_world.seed
-        );
-        warn!("Modifications may not align with current procedural terrain!");
-        warn!("Starting with empty world to avoid inconsistencies");
-        return Vec::new();
-    }
-
-    if save_data.generation_version != map_world.generation_version {
-        warn!(
-            "Generation algorithm version mismatch (saved: {}, current: {})",
-            save_data.generation_version, map_world.generation_version
-        );
-        warn!("Modifications may not align with current procedural terrain!");
-        warn!("Starting with empty world to avoid inconsistencies");
-        return Vec::new();
-    }
-
-    info!(
-        "Loaded {} voxel modifications from {}",
-        save_data.modifications.len(),
-        save_path
-    );
-    save_data.modifications
 }
 
 fn handle_voxel_edit_requests(
@@ -348,7 +247,7 @@ fn handle_voxel_edit_requests(
     mut sender: ServerMultiMessageSender,
     server: Single<&Server>,
     mut modifications: ResMut<VoxelModifications>,
-    mut dirty_state: ResMut<VoxelDirtyState>,
+    mut dirty_state: ResMut<WorldDirtyState>,
     time: Res<Time>,
     overworld: Res<OverworldMap>,
     mut voxel_world: VoxelWorld,
@@ -387,7 +286,7 @@ fn handle_voxel_edit_requests(
     }
 }
 
-/// System to send initial state to newly connected clients
+/// System to send initial state to newly connected clients.
 fn send_initial_voxel_state(
     trigger: On<Add, Connected>,
     modifications: Res<VoxelModifications>,
@@ -512,7 +411,7 @@ fn execute_server_transition(
         .entity(player_entity)
         .insert(ChunkTarget::new(map_entity, 4));
 
-    let spawn_position = Vec3::new(0.0, 5.0, 0.0);
+    let spawn_position = crate::gameplay::DEFAULT_SPAWN_POS;
     commands.entity(player_entity).insert((
         avian3d::prelude::Position(spawn_position),
         avian3d::prelude::LinearVelocity(Vec3::ZERO),

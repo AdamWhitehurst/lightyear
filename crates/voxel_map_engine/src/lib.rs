@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod mesh_cache;
 pub mod meshing;
 pub mod palette;
+pub mod persistence;
 pub mod raycast;
 pub mod types;
 

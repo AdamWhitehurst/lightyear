@@ -1,6 +1,7 @@
 pub mod gameplay;
 pub mod map;
 pub mod network;
+pub mod persistence;
 
 use bevy::prelude::*;
 use gameplay::ServerGameplayPlugin;

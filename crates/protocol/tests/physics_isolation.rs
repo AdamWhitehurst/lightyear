@@ -139,7 +139,7 @@ fn chunk_target_derived_from_map_registry() {
         .world_mut()
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(0, 1, None, 5, generator.clone()),
+            VoxelMapConfig::new(0, 0, 1, None, 5, generator.clone()),
             Transform::default(),
         ))
         .id();
@@ -147,7 +147,7 @@ fn chunk_target_derived_from_map_registry() {
         .world_mut()
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(1, 1, None, 5, generator),
+            VoxelMapConfig::new(1, 0, 1, None, 5, generator),
             Transform::default(),
         ))
         .id();
@@ -243,7 +243,7 @@ fn chunk_colliders_inherit_map_instance_id() {
         .world_mut()
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(0, 1, None, 5, Arc::new(flat_terrain_voxels)),
+            VoxelMapConfig::new(0, 0, 1, None, 5, Arc::new(flat_terrain_voxels)),
             Transform::default(),
             MapInstanceId::Overworld,
         ))

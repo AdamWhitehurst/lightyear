@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bevy::prelude::*;
@@ -13,6 +14,8 @@ pub struct ChunkGenResult {
     pub position: IVec3,
     pub mesh: Option<Mesh>,
     pub voxels: Vec<WorldVoxel>,
+    /// Whether this chunk was loaded from disk rather than generated.
+    pub from_disk: bool,
 }
 
 /// Pending async chunk generation tasks for a map entity.
@@ -22,16 +25,38 @@ pub struct PendingChunks {
     pub pending_positions: HashSet<IVec3>,
 }
 
-/// Spawn an async task that generates voxel data and meshes a chunk.
+/// Spawn an async task that loads a chunk from disk (if available) or generates it.
 pub fn spawn_chunk_gen_task(
     pending: &mut PendingChunks,
     position: IVec3,
     generator: &VoxelGenerator,
+    save_dir: Option<PathBuf>,
 ) {
     let generator = Arc::clone(generator);
     let pool = AsyncComputeTaskPool::get();
 
-    let task = pool.spawn(async move { generate_chunk(position, &generator) });
+    let task = pool.spawn(async move {
+        if let Some(ref dir) = save_dir {
+            match crate::persistence::load_chunk(dir, position) {
+                Ok(Some(chunk_data)) => {
+                    let voxels = chunk_data.voxels.to_voxels();
+                    let mesh = mesh_chunk_greedy(&voxels);
+                    return ChunkGenResult {
+                        position,
+                        mesh,
+                        voxels,
+                        from_disk: true,
+                    };
+                }
+                Ok(None) => {} // No saved file, generate fresh
+                Err(e) => {
+                    bevy::log::warn!("Failed to load chunk at {position}: {e}, regenerating");
+                }
+            }
+        }
+
+        generate_chunk(position, &generator)
+    });
 
     pending.tasks.push(task);
     pending.pending_positions.insert(position);
@@ -44,5 +69,6 @@ fn generate_chunk(position: IVec3, generator: &VoxelGenerator) -> ChunkGenResult
         position,
         mesh,
         voxels,
+        from_disk: false,
     }
 }

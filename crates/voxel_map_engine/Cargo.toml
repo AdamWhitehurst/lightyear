@@ -10,8 +10,10 @@ ndcopy = { path = "../../git/ndcopy-rs" }
 grid-tree = { path = "../../git/grid-tree-rs" }
 block-mesh = { path = "../../git/block-mesh-rs" }
 serde = { workspace = true, features = ["derive"] }
+bincode = "1.3"
+zstd = "0.13"
 
 [dev-dependencies]
 approx = { workspace = true }
 bevy = { workspace = true, default-features = true }
-bincode = "1.3"
+tempfile = "3"

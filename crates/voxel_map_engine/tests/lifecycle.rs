@@ -18,13 +18,7 @@ fn spawn_map(app: &mut App, spawning_distance: u32) -> Entity {
     app.world_mut()
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig {
-                seed: 0,
-                spawning_distance,
-                bounds: None,
-                tree_height: 5,
-                generator,
-            },
+            VoxelMapConfig::new(0, 0, spawning_distance, None, 5, generator),
             Transform::default(),
         ))
         .id()
@@ -128,13 +122,7 @@ fn bounded_map_respects_bounds() {
         .world_mut()
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig {
-                seed: 0,
-                spawning_distance: 5,
-                bounds: Some(IVec3::new(2, 2, 2)),
-                tree_height: 5,
-                generator,
-            },
+            VoxelMapConfig::new(0, 0, 5, Some(IVec3::new(2, 2, 2)), 5, generator),
             Transform::default(),
         ))
         .id();

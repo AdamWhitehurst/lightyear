@@ -1,217 +1,132 @@
-use bevy::app::AppExit;
 use bevy::prelude::*;
-use protocol::{MapWorld, VoxelType};
-use server::map::{
-    load_voxel_world_from_disk_at, save_voxel_world_to_disk_at, VoxelDirtyState,
-    VoxelModifications, VoxelSavePath,
-};
-use std::fs;
-use std::path::Path;
-
-// Helper: Get unique test directory for each test
-fn get_test_dir(test_name: &str) -> String {
-    format!("tests/world_save_test/{}", test_name)
-}
-
-// Helper: Get save path for a specific test
-fn get_save_path(test_name: &str) -> String {
-    format!("{}/voxel_world.bin", get_test_dir(test_name))
-}
-
-// Helper: Get corrupt backup path for a specific test
-fn get_corrupt_backup_path(test_name: &str) -> String {
-    format!("{}/voxel_world.bin.corrupt", get_test_dir(test_name))
-}
-
-// Helper: Clean up test files for a specific test
-fn cleanup_test_files(test_name: &str) {
-    let _ = fs::remove_dir_all(get_test_dir(test_name));
-}
-
-// Helper: Create test app with ServerMapPlugin for shutdown test
-fn create_test_app_for_shutdown(save_path: &str) -> App {
-    let mut app = App::new();
-    app.add_plugins(MinimalPlugins);
-    app.init_resource::<VoxelModifications>();
-    app.init_resource::<VoxelDirtyState>();
-    app.insert_resource(MapWorld::default());
-    app.insert_resource(VoxelSavePath(save_path.to_string()));
-    app.add_systems(Last, server::map::save_voxel_world_on_shutdown);
-    app
-}
-
-// Helper system to add voxels directly to VoxelModifications (for shutdown test)
-fn add_test_modifications(mut modifications: ResMut<VoxelModifications>, voxels: Res<TestVoxels>) {
-    modifications.modifications = voxels.0.clone();
-}
-
-// Helper resource to pass test voxels
-#[derive(Resource)]
-struct TestVoxels(Vec<(IVec3, VoxelType)>);
+use ndshape::ConstShape;
+use protocol::VoxelType;
+use server::map::{save_dirty_chunks_for_instance, VoxelModifications};
+use server::persistence::{load_map_meta, save_map_meta, MapMeta};
+use voxel_map_engine::persistence as chunk_persist;
+use voxel_map_engine::prelude::*;
 
 #[test]
-fn test_save_load_cycle() {
-    let test_name = "save_load_cycle";
-    cleanup_test_files(test_name);
+fn dirty_chunks_saved_on_debounce() {
+    let dir = tempfile::tempdir().unwrap();
+    let map_dir = dir.path().join("overworld");
 
-    let save_path = get_save_path(test_name);
+    let mut instance = VoxelMapInstance::new(5);
+    let chunk_pos = IVec3::new(1, 0, 0);
+    let voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+    instance.insert_chunk_data(chunk_pos, ChunkData::from_voxels(&voxels));
+    instance.loaded_chunks.insert(chunk_pos);
+    instance.dirty_chunks.insert(chunk_pos);
 
-    // Test data
-    let test_voxels = vec![
-        (IVec3::new(0, 0, 0), VoxelType::Solid(1)),
-        (IVec3::new(5, 10, 15), VoxelType::Solid(2)),
-        (IVec3::new(-3, 7, -2), VoxelType::Solid(3)),
-    ];
+    save_dirty_chunks_for_instance(&mut instance, &map_dir);
 
-    let map_world = MapWorld::default();
-
-    // Save directly using the save function (creates directory if needed)
-    save_voxel_world_to_disk_at(&test_voxels, &map_world, &save_path).unwrap();
-
-    // Verify save file exists
-    assert!(Path::new(&save_path).exists(), "Save file should exist");
-
-    // Load using the load function
-    let loaded_mods = load_voxel_world_from_disk_at(&map_world, &save_path);
-
-    // Verify all 3 voxels loaded
-    assert_eq!(loaded_mods.len(), 3, "Should load 3 voxels");
-
-    // Verify specific positions and materials match
-    for (pos, voxel_type) in &test_voxels {
-        let found = loaded_mods.iter().any(|(p, v)| p == pos && v == voxel_type);
-        assert!(
-            found,
-            "Should find voxel at {:?} with type {:?}",
-            pos, voxel_type
-        );
-    }
-
-    cleanup_test_files(test_name);
+    assert!(chunk_persist::chunk_file_path(&map_dir, chunk_pos).exists());
+    assert!(instance.dirty_chunks.is_empty());
 }
 
 #[test]
-fn test_corrupt_file_recovery() {
-    let test_name = "corrupt_file_recovery";
-    cleanup_test_files(test_name);
+fn clean_chunks_not_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let map_dir = dir.path().join("overworld");
 
-    let save_path = get_save_path(test_name);
-    let corrupt_backup_path = get_corrupt_backup_path(test_name);
+    let mut instance = VoxelMapInstance::new(5);
+    let chunk_pos = IVec3::ZERO;
+    let voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+    instance.insert_chunk_data(chunk_pos, ChunkData::from_voxels(&voxels));
+    instance.loaded_chunks.insert(chunk_pos);
+    // NOT marking dirty
 
-    // Write corrupt data to save file
-    fs::create_dir_all(get_test_dir(test_name)).unwrap();
-    fs::write(&save_path, b"corrupt data").unwrap();
+    save_dirty_chunks_for_instance(&mut instance, &map_dir);
 
-    // Try to load (should detect corruption and create backup)
-    let map_world = MapWorld::default();
-    let loaded_mods = load_voxel_world_from_disk_at(&map_world, &save_path);
-
-    // Verify backup file created
-    assert!(
-        Path::new(&corrupt_backup_path).exists(),
-        "Corrupt backup file should exist"
-    );
-
-    // Verify loaded data is empty (clean start)
-    assert_eq!(
-        loaded_mods.len(),
-        0,
-        "Should start with empty world after corrupt file"
-    );
-
-    cleanup_test_files(test_name);
+    assert!(!chunk_persist::chunk_file_path(&map_dir, chunk_pos).exists());
 }
 
 #[test]
-fn test_generation_metadata_mismatch() {
-    let test_name = "generation_metadata_mismatch";
-    cleanup_test_files(test_name);
+fn terrain_persists_across_save_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let map_dir = dir.path().join("overworld");
 
-    let save_path = get_save_path(test_name);
-
-    // Phase 1: Save with default MapWorld (seed=0, version=1)
-    let test_voxels = vec![
-        (IVec3::new(1, 2, 3), VoxelType::Solid(1)),
-        (IVec3::new(4, 5, 6), VoxelType::Solid(2)),
-    ];
-
-    let map_world = MapWorld {
-        seed: 0,
-        generation_version: 1,
-    };
-    save_voxel_world_to_disk_at(&test_voxels, &map_world, &save_path).unwrap();
-
-    // Phase 2: Try to load with mismatched seed (999)
-    let mismatched_seed = MapWorld {
-        seed: 999,
-        generation_version: 1,
-    };
-    let loaded_mods = load_voxel_world_from_disk_at(&mismatched_seed, &save_path);
-
-    // Verify rejected due to seed mismatch
-    assert_eq!(
-        loaded_mods.len(),
-        0,
-        "Should reject save due to seed mismatch"
-    );
-
-    // Phase 3: Try to load with mismatched generation_version
-    let mismatched_version = MapWorld {
-        seed: 0,
-        generation_version: 999,
-    };
-    let loaded_mods = load_voxel_world_from_disk_at(&mismatched_version, &save_path);
-
-    // Verify rejected due to version mismatch
-    assert_eq!(
-        loaded_mods.len(),
-        0,
-        "Should reject save due to generation_version mismatch"
-    );
-
-    cleanup_test_files(test_name);
-}
-
-#[test]
-fn test_shutdown_save() {
-    let test_name = "shutdown_save";
-    cleanup_test_files(test_name);
-    let save_path = get_save_path(test_name);
-
-    let mut app = create_test_app_for_shutdown(&save_path);
-
-    // Add voxels to VoxelModifications
-    let test_voxels = vec![
-        (IVec3::new(10, 20, 30), VoxelType::Solid(1)),
-        (IVec3::new(40, 50, 60), VoxelType::Solid(2)),
-    ];
-
-    app.insert_resource(TestVoxels(test_voxels.clone()));
-    app.add_systems(Update, add_test_modifications);
-    app.update(); // Run Update to add modifications
-
-    // Set VoxelDirtyState.is_dirty = true manually
+    // Save a chunk with a specific voxel edit
     {
-        let mut dirty_state = app.world_mut().resource_mut::<VoxelDirtyState>();
-        dirty_state.is_dirty = true;
-        dirty_state.last_edit_time = 0.0;
-        dirty_state.first_dirty_time = Some(0.0);
+        let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+        voxels[100] = WorldVoxel::Solid(42);
+        let chunk_data = ChunkData::from_voxels(&voxels);
+        chunk_persist::save_chunk(&map_dir, IVec3::ZERO, &chunk_data).unwrap();
+
+        let meta = MapMeta {
+            version: 1,
+            seed: 999,
+            generation_version: 0,
+            spawn_points: vec![Vec3::new(0.0, 5.0, 0.0)],
+        };
+        save_map_meta(&map_dir, &meta).unwrap();
     }
 
-    // Send AppExit::Success event
-    app.world_mut().write_message(AppExit::Success);
+    // Load and verify
+    {
+        let loaded = chunk_persist::load_chunk(&map_dir, IVec3::ZERO)
+            .unwrap()
+            .expect("chunk should exist");
+        let loaded_voxels = loaded.voxels.to_voxels();
+        assert_eq!(loaded_voxels[100], WorldVoxel::Solid(42));
+        assert_eq!(loaded_voxels[0], WorldVoxel::Air);
 
-    // Run Last schedule (triggers save system)
-    app.update();
+        let meta = load_map_meta(&map_dir).unwrap().expect("meta should exist");
+        assert_eq!(meta.seed, 999);
+        assert_eq!(meta.spawn_points.len(), 1);
+    }
+}
 
-    assert!(
-        Path::new(&save_path).exists(),
-        "Save file should be created on shutdown"
-    );
+#[test]
+fn evicted_dirty_chunk_saved_before_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let map_dir = dir.path().join("overworld");
 
-    let map_world = MapWorld::default();
-    let loaded_mods = load_voxel_world_from_disk_at(&map_world, &save_path);
-    assert_eq!(loaded_mods.len(), 2, "Should save 2 voxels on shutdown");
+    // Set up an instance with a dirty chunk
+    let mut instance = VoxelMapInstance::new(5);
+    let chunk_pos = IVec3::new(3, 0, 0);
+    let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+    voxels[50] = WorldVoxel::Solid(7);
+    instance.insert_chunk_data(chunk_pos, ChunkData::from_voxels(&voxels));
+    instance.loaded_chunks.insert(chunk_pos);
+    instance.dirty_chunks.insert(chunk_pos);
 
-    cleanup_test_files(test_name);
+    // Save all dirty chunks (simulates what eviction does before removing)
+    save_dirty_chunks_for_instance(&mut instance, &map_dir);
+
+    // Then remove from octree (simulates eviction completing)
+    instance.loaded_chunks.remove(&chunk_pos);
+    instance.remove_chunk_data(chunk_pos);
+
+    // Verify chunk was persisted before removal
+    let loaded = chunk_persist::load_chunk(&map_dir, chunk_pos)
+        .unwrap()
+        .expect("evicted dirty chunk should have been saved");
+    let loaded_voxels = loaded.voxels.to_voxels();
+    assert_eq!(loaded_voxels[50], WorldVoxel::Solid(7));
+
+    // Verify chunk is no longer in memory
+    assert!(!instance.loaded_chunks.contains(&chunk_pos));
+    assert!(instance.get_chunk_data(chunk_pos).is_none());
+    assert!(instance.dirty_chunks.is_empty());
+}
+
+#[test]
+fn initial_voxel_state_from_runtime_modifications() {
+    // VoxelModifications is populated at runtime by handle_voxel_edit_requests,
+    // not loaded from disk. Verify the resource accumulates edits correctly.
+    let mut modifications = VoxelModifications::default();
+    assert!(modifications.modifications.is_empty());
+
+    modifications
+        .modifications
+        .push((IVec3::new(1, 2, 3), VoxelType::Solid(1)));
+    modifications
+        .modifications
+        .push((IVec3::new(4, 5, 6), VoxelType::Air));
+
+    assert_eq!(modifications.modifications.len(), 2);
+    assert_eq!(modifications.modifications[0].0, IVec3::new(1, 2, 3));
+    assert_eq!(modifications.modifications[0].1, VoxelType::Solid(1));
+    assert_eq!(modifications.modifications[1].1, VoxelType::Air);
 }

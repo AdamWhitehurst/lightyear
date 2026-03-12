@@ -32,7 +32,7 @@ fn spawn_map(app: &mut App) -> Entity {
         .world_mut()
         .spawn((
             VoxelMapInstance::new(3),
-            VoxelMapConfig::new(0, 1, None, 3, Arc::new(flat_terrain_voxels)),
+            VoxelMapConfig::new(0, 0, 1, None, 3, Arc::new(flat_terrain_voxels)),
             Transform::default(),
             MapInstanceId::Overworld,
             PendingChunks::default(),

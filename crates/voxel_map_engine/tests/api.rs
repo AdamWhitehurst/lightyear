@@ -23,7 +23,7 @@ fn spawn_map_with(app: &mut App, spawning_distance: u32, generator: VoxelGenerat
     app.world_mut()
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(0, spawning_distance, None, 5, generator),
+            VoxelMapConfig::new(0, 0, spawning_distance, None, 5, generator),
             Transform::default(),
         ))
         .id()

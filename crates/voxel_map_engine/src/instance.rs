@@ -52,7 +52,7 @@ impl VoxelMapInstance {
         let tree_height = 5;
         (
             Self::new(tree_height),
-            VoxelMapConfig::new(seed, 10, None, tree_height, generator),
+            VoxelMapConfig::new(seed, 0, 10, None, tree_height, generator),
             Overworld,
         )
     }
@@ -69,6 +69,7 @@ impl VoxelMapInstance {
             Self::new(tree_height),
             VoxelMapConfig::new(
                 seed_from_id(owner_id),
+                0,
                 spawning_distance,
                 Some(bounds),
                 tree_height,
@@ -91,6 +92,7 @@ impl VoxelMapInstance {
             Self::new(tree_height),
             VoxelMapConfig::new(
                 seed,
+                0,
                 spawning_distance,
                 Some(bounds),
                 tree_height,

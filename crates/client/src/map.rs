@@ -61,7 +61,7 @@ fn spawn_overworld(
     let map = commands
         .spawn((
             VoxelMapInstance::new(5),
-            VoxelMapConfig::new(map_world.seed, 2, None, 5, Arc::new(flat_terrain_voxels)),
+            VoxelMapConfig::new(map_world.seed, 0, 2, None, 5, Arc::new(flat_terrain_voxels)),
             Transform::default(),
             MapInstanceId::Overworld,
         ))
@@ -255,7 +255,7 @@ fn spawn_map_instance(
     let entity = commands
         .spawn((
             VoxelMapInstance::new(tree_height),
-            VoxelMapConfig::new(seed, spawning_distance, bounds, tree_height, generator),
+            VoxelMapConfig::new(seed, 0, spawning_distance, bounds, tree_height, generator),
             Transform::default(),
             map_id.clone(),
         ))

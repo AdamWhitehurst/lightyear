@@ -8,7 +8,11 @@ use lightyear::prelude::*;
 use protocol::*;
 
 use crate::map::spawn_overworld;
+use crate::persistence::{load_map_meta, map_save_dir, WorldSavePath};
 use voxel_map_engine::prelude::ChunkTarget;
+
+/// Default spawn position used for respawning and initial player placement.
+pub const DEFAULT_SPAWN_POS: Vec3 = Vec3::new(0.0, 5.0, 0.0);
 
 pub struct ServerGameplayPlugin;
 
@@ -107,8 +111,17 @@ fn handle_character_movement(
     }
 }
 
-fn spawn_respawn_points(mut commands: Commands) {
-    commands.spawn((RespawnPoint, Position(Vec3::new(0.0, 5.0, 0.0))));
+/// Load spawn points from disk metadata; fall back to DEFAULT_SPAWN_POS on first run.
+fn spawn_respawn_points(mut commands: Commands, save_path: Res<WorldSavePath>) {
+    let map_dir = map_save_dir(&save_path.0, &MapInstanceId::Overworld);
+    let spawn_points = match load_map_meta(&map_dir) {
+        Ok(Some(meta)) if !meta.spawn_points.is_empty() => meta.spawn_points,
+        _ => vec![DEFAULT_SPAWN_POS],
+    };
+
+    for pos in spawn_points {
+        commands.spawn((RespawnPoint, Position(pos), MapInstanceId::Overworld));
+    }
 }
 
 fn check_death_and_respawn(
@@ -148,7 +161,7 @@ fn nearest_respawn_pos(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|p| p.0)
-        .unwrap_or(Vec3::new(0.0, 5.0, 0.0))
+        .unwrap_or(DEFAULT_SPAWN_POS)
 }
 
 fn expire_invulnerability(
@@ -171,6 +184,7 @@ fn handle_connected(
     remote_id_query: Query<&RemoteId, With<ClientOf>>,
     registry: Res<MapRegistry>,
     mut room_registry: ResMut<crate::map::RoomRegistry>,
+    respawn_query: Query<(&Position, &MapInstanceId), With<RespawnPoint>>,
 ) {
     let client_entity = trigger.entity;
     let peer_id = remote_id_query
@@ -190,15 +204,18 @@ fn handle_connected(
     ];
     let color = available_colors[num_characters % available_colors.len()];
 
-    let angle: f32 = num_characters as f32 * 5.0;
-    let x = 4.0 * angle.cos();
-    let z = 4.0 * angle.sin();
+    let spawn_pos = respawn_query
+        .iter()
+        .find(|(_, mid)| **mid == MapInstanceId::Overworld)
+        .map(|(p, _)| p.0)
+        .unwrap_or(DEFAULT_SPAWN_POS);
+    let start_pos = Vec3::new(spawn_pos.x, spawn_pos.y + 25.0, spawn_pos.z);
 
     commands
         .spawn((
             Name::new("Character"),
             PlayerId(peer_id),
-            Position(Vec3::new(x, 5.0, z)),
+            Position(start_pos),
             Rotation::default(),
             ActionState::<PlayerActions>::default(),
             Replicate::to_clients(NetworkTarget::All),
