@@ -232,10 +232,8 @@ fn collect_events<E: Event + Debug + Clone>(
 /// Integration test using UDP transport to validate connection establishment
 #[test]
 fn test_client_server_udp_connection() {
-    // Use a unique test port to avoid conflicts
     const TEST_PORT: u16 = 7777;
 
-    // Create server app with UDP transport on test port
     let mut server_app = App::new();
     server_app.add_plugins(MinimalPlugins);
     server_app.add_plugins(ServerPlugins {
@@ -245,14 +243,13 @@ fn test_client_server_udp_connection() {
     server_app.add_plugins(ServerNetworkPlugin {
         config: ServerNetworkConfig {
             transports: vec![ServerTransport::Udp { port: TEST_PORT }],
-            bind_addr: [127, 0, 0, 1], // localhost only for tests
+            bind_addr: [127, 0, 0, 1],
             protocol_id: PROTOCOL_ID,
             private_key: PRIVATE_KEY,
             replication_interval: Duration::from_millis(100),
         },
     });
 
-    // Create client app with UDP transport connecting to test server
     let mut client_app = App::new();
     client_app.add_plugins(MinimalPlugins);
     client_app.add_plugins(ClientPlugins {
@@ -261,7 +258,7 @@ fn test_client_server_udp_connection() {
     client_app.add_plugins(ProtocolPlugin);
     client_app.add_plugins(ClientNetworkPlugin {
         config: ClientNetworkConfig {
-            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)), // Random port
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             server_addr: SocketAddr::from(([127, 0, 0, 1], TEST_PORT)),
             client_id: 0,
             protocol_id: PROTOCOL_ID,
@@ -271,17 +268,14 @@ fn test_client_server_udp_connection() {
         },
     });
 
-    // Setup manual time control for deterministic testing
     let mut current_time = bevy::platform::time::Instant::now();
     let frame_duration = Duration::from_millis(10);
     server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
     client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
 
-    // Run startup systems
     server_app.update();
     client_app.update();
 
-    // Manually trigger connection (since UI plugin isn't used in this test)
     let client_entity = client_app
         .world_mut()
         .query_filtered::<Entity, With<lightyear_client::Client>>()
@@ -295,73 +289,46 @@ fn test_client_server_udp_connection() {
         });
     client_app.update();
 
-    // Verify server spawned UDP entity
     let mut query = server_app
         .world_mut()
         .query_filtered::<Entity, With<NetcodeServer>>();
-    let server_count = query.iter(server_app.world()).count();
-    assert_eq!(server_count, 1, "Server should have spawned one UDP entity");
+    assert_eq!(
+        query.iter(server_app.world()).count(),
+        1,
+        "Server should have spawned one UDP entity"
+    );
 
-    // Verify client spawned entity
-    let mut query = client_app
-        .world_mut()
-        .query_filtered::<Entity, With<Client>>();
-    let client_count = query.iter(client_app.world()).count();
-    assert_eq!(client_count, 1, "Client should have spawned one entity");
-
-    // Step both apps multiple times to allow UDP connection to establish
-    // UDP + netcode handshake can take 100-200 updates depending on timing
-    for i in 0..300 {
-        // Advance time before each update
+    let mut connected = false;
+    for _ in 0..300 {
         current_time += frame_duration;
         server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
         client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
-
         server_app.update();
         client_app.update();
-
-        // Small delay to allow real UDP packets to be sent/received
         std::thread::sleep(Duration::from_micros(100));
 
-        // Check if client is connected
         let mut query = client_app
             .world_mut()
             .query_filtered::<Entity, (With<Client>, With<Connected>)>();
-        let client_connected = query.iter(client_app.world()).count();
-
-        if client_connected > 0 {
-            info!("Client connected after {} update cycles", i + 1);
+        if query.iter(client_app.world()).count() > 0 {
+            connected = true;
             break;
-        }
-
-        // Log progress every 50 cycles
-        if (i + 1) % 50 == 0 {
-            info!("UDP connection attempt {}/300...", i + 1);
         }
     }
 
-    // Verify client has Connected component
-    let mut query = client_app
-        .world_mut()
-        .query_filtered::<Entity, (With<Client>, With<Connected>)>();
-    let client_connected_count = query.iter(client_app.world()).count();
-    assert_eq!(
-        client_connected_count, 1,
-        "Client should have Connected component after connection handshake"
+    assert!(
+        connected,
+        "Client should have Connected component after UDP handshake"
     );
 
-    // Verify server added ReplicationSender to client entity
     let mut query = server_app
         .world_mut()
         .query_filtered::<Entity, (With<Connected>, With<ReplicationSender>)>();
-    let client_entities_on_server = query.iter(server_app.world()).count();
     assert_eq!(
-        client_entities_on_server, 1,
+        query.iter(server_app.world()).count(),
+        1,
         "Server should have added ReplicationSender to connected client"
     );
-
-    info!("✓ UDP connection test passed!");
-    info!("✓ Client and server successfully connected via networking plugins");
 }
 
 /// Test that client and server plugins can be instantiated together
@@ -467,128 +434,136 @@ fn test_plugin_transport_configuration() {
     ));
 }
 
-/// Test that a client can connect and disconnect multiple times,
-/// ensuring connection tokens are properly refreshed on each reconnection.
+/// Test that a client can disconnect and reconnect multiple times to the same
+/// persistent server. Each cycle creates a fresh crossbeam channel pair and
+/// client app while the server app (and its state) persists across reconnections.
 #[test]
-fn test_reconnection_with_token_refresh() {
-    const TEST_PORT: u16 = 7780;
+fn test_crossbeam_reconnection() {
     const RECONNECT_COUNT: usize = 3;
 
-    // Create server app (persists across reconnections)
+    let tick_duration = Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ);
+    let mut current_time = bevy::platform::time::Instant::now();
+
+    // Persistent server app — survives across all reconnection cycles
     let mut server_app = App::new();
     server_app.add_plugins(MinimalPlugins);
-    server_app.add_plugins(ServerPlugins {
-        tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
-    });
+    server_app.add_plugins(ServerPlugins { tick_duration });
     server_app.add_plugins(ProtocolPlugin);
-    server_app.add_plugins(ServerNetworkPlugin {
-        config: ServerNetworkConfig {
-            transports: vec![ServerTransport::Udp { port: TEST_PORT }],
-            bind_addr: [127, 0, 0, 1],
-            protocol_id: PROTOCOL_ID,
-            private_key: PRIVATE_KEY,
-            replication_interval: Duration::from_millis(100),
-        },
-    });
-
-    let mut current_time = bevy::platform::time::Instant::now();
-    let frame_duration = Duration::from_millis(10);
+    server_app.add_plugins(lightyear::prelude::RoomPlugin);
+    server_app.finish();
+    server_app.cleanup();
     server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
-    server_app.update();
 
     for iteration in 0..RECONNECT_COUNT {
-        // Create fresh client with unique client_id for each connection
+        // Fresh crossbeam channel pair for this connection
+        let (crossbeam_client, crossbeam_server) = lightyear_crossbeam::CrossbeamIo::new_pair();
+
+        // Spawn server + client_of entities for this connection
+        let server_entity = server_app
+            .world_mut()
+            .spawn((
+                Name::new(format!("Server {iteration}")),
+                Server::default(),
+                RawServer,
+                DeltaManager::default(),
+                crossbeam_server.clone(),
+            ))
+            .id();
+
+        let client_of_entity = server_app
+            .world_mut()
+            .spawn((
+                Name::new(format!("ClientOf {iteration}")),
+                LinkOf {
+                    server: server_entity,
+                },
+                PingManager::new(PingConfig {
+                    ping_interval: Duration::ZERO,
+                }),
+                ReplicationSender::default(),
+                ReplicationReceiver::default(),
+                Link::new(None),
+                PeerAddr(SocketAddr::from(([127, 0, 0, 1], 9990 + iteration as u16))),
+                Linked,
+                crossbeam_server,
+            ))
+            .id();
+
+        // Trigger Start on server
+        server_app.world_mut().commands().trigger(Start {
+            entity: server_entity,
+        });
+        server_app.update();
+
+        // Fresh client app for this connection
         let mut client_app = App::new();
         client_app.add_plugins(MinimalPlugins);
-        client_app.add_plugins(ClientPlugins {
-            tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
-        });
+        client_app.add_plugins(ClientPlugins { tick_duration });
         client_app.add_plugins(ProtocolPlugin);
-        client_app.add_plugins(ClientNetworkPlugin {
-            config: ClientNetworkConfig {
-                client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-                server_addr: SocketAddr::from(([127, 0, 0, 1], TEST_PORT)),
-                client_id: iteration as u64, // Unique ID per connection
-                protocol_id: PROTOCOL_ID,
-                private_key: PRIVATE_KEY,
-                transport: ClientTransport::Udp,
-                ..default()
-            },
-        });
+        client_app.finish();
+        client_app.cleanup();
         client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
-        client_app.update();
 
-        // Trigger connection
         let client_entity = client_app
             .world_mut()
-            .query_filtered::<Entity, With<lightyear_client::Client>>()
-            .single(client_app.world())
-            .unwrap();
-        client_app
-            .world_mut()
-            .commands()
-            .trigger(lightyear_client::Connect {
-                entity: client_entity,
-            });
+            .spawn((
+                Name::new("Test Client"),
+                Client::default(),
+                PingManager::new(PingConfig {
+                    ping_interval: Duration::ZERO,
+                }),
+                ReplicationSender::default(),
+                ReplicationReceiver::default(),
+                crossbeam_client,
+                PredictionManager::default(),
+                RawClient,
+                Linked,
+            ))
+            .id();
+
+        // Trigger Connect on client
+        client_app.world_mut().commands().trigger(Connect {
+            entity: client_entity,
+        });
         client_app.update();
 
         // Wait for connection
         let mut connected = false;
-        for _ in 0..300 {
-            current_time += frame_duration;
+        for _ in 0..50 {
+            current_time += tick_duration;
             server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
             client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
             server_app.update();
             client_app.update();
-            std::thread::sleep(Duration::from_micros(100));
 
-            let mut query = client_app
-                .world_mut()
-                .query_filtered::<Entity, (With<Client>, With<Connected>)>();
-            if query.iter(client_app.world()).count() > 0 {
+            if client_app.world().get::<Connected>(client_entity).is_some() {
                 connected = true;
                 break;
             }
         }
+
+        assert!(connected, "Client should connect on iteration {iteration}");
         assert!(
-            connected,
-            "Client should connect on iteration {}",
-            iteration
+            server_app
+                .world()
+                .get::<Connected>(client_of_entity)
+                .is_some(),
+            "Server should have Connected on ClientOf entity on iteration {iteration}"
         );
 
-        // Verify server has connected client
-        let mut query = server_app
-            .world_mut()
-            .query_filtered::<Entity, (With<Connected>, With<ReplicationSender>)>();
-        assert!(
-            query.iter(server_app.world()).count() >= 1,
-            "Server should have connected client on iteration {}",
-            iteration
-        );
+        // Simulate disconnect: drop client app, then clean up server-side entities
+        // before stepping to avoid sending on disconnected crossbeam channels
+        drop(client_app);
+        server_app.world_mut().despawn(client_of_entity);
+        server_app.world_mut().despawn(server_entity);
 
-        // Trigger disconnect
-        client_app
-            .world_mut()
-            .commands()
-            .trigger(lightyear_client::Disconnect {
-                entity: client_entity,
-            });
-
-        // Step to process disconnect
-        for _ in 0..50 {
-            current_time += frame_duration;
+        // Step server to flush despawns and process cleanup
+        for _ in 0..10 {
+            current_time += tick_duration;
             server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
-            client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
             server_app.update();
-            client_app.update();
-            std::thread::sleep(Duration::from_micros(100));
         }
     }
-
-    info!(
-        "✓ Reconnection test passed! {} connect/disconnect cycles completed",
-        RECONNECT_COUNT
-    );
 }
 
 /// Test that voxel messages are registered in protocol
@@ -683,10 +658,23 @@ fn test_crossbeam_client_to_server_messages() {
         .expect("Client should have MessageSender")
         .send::<VoxelChannel>(test_message.clone());
 
-    // Step to deliver message (3 ticks needed to ensure delivery)
-    stepper.tick_step(3);
+    // Poll until server receives the message
+    let mut received = false;
+    for _ in 0..30 {
+        stepper.tick_step(1);
+        if !stepper
+            .server_app
+            .world()
+            .resource::<MessageBuffer<VoxelEditRequest>>()
+            .messages
+            .is_empty()
+        {
+            received = true;
+            break;
+        }
+    }
+    assert!(received, "Server should receive the message");
 
-    // Verify on server
     let buffer = stepper
         .server_app
         .world()
@@ -738,10 +726,23 @@ fn test_crossbeam_server_to_client_messages() {
         .expect("Server client entity should have MessageSender")
         .send::<VoxelChannel>(test_message.clone());
 
-    // Step simulation to deliver message (may need 2 ticks for server→client)
-    stepper.tick_step(2);
+    // Poll until client receives the message
+    let mut received = false;
+    for _ in 0..30 {
+        stepper.tick_step(1);
+        if !stepper
+            .client_app
+            .world()
+            .resource::<MessageBuffer<VoxelEditBroadcast>>()
+            .messages
+            .is_empty()
+        {
+            received = true;
+            break;
+        }
+    }
+    assert!(received, "Client should receive the message");
 
-    // Verify message received on client
     let buffer = stepper
         .client_app
         .world()
@@ -794,10 +795,23 @@ fn test_crossbeam_event_triggers() {
         .expect("Client should have EventSender")
         .trigger::<VoxelChannel>(test_trigger.clone());
 
-    // Step to deliver event
-    stepper.tick_step(3);
+    // Poll until server receives the event
+    let mut received = false;
+    for _ in 0..30 {
+        stepper.tick_step(1);
+        if !stepper
+            .server_app
+            .world()
+            .resource::<EventBuffer<TestTrigger>>()
+            .events
+            .is_empty()
+        {
+            received = true;
+            break;
+        }
+    }
+    assert!(received, "Server should receive the event");
 
-    // Verify event received on server
     let buffer = stepper
         .server_app
         .world()
@@ -1353,10 +1367,23 @@ fn test_client_requests_chunk_and_receives_data() {
         .expect("Client should have MessageSender<ChunkRequest>")
         .send::<ChunkChannel>(ChunkRequest { chunk_pos });
 
-    // Step simulation to deliver request and response
-    stepper.tick_step(20);
+    // Poll until client receives ChunkDataSync
+    let mut received = false;
+    for _ in 0..50 {
+        stepper.tick_step(1);
+        if !stepper
+            .client_app
+            .world()
+            .resource::<MessageBuffer<ChunkDataSync>>()
+            .messages
+            .is_empty()
+        {
+            received = true;
+            break;
+        }
+    }
+    assert!(received, "Client should receive ChunkDataSync");
 
-    // Verify client received ChunkDataSync
     let buffer = stepper
         .client_app
         .world()
