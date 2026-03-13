@@ -15,8 +15,8 @@ use protocol::map::{
 };
 use protocol::{
     CharacterMarker, ChunkChannel, ChunkDataSync, ChunkRequest, MapInstanceId, MapRegistry,
-    PendingTransition, VoxelChannel, VoxelEditAck, VoxelEditBroadcast, VoxelEditReject,
-    VoxelEditRequest, VoxelType,
+    PendingTransition, SectionBlocksUpdate, VoxelChannel, VoxelEditAck, VoxelEditBroadcast,
+    VoxelEditReject, VoxelEditRequest, VoxelType,
 };
 use voxel_map_engine::prelude::{
     flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
@@ -351,8 +351,7 @@ impl Plugin for ServerMapPlugin {
             .add_systems(
                 Update,
                 (
-                    handle_voxel_edit_requests,
-                    flush_voxel_broadcasts,
+                    (handle_voxel_edit_requests, flush_voxel_broadcasts).chain(),
                     handle_chunk_requests,
                     save_dirty_chunks_debounced,
                     handle_map_switch_requests,
@@ -363,6 +362,80 @@ impl Plugin for ServerMapPlugin {
             .add_systems(Last, save_world_on_shutdown)
             .add_observer(on_map_instance_id_added);
     }
+}
+
+/// Resolves which map entity a client's character is on.
+fn resolve_player_map(
+    client_entity: Entity,
+    controlled_query: &Query<(&ControlledBy, &MapInstanceId), With<CharacterMarker>>,
+    map_registry: &MapRegistry,
+) -> Option<(Entity, MapInstanceId)> {
+    let (_, player_map_id) = controlled_query
+        .iter()
+        .find(|(ctrl, _)| ctrl.owner == client_entity)?;
+    Some((map_registry.get(player_map_id), player_map_id.clone()))
+}
+
+/// Validates the edit and sends a reject if invalid. Returns `true` if edit is valid.
+fn is_edit_valid(
+    request: &VoxelEditRequest,
+    map_entity: Entity,
+    client_entity: Entity,
+    voxel_world: &VoxelWorld,
+    reject_senders: &mut Query<&mut MessageSender<VoxelEditReject>>,
+) -> bool {
+    if validate_voxel_edit(request, map_entity, voxel_world) {
+        return true;
+    }
+    let current_voxel = voxel_world.get_voxel(map_entity, request.position);
+    if let Ok(mut sender) = reject_senders.get_mut(client_entity) {
+        sender.send::<VoxelChannel>(VoxelEditReject {
+            sequence: request.sequence,
+            position: request.position,
+            correct_voxel: current_voxel.into(),
+        });
+    }
+    false
+}
+
+/// Applies the voxel edit and marks the world dirty.
+fn apply_voxel_edit(
+    request: &VoxelEditRequest,
+    map_entity: Entity,
+    voxel_world: &mut VoxelWorld,
+    dirty_state: &mut WorldDirtyState,
+    time: &Time,
+) {
+    voxel_world.set_voxel(
+        map_entity,
+        request.position,
+        WorldVoxel::from(request.voxel),
+    );
+    let now = time.elapsed_secs_f64();
+    if !dirty_state.is_dirty {
+        dirty_state.first_dirty_time = Some(now);
+    }
+    dirty_state.is_dirty = true;
+    dirty_state.last_edit_time = now;
+}
+
+/// Sends an edit acknowledgment to the originating client.
+fn send_edit_ack(
+    client_entity: Entity,
+    sequence: u32,
+    ack_senders: &mut Query<&mut MessageSender<VoxelEditAck>>,
+) {
+    if let Ok(mut sender) = ack_senders.get_mut(client_entity) {
+        sender.send::<VoxelChannel>(VoxelEditAck { sequence });
+    } else {
+        warn!("send_edit_ack: no ack sender for {client_entity:?}");
+    }
+}
+
+/// Queues a voxel edit for batched broadcast.
+fn queue_edit_broadcast(edit: PendingVoxelEdit, pending: &mut PendingVoxelBroadcasts) {
+    let chunk_pos = voxel_map_engine::prelude::voxel_to_chunk_pos(edit.position);
+    pending.per_chunk.entry(chunk_pos).or_default().push(edit);
 }
 
 pub fn handle_voxel_edit_requests(
@@ -378,64 +451,40 @@ pub fn handle_voxel_edit_requests(
 ) {
     for (client_entity, mut receiver) in &mut receivers {
         for request in receiver.receive() {
-            debug!("handle_voxel_edit_requests: received edit from {client_entity:?} at {:?} voxel={:?} seq={}", request.position, request.voxel, request.sequence);
-            let Some((_, player_map_id)) = controlled_query
-                .iter()
-                .find(|(ctrl, _)| ctrl.owner == client_entity)
+            let Some((map_entity, player_map_id)) =
+                resolve_player_map(client_entity, &controlled_query, &*map_registry)
             else {
                 trace!("handle_voxel_edit_requests: no character for client {client_entity:?}");
                 continue;
             };
-            let map_entity = map_registry.get(player_map_id);
 
-            if !validate_voxel_edit(&request, map_entity, &voxel_world) {
-                let current_voxel = voxel_world.get_voxel(map_entity, request.position);
-                if let Ok(mut sender) = reject_senders.get_mut(client_entity) {
-                    sender.send::<VoxelChannel>(VoxelEditReject {
-                        sequence: request.sequence,
-                        position: request.position,
-                        correct_voxel: current_voxel.into(),
-                    });
-                }
+            if !is_edit_valid(
+                &request,
+                map_entity,
+                client_entity,
+                &voxel_world,
+                &mut reject_senders,
+            ) {
                 continue;
             }
 
-            voxel_world.set_voxel(
+            apply_voxel_edit(
+                &request,
                 map_entity,
-                request.position,
-                WorldVoxel::from(request.voxel),
+                &mut voxel_world,
+                &mut *dirty_state,
+                &*time,
             );
-
-            let now = time.elapsed_secs_f64();
-            if !dirty_state.is_dirty {
-                dirty_state.first_dirty_time = Some(now);
-            }
-            dirty_state.is_dirty = true;
-            dirty_state.last_edit_time = now;
-
-            if let Ok(mut sender) = ack_senders.get_mut(client_entity) {
-                debug!(
-                    "handle_voxel_edit_requests: ack seq={} to {client_entity:?}",
-                    request.sequence
-                );
-                sender.send::<VoxelChannel>(VoxelEditAck {
-                    sequence: request.sequence,
-                });
-            } else {
-                warn!("handle_voxel_edit_requests: no ack sender for {client_entity:?}");
-            }
-
-            let chunk_pos = voxel_map_engine::prelude::voxel_to_chunk_pos(request.position);
-            pending_broadcasts
-                .per_chunk
-                .entry(chunk_pos)
-                .or_default()
-                .push(PendingVoxelEdit {
+            send_edit_ack(client_entity, request.sequence, &mut ack_senders);
+            queue_edit_broadcast(
+                PendingVoxelEdit {
                     position: request.position,
                     voxel: request.voxel,
                     originator: client_entity,
-                    map_id: player_map_id.clone(),
-                });
+                    map_id: player_map_id,
+                },
+                &mut *pending_broadcasts,
+            );
         }
     }
 }
@@ -450,8 +499,9 @@ fn validate_voxel_edit(
     true
 }
 
-/// Drains accumulated voxel edits and broadcasts them to clients in the same room,
-/// excluding the originating client.
+/// Drains accumulated voxel edits and broadcasts them to clients in the same room.
+/// Single edits send individual `VoxelEditBroadcast`; 2+ edits in the same chunk
+/// send a batched `SectionBlocksUpdate`. The originating client is excluded.
 pub fn flush_voxel_broadcasts(
     mut pending: ResMut<PendingVoxelBroadcasts>,
     mut sender: ServerMultiMessageSender,
@@ -463,29 +513,47 @@ pub fn flush_voxel_broadcasts(
     }
 
     for (_chunk_pos, edits) in pending.per_chunk.drain() {
-        for edit in edits {
-            let Some(&room_entity) = room_registry.0.get(&edit.map_id) else {
-                warn!("flush_voxel_broadcasts: no room for map {:?}", edit.map_id);
-                continue;
-            };
-            let Ok(room) = rooms.get(room_entity) else {
-                warn!("flush_voxel_broadcasts: room entity {room_entity:?} has no Room component");
-                continue;
-            };
+        let Some(first) = edits.first() else {
+            continue;
+        };
+        let Some(&room_entity) = room_registry.0.get(&first.map_id) else {
+            warn!("flush_voxel_broadcasts: no room for map {:?}", first.map_id);
+            continue;
+        };
+        let Ok(room) = rooms.get(room_entity) else {
+            warn!("flush_voxel_broadcasts: room entity {room_entity:?} has no Room component");
+            continue;
+        };
 
-            let broadcast = VoxelEditBroadcast {
-                position: edit.position,
-                voxel: edit.voxel,
-            };
+        let originators: bevy::ecs::entity::EntityHashSet =
+            edits.iter().map(|e| e.originator).collect();
+        let targets: bevy::ecs::entity::EntityHashSet = room
+            .clients
+            .iter()
+            .filter(|e| !originators.contains(*e))
+            .copied()
+            .collect();
 
-            let targets: bevy::ecs::entity::EntityHashSet = room
-                .clients
-                .iter()
-                .filter(|e| **e != edit.originator)
-                .copied()
-                .collect();
+        if edits.len() == 1 {
+            let edit = &edits[0];
             sender
-                .send_to_entities::<_, VoxelChannel>(&broadcast, &targets)
+                .send_to_entities::<_, VoxelChannel>(
+                    &VoxelEditBroadcast {
+                        position: edit.position,
+                        voxel: edit.voxel,
+                    },
+                    &targets,
+                )
+                .ok();
+        } else {
+            let chunk_pos = voxel_map_engine::prelude::voxel_to_chunk_pos(edits[0].position);
+            let changes: Vec<(IVec3, VoxelType)> =
+                edits.iter().map(|e| (e.position, e.voxel)).collect();
+            sender
+                .send_to_entities::<_, VoxelChannel>(
+                    &SectionBlocksUpdate { chunk_pos, changes },
+                    &targets,
+                )
                 .ok();
         }
     }

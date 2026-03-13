@@ -2879,13 +2879,13 @@ fn test_client_requests_chunk_and_receives_data() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [x] All tests pass: `cargo test-all`
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client -c 1`
 
 #### Manual Verification:
 - [x] Client renders terrain received from server (no local generation)
-- [ ] Moving to new areas loads new chunks from server
+- [x] Moving to new areas loads new chunks from server
 - [ ] Chunks unload when leaving view range
 - [ ] Map transitions work — new map's chunks stream from server
 - [ ] Existing voxel edits are visible (baked into chunk data)

@@ -93,6 +93,13 @@ pub struct VoxelEditReject {
     pub correct_voxel: VoxelType,
 }
 
+/// Batched block changes for a single chunk, sent when 2+ changes happen in one tick.
+#[derive(Serialize, Deserialize, Clone, Debug, Reflect, Message)]
+pub struct SectionBlocksUpdate {
+    pub chunk_pos: IVec3,
+    pub changes: Vec<(IVec3, VoxelType)>,
+}
+
 /// Channel for map transition messages
 pub struct MapChannel;
 

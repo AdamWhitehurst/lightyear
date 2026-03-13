@@ -8,8 +8,8 @@ use lightyear::prelude::{Controlled, DisableRollback, MessageReceiver, MessageSe
 use protocol::map::{MapChannel, MapTransitionEnd, MapTransitionReady, MapTransitionStart};
 use protocol::{
     CharacterMarker, ChunkChannel, ChunkDataSync, ChunkRequest, ChunkUnload, MapInstanceId,
-    MapRegistry, PendingTransition, PlayerActions, TransitionReadySent, VoxelChannel, VoxelEditAck,
-    VoxelEditBroadcast, VoxelEditReject, VoxelEditRequest, VoxelType,
+    MapRegistry, PendingTransition, PlayerActions, SectionBlocksUpdate, TransitionReadySent,
+    VoxelChannel, VoxelEditAck, VoxelEditBroadcast, VoxelEditReject, VoxelEditRequest, VoxelType,
 };
 use ui::MapTransitionState;
 use voxel_map_engine::prelude::{
@@ -78,6 +78,7 @@ impl Plugin for ClientMapPlugin {
                 (
                     attach_chunk_target_to_player,
                     handle_voxel_broadcasts,
+                    handle_section_blocks_update,
                     handle_voxel_edit_ack,
                     handle_voxel_edit_reject,
                     request_missing_chunks,
@@ -350,6 +351,35 @@ fn handle_voxel_broadcasts(
                 broadcast.position,
                 WorldVoxel::from(broadcast.voxel),
             );
+        }
+    }
+}
+
+/// Handles batched block updates from server.
+fn handle_section_blocks_update(
+    mut receivers: Query<&mut MessageReceiver<SectionBlocksUpdate>>,
+    player_query: Query<&ChunkTarget, (With<Predicted>, With<Controlled>, With<CharacterMarker>)>,
+    mut voxel_world: VoxelWorld,
+    prediction_state: Res<VoxelPredictionState>,
+) {
+    let Ok(chunk_target) = player_query.single() else {
+        trace!("handle_section_blocks_update: no predicted player with ChunkTarget");
+        return;
+    };
+    for mut receiver in receivers.iter_mut() {
+        for update in receiver.receive() {
+            for (pos, voxel) in &update.changes {
+                let has_pending_prediction =
+                    prediction_state.pending.iter().any(|p| p.position == *pos);
+                if has_pending_prediction {
+                    trace!(
+                        "handle_section_blocks_update: skipping change at {:?} (pending prediction)",
+                        pos
+                    );
+                    continue;
+                }
+                voxel_world.set_voxel(chunk_target.map_entity, *pos, WorldVoxel::from(*voxel));
+            }
         }
     }
 }
@@ -695,5 +725,68 @@ mod tests {
         state.pending.retain(|p| p.sequence > 2);
         assert_eq!(state.pending.len(), 2);
         assert_eq!(state.pending[0].sequence, 3);
+    }
+
+    #[test]
+    fn broadcast_skipped_for_pending_prediction_position() {
+        let mut state = VoxelPredictionState::default();
+        state.pending.push(VoxelPrediction {
+            sequence: 0,
+            position: IVec3::new(5, 10, 15),
+            old_voxel: VoxelType::Solid(1),
+            new_voxel: VoxelType::Air,
+        });
+
+        let broadcast_pos = IVec3::new(5, 10, 15);
+        let has_pending = state.pending.iter().any(|p| p.position == broadcast_pos);
+        assert!(
+            has_pending,
+            "broadcast at pending prediction position should be filtered"
+        );
+
+        let other_pos = IVec3::new(1, 2, 3);
+        let has_pending_other = state.pending.iter().any(|p| p.position == other_pos);
+        assert!(
+            !has_pending_other,
+            "broadcast at non-pending position should not be filtered"
+        );
+    }
+
+    #[test]
+    fn reject_removes_specific_prediction() {
+        let mut state = VoxelPredictionState::default();
+        for i in 0..5 {
+            state.pending.push(VoxelPrediction {
+                sequence: i,
+                position: IVec3::new(i as i32, 0, 0),
+                old_voxel: VoxelType::Air,
+                new_voxel: VoxelType::Solid(1),
+            });
+        }
+
+        let rejected_seq = 2u32;
+        state.pending.retain(|p| p.sequence != rejected_seq);
+
+        assert_eq!(state.pending.len(), 4);
+        assert!(
+            state.pending.iter().all(|p| p.sequence != 2),
+            "rejected prediction should be removed"
+        );
+        assert!(
+            state.pending.iter().any(|p| p.sequence == 0),
+            "other predictions should remain"
+        );
+        assert!(
+            state.pending.iter().any(|p| p.sequence == 1),
+            "other predictions should remain"
+        );
+        assert!(
+            state.pending.iter().any(|p| p.sequence == 3),
+            "other predictions should remain"
+        );
+        assert!(
+            state.pending.iter().any(|p| p.sequence == 4),
+            "other predictions should remain"
+        );
     }
 }
