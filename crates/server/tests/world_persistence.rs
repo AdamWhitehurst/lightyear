@@ -167,6 +167,98 @@ fn meta_and_chunks_coexist_in_map_directory() {
 }
 
 #[test]
+fn multiple_maps_save_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ow_dir = map_save_dir(tmp.path(), &MapInstanceId::Overworld);
+    let hb_dir = map_save_dir(tmp.path(), &MapInstanceId::Homebase { owner: 42 });
+
+    let mut ow_voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+    ow_voxels[0] = WorldVoxel::Solid(1);
+    chunk_persist::save_chunk(&ow_dir, IVec3::ZERO, &ChunkData::from_voxels(&ow_voxels)).unwrap();
+
+    let mut hb_voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+    hb_voxels[0] = WorldVoxel::Solid(99);
+    chunk_persist::save_chunk(&hb_dir, IVec3::ZERO, &ChunkData::from_voxels(&hb_voxels)).unwrap();
+
+    let ow_loaded = chunk_persist::load_chunk(&ow_dir, IVec3::ZERO)
+        .unwrap()
+        .unwrap();
+    let hb_loaded = chunk_persist::load_chunk(&hb_dir, IVec3::ZERO)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ow_loaded.voxels.get(0), WorldVoxel::Solid(1));
+    assert_eq!(hb_loaded.voxels.get(0), WorldVoxel::Solid(99));
+}
+
+#[test]
+fn homebase_metadata_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hb_dir = map_save_dir(tmp.path(), &MapInstanceId::Homebase { owner: 123 });
+
+    let meta = MapMeta {
+        version: 1,
+        seed: 123,
+        generation_version: 0,
+        spawn_points: vec![Vec3::new(0.0, 5.0, 0.0)],
+    };
+    save_map_meta(&hb_dir, &meta).unwrap();
+
+    let loaded = load_map_meta(&hb_dir).unwrap().expect("meta should exist");
+    assert_eq!(loaded.seed, 123);
+}
+
+#[test]
+fn homebase_entities_saved_separately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ow_dir = map_save_dir(tmp.path(), &MapInstanceId::Overworld);
+    let hb_dir = map_save_dir(tmp.path(), &MapInstanceId::Homebase { owner: 1 });
+
+    save_entities(
+        &ow_dir,
+        &[SavedEntity {
+            kind: SavedEntityKind::RespawnPoint,
+            position: Vec3::ZERO,
+        }],
+    )
+    .unwrap();
+    save_entities(
+        &hb_dir,
+        &[
+            SavedEntity {
+                kind: SavedEntityKind::RespawnPoint,
+                position: Vec3::ONE,
+            },
+            SavedEntity {
+                kind: SavedEntityKind::RespawnPoint,
+                position: Vec3::NEG_ONE,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(load_entities(&ow_dir).unwrap().len(), 1);
+    assert_eq!(load_entities(&hb_dir).unwrap().len(), 2);
+}
+
+#[test]
+fn map_save_dir_different_homebases_are_isolated() {
+    let base = std::path::Path::new("worlds");
+    let dir1 = map_save_dir(base, &MapInstanceId::Homebase { owner: 1 });
+    let dir2 = map_save_dir(base, &MapInstanceId::Homebase { owner: 2 });
+    assert_ne!(dir1, dir2);
+    assert_eq!(dir1, std::path::PathBuf::from("worlds/homebase-1"));
+    assert_eq!(dir2, std::path::PathBuf::from("worlds/homebase-2"));
+}
+
+#[test]
+fn overworld_and_homebase_dirs_are_isolated() {
+    let base = std::path::Path::new("worlds");
+    let ow = map_save_dir(base, &MapInstanceId::Overworld);
+    let hb = map_save_dir(base, &MapInstanceId::Homebase { owner: 1 });
+    assert_ne!(ow, hb);
+}
+
+#[test]
 fn entities_persist_across_server_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let map_dir = tmp.path().join("overworld");

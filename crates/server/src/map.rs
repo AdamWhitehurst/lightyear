@@ -19,8 +19,8 @@ use protocol::{
     VoxelEditReject, VoxelEditRequest, VoxelType,
 };
 use voxel_map_engine::prelude::{
-    flat_terrain_voxels, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld,
-    WorldVoxel,
+    flat_terrain_voxels, seed_from_id, ChunkTarget, VoxelMapConfig, VoxelMapInstance, VoxelPlugin,
+    VoxelWorld, WorldVoxel,
 };
 
 use crate::persistence::{
@@ -616,6 +616,7 @@ pub fn handle_map_switch_requests(
     mut registry: ResMut<MapRegistry>,
     mut room_registry: ResMut<RoomRegistry>,
     config_query: Query<&VoxelMapConfig>,
+    save_path: Res<WorldSavePath>,
 ) {
     for (client_entity, mut receiver) in &mut receivers {
         for request in receiver.receive() {
@@ -653,6 +654,7 @@ pub fn handle_map_switch_requests(
                 &mut *room_registry,
                 &config_query,
                 &mut senders,
+                &*save_path,
             );
         }
     }
@@ -686,6 +688,7 @@ fn execute_server_transition(
     room_registry: &mut RoomRegistry,
     config_query: &Query<&VoxelMapConfig>,
     senders: &mut Query<&mut MessageSender<MapTransitionStart>>,
+    save_path: &WorldSavePath,
 ) {
     info!("Transitioning player {player_entity:?} from {current_map_id:?} to {target_map_id:?}");
 
@@ -718,7 +721,8 @@ fn execute_server_transition(
 
     commands.entity(player_entity).insert(target_map_id.clone());
 
-    let (map_entity, params) = ensure_map_exists(commands, target_map_id, registry, config_query);
+    let (map_entity, params) =
+        ensure_map_exists(commands, target_map_id, registry, config_query, save_path);
     commands
         .entity(player_entity)
         .insert(ChunkTarget::new(map_entity, 4));
@@ -749,6 +753,7 @@ fn ensure_map_exists(
     map_id: &MapInstanceId,
     registry: &mut MapRegistry,
     config_query: &Query<&VoxelMapConfig>,
+    save_path: &WorldSavePath,
 ) -> (Entity, MapTransitionParams) {
     if let Some(&entity) = registry.0.get(map_id) {
         let config = config_query
@@ -767,26 +772,69 @@ fn ensure_map_exists(
             panic!("Overworld must already be registered in MapRegistry");
         }
         MapInstanceId::Homebase { owner } => {
-            let bounds = IVec3::new(4, 4, 4);
-            let (instance, config, marker) =
-                VoxelMapInstance::homebase(*owner, bounds, Arc::new(flat_terrain_voxels));
-            let params = MapTransitionParams {
-                seed: config.seed,
-                generation_version: config.generation_version,
-                bounds: config.bounds,
-            };
-            let entity = commands
-                .spawn((
-                    instance,
-                    config,
-                    marker,
-                    Transform::default(),
-                    map_id.clone(),
-                ))
-                .id();
-            registry.insert(map_id.clone(), entity);
-            info!("Spawned server homebase for owner {owner}: {entity:?}");
+            let (entity, params) = spawn_homebase(commands, *owner, save_path, registry, map_id);
             (entity, params)
+        }
+    }
+}
+
+/// Spawns a new homebase map, loading seed and entities from disk if saved.
+fn spawn_homebase(
+    commands: &mut Commands,
+    owner: u64,
+    save_path: &WorldSavePath,
+    registry: &mut MapRegistry,
+    map_id: &MapInstanceId,
+) -> (Entity, MapTransitionParams) {
+    let map_dir = map_save_dir(&save_path.0, map_id);
+
+    let seed = load_homebase_seed(&map_dir, owner);
+
+    let bounds = IVec3::new(4, 4, 4);
+    let (instance, mut config, marker) =
+        VoxelMapInstance::homebase(owner, bounds, Arc::new(flat_terrain_voxels));
+    config.seed = seed;
+    config.save_dir = Some(map_dir);
+
+    let params = MapTransitionParams {
+        seed: config.seed,
+        generation_version: config.generation_version,
+        bounds: config.bounds,
+    };
+    let entity = commands
+        .spawn((
+            instance,
+            config,
+            marker,
+            Transform::default(),
+            map_id.clone(),
+        ))
+        .id();
+    registry.insert(map_id.clone(), entity);
+
+    let entity_count = load_map_entities(commands, save_path, map_id);
+    if entity_count > 0 {
+        info!("Loaded {entity_count} entities for homebase-{owner}");
+    }
+
+    info!("Spawned server homebase for owner {owner}: {entity:?}");
+    (entity, params)
+}
+
+/// Loads the seed for a homebase from saved metadata, falling back to `seed_from_id`.
+fn load_homebase_seed(map_dir: &Path, owner: u64) -> u64 {
+    match load_map_meta(map_dir) {
+        Ok(Some(meta)) => {
+            info!(
+                "Loading homebase-{owner} from saved metadata (seed={})",
+                meta.seed
+            );
+            meta.seed
+        }
+        _ => {
+            let seed = seed_from_id(owner);
+            info!("Creating new homebase-{owner} (seed={seed})");
+            seed
         }
     }
 }

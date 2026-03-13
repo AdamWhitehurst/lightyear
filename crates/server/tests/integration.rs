@@ -6,6 +6,7 @@ use ::server::map::{
     WorldDirtyState,
 };
 use ::server::network::{ServerNetworkConfig, ServerNetworkPlugin, ServerTransport};
+use ::server::persistence::WorldSavePath;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
@@ -833,6 +834,7 @@ fn test_crossbeam_event_triggers() {
 fn add_server_map_systems(stepper: &mut CrossbeamTestStepper) {
     stepper.server_app.init_resource::<MapRegistry>();
     stepper.server_app.init_resource::<RoomRegistry>();
+    stepper.server_app.init_resource::<WorldSavePath>();
     stepper.server_app.add_systems(
         Update,
         (handle_map_switch_requests, handle_map_transition_ready),
@@ -1089,6 +1091,7 @@ fn server_and_client_spawn_matching_homebase_configs() {
     server_app.add_plugins(lightyear::prelude::RoomPlugin);
     server_app.init_resource::<MapRegistry>();
     server_app.init_resource::<RoomRegistry>();
+    server_app.init_resource::<WorldSavePath>();
     server_app.add_systems(
         Update,
         (handle_map_switch_requests, handle_map_transition_ready),

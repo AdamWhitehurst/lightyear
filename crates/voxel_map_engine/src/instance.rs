@@ -204,7 +204,8 @@ fn bounds_to_spawning_distance(bounds: IVec3) -> u32 {
     bounds.max_element().max(1) as u32
 }
 
-fn seed_from_id(id: u64) -> u64 {
+/// Derives a deterministic seed from a player/entity ID.
+pub fn seed_from_id(id: u64) -> u64 {
     id
 }
 

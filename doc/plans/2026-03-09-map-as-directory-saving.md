@@ -3884,7 +3884,7 @@ fn full_world_persistence_cycle() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
+- [x] All tests pass: `cargo test-all`
 - [ ] Server builds and runs: `cargo server`
 - [ ] Client builds and runs: `cargo client -c 1`
 
