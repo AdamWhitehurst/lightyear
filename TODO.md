@@ -1,3 +1,6 @@
+- update world object system on hot reload by first remove WorldObjectId's components using old loaded Def, load new Def, insert_if_new(...) ?
+- /sped:update - test on adding tracing > output txt file
+- client --autoconnect flag
 - stream ron assets to web clients on request
 - 90 degree camera rotation, w/ character facing, other characters facing other plane off by some degrees i.e. slightly visible instead 
 - bevi-inspector-egui
@@ -7,3 +10,5 @@
 - meaningful proc gen terrain
 - prefab world objects 'doodads?'
 - composable Character templates that are loadable Asset files. Character template asset files are composed of other ron asset files
+- /spec:rules
+- /spec:find-rules
