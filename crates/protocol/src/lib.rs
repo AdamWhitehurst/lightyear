@@ -22,8 +22,8 @@ pub use ability::{
 };
 pub use app_state::{AppState, AppStatePlugin, TrackedAssets};
 pub use hit_detection::{
-    character_collision_layers, hitbox_collision_layers, projectile_collision_layers,
-    terrain_collision_layers, GameLayer,
+    character_collision_layers, damageable_collision_layers, hitbox_collision_layers,
+    projectile_collision_layers, terrain_collision_layers, GameLayer,
 };
 pub use map::{
     attach_chunk_colliders, ChunkChannel, ChunkDataSync, ChunkRequest, ChunkUnload, MapChannel,

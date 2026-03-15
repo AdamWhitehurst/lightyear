@@ -8,7 +8,7 @@ use crate::ability::{
     ActiveAbility, ActiveBuffs, ActiveShield, EffectTarget, ForceFrame, HitTargets, HitboxOf,
     MeleeHitbox, OnHitEffects,
 };
-use crate::{CharacterMarker, Health, Invulnerable, PlayerId};
+use crate::{Health, Invulnerable, PlayerId};
 
 pub const MELEE_HITBOX_OFFSET: f32 = 3.0;
 pub const MELEE_HITBOX_HALF_EXTENTS: Vec3 = Vec3::new(1.5, 2.0, 1.0);
@@ -21,6 +21,7 @@ pub enum GameLayer {
     Hitbox,
     Projectile,
     Terrain,
+    Damageable,
 }
 
 /// Collision layer config for characters.
@@ -32,6 +33,7 @@ pub fn character_collision_layers() -> CollisionLayers {
             GameLayer::Terrain,
             GameLayer::Hitbox,
             GameLayer::Projectile,
+            GameLayer::Damageable,
         ],
     )
 }
@@ -43,12 +45,30 @@ pub fn terrain_collision_layers() -> CollisionLayers {
 
 /// Collision layer config for projectiles.
 pub fn projectile_collision_layers() -> CollisionLayers {
-    CollisionLayers::new(GameLayer::Projectile, [GameLayer::Character])
+    CollisionLayers::new(
+        GameLayer::Projectile,
+        [GameLayer::Character, GameLayer::Damageable],
+    )
 }
 
 /// Collision layer config for hitbox entities (melee/AoE).
 pub fn hitbox_collision_layers() -> CollisionLayers {
-    CollisionLayers::new(GameLayer::Hitbox, [GameLayer::Character])
+    CollisionLayers::new(
+        GameLayer::Hitbox,
+        [GameLayer::Character, GameLayer::Damageable],
+    )
+}
+
+/// Collision layer config for damageable world objects.
+pub fn damageable_collision_layers() -> CollisionLayers {
+    CollisionLayers::new(
+        GameLayer::Damageable,
+        [
+            GameLayer::Character,
+            GameLayer::Hitbox,
+            GameLayer::Projectile,
+        ],
+    )
 }
 
 /// Update melee hitbox positions to follow caster's position + facing offset.
@@ -83,15 +103,12 @@ pub fn process_hitbox_hits(
         &mut HitTargets,
         &Position,
     )>,
-    mut target_query: Query<
-        (
-            &Position,
-            &mut LinearVelocity,
-            &mut Health,
-            Option<&Invulnerable>,
-        ),
-        With<CharacterMarker>,
-    >,
+    mut target_query: Query<(
+        &Position,
+        Option<&mut LinearVelocity>,
+        &mut Health,
+        Option<&Invulnerable>,
+    )>,
     mut shield_query: Query<&mut ActiveShield>,
     buff_query: Query<&ActiveBuffs>,
     rotation_query: Query<&Rotation>,
@@ -154,15 +171,12 @@ pub fn process_projectile_hits(
         (Entity, &CollidingEntities, &OnHitEffects, &Position),
         With<AbilityBulletOf>,
     >,
-    mut target_query: Query<
-        (
-            &Position,
-            &mut LinearVelocity,
-            &mut Health,
-            Option<&Invulnerable>,
-        ),
-        With<CharacterMarker>,
-    >,
+    mut target_query: Query<(
+        &Position,
+        Option<&mut LinearVelocity>,
+        &mut Health,
+        Option<&Invulnerable>,
+    )>,
     mut shield_query: Query<&mut ActiveShield>,
     buff_query: Query<&ActiveBuffs>,
     rotation_query: Query<&Rotation>,
@@ -254,15 +268,12 @@ fn apply_on_hit_effects(
     on_hit: &OnHitEffects,
     victim: Entity,
     source_pos: Vec3,
-    target_query: &mut Query<
-        (
-            &Position,
-            &mut LinearVelocity,
-            &mut Health,
-            Option<&Invulnerable>,
-        ),
-        With<CharacterMarker>,
-    >,
+    target_query: &mut Query<(
+        &Position,
+        Option<&mut LinearVelocity>,
+        &mut Health,
+        Option<&Invulnerable>,
+    )>,
     shield_query: &mut Query<&mut ActiveShield>,
     buff_query: &Query<&ActiveBuffs>,
     rotation_query: &Query<&Rotation>,
@@ -297,7 +308,7 @@ fn apply_on_hit_effects(
                 target,
             } => {
                 let entity = resolve_on_hit_target(target, victim, on_hit);
-                if let Ok((target_pos, mut velocity, _, _)) = target_query.get_mut(entity) {
+                if let Ok((target_pos, velocity, _, _)) = target_query.get_mut(entity) {
                     let world_force = resolve_force_frame(
                         *force,
                         frame,
@@ -307,7 +318,9 @@ fn apply_on_hit_effects(
                         entity,
                         rotation_query,
                     );
-                    velocity.0 += world_force;
+                    if let Some(mut velocity) = velocity {
+                        velocity.0 += world_force;
+                    }
                 } else {
                     warn!("ApplyForce target {:?} not found", entity);
                 }

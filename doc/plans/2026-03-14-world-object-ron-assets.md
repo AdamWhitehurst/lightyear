@@ -1172,3 +1172,55 @@ Follow the existing `MapSwitchButton` pattern:
 - Message API pattern: [crates/server/src/map.rs:609-661](../crates/server/src/map.rs#L609-L661) (`PlayerMapSwitchRequest` handler)
 - Client replication handler pattern: [crates/client/src/gameplay.rs:16-53](../crates/client/src/gameplay.rs#L16-L53)
 - Sprite rig spawn observer: [crates/sprite_rig/src/spawn.rs:40-64](../crates/sprite_rig/src/spawn.rs#L40-L64)
+
+---
+
+## Follow-up: Damageable Collision Layer & Health Bar Consolidation (2026-03-15)
+
+After Phase 3, the tree world object had `Health` but could not be damaged and had no health bar. Two root causes:
+
+### Problem 1: Collision layers
+
+Hitbox/projectile collision layers only filtered against `Character`. The tree used `Terrain` layers, which don't participate in hit detection queries.
+
+**Fix — new `Damageable` layer:**
+
+- Added `Damageable` variant to `GameLayer` enum (bit 32)
+- `hitbox_collision_layers()` and `projectile_collision_layers()` now filter against `[Character, Damageable]`
+- `character_collision_layers()` now filters against `[Character, Terrain, Hitbox, Projectile, Damageable]` (so players physically collide with damageable objects)
+- Added `damageable_collision_layers()` helper (membership: `Damageable`, filters: `Character | Hitbox | Projectile`)
+- Exported `damageable_collision_layers` from `protocol::lib`
+- Updated `tree_circle.object.ron` to use `Damageable(32)` membership with filters `(14)` (Character + Hitbox + Projectile)
+
+### Problem 2: `LinearVelocity` required in hit detection
+
+Hit detection target queries required `&mut LinearVelocity`. Static world objects (e.g. trees with `RigidBody::Static`) don't have `LinearVelocity`, so they were excluded from queries entirely — damage and force effects silently skipped them.
+
+**Fix — `Option<&mut LinearVelocity>` in target queries:**
+
+- `process_hitbox_hits`, `process_projectile_hits`, and `apply_on_hit_effects` now use `Option<&mut LinearVelocity>` in target queries
+- `AbilityEffect::ApplyForce` handler checks `if let Some(mut velocity) = velocity` before applying force; static objects simply ignore force effects
+
+### Problem 3: Health bars only for characters
+
+Health bars were spawned in `add_character_meshes` (gated on `With<CharacterMarker>`) and updated in `update_health_bars` (also gated on `With<CharacterMarker>`).
+
+**Fix — consolidated `On<Add, Health>` observer:**
+
+- Removed `add_character_meshes` (was only spawning health bars; no other cosmetic setup remained)
+- Added `add_health_bars` observer (`On<Add, Health>`) in `RenderPlugin` — spawns a health bar for any entity that receives `Health`, regardless of entity type
+- Removed `With<CharacterMarker>` filter from `update_health_bars` query
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `crates/protocol/src/hit_detection.rs` | Added `Damageable` layer, updated collision layer functions, made `LinearVelocity` optional in queries |
+| `crates/protocol/src/lib.rs` | Exported `damageable_collision_layers` |
+| `crates/render/src/lib.rs` | Replaced `add_character_meshes` with `add_health_bars` observer |
+| `crates/render/src/health_bar.rs` | Removed `With<CharacterMarker>` from `update_health_bars` |
+| `assets/objects/tree_circle.object.ron` | Updated collision layers to `Damageable` |
+
+### Outstanding
+
+- World objects have no death handling — `check_death_and_respawn` is gated on `With<CharacterMarker>`. Need to decide behavior (despawn, respawn with timer, visual change).

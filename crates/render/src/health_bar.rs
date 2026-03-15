@@ -144,7 +144,7 @@ fn set_fg_color(
 }
 
 pub(crate) fn update_health_bars(
-    health_query: Query<&Health, With<CharacterMarker>>,
+    health_query: Query<&Health>,
     bar_root_query: Query<(&ChildOf, &Children), With<HealthBarRoot>>,
     mut fg_query: Query<&mut Transform, With<HealthBarForeground>>,
 ) {

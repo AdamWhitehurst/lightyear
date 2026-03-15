@@ -28,13 +28,13 @@ impl Plugin for RenderPlugin {
         app.add_systems(
             Update,
             (
-                add_character_meshes,
                 camera::follow_player,
                 health_bar::billboard_face_camera,
                 health_bar::update_health_bars,
             ),
         );
 
+        app.add_observer(add_health_bars);
         app.add_observer(health_bar::on_invulnerable_added);
         app.add_observer(health_bar::on_invulnerable_removed);
 
@@ -69,20 +69,12 @@ fn add_visual_interpolation_components(
     ));
 }
 
-fn add_character_meshes(
+/// Spawns a health bar for any entity that receives a `Health` component.
+fn add_health_bars(
+    trigger: On<Add, Health>,
     mut commands: Commands,
-    character_query: Query<
-        Entity,
-        (
-            Or<(Added<Predicted>, Added<Replicated>, Added<Interpolated>)>,
-            With<CharacterMarker>,
-        ),
-    >,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for entity in &character_query {
-        info!(?entity, "Adding cosmetics to character");
-        health_bar::spawn_health_bar(&mut commands, entity, &mut *meshes, &mut *materials);
-    }
+    health_bar::spawn_health_bar(&mut commands, trigger.entity, &mut *meshes, &mut *materials);
 }

@@ -131,10 +131,12 @@ fn validate_respawn_points(
 fn check_death_and_respawn(
     mut commands: Commands,
     timeline: Res<LocalTimeline>,
-    mut dead_query: Query<
-        (Entity, &mut Health, &mut Position, &mut LinearVelocity),
-        With<CharacterMarker>,
-    >,
+    mut dead_query: Query<(
+        Entity,
+        &mut Health,
+        &mut Position,
+        Option<&mut LinearVelocity>,
+    )>,
     respawn_query: Query<&Position, (With<RespawnPoint>, Without<CharacterMarker>)>,
 ) {
     let tick = timeline.tick();
@@ -145,7 +147,9 @@ fn check_death_and_respawn(
         let respawn_pos = nearest_respawn_pos(&position, &respawn_query);
         info!("Entity {:?} died, respawning at {:?}", entity, respawn_pos);
         position.0 = respawn_pos;
-        velocity.0 = Vec3::ZERO;
+        if let Some(mut velocity) = velocity {
+            velocity.0 = Vec3::ZERO;
+        }
         health.restore_full();
         commands.entity(entity).insert(Invulnerable {
             expires_at: tick + 128i16,
