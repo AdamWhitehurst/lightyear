@@ -10,6 +10,7 @@ use std::time::Duration;
 
 const CERT_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certificates/cert.pem");
 const KEY_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certificates/key.pem");
+const REPLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Transport configuration for a server
 #[derive(Clone)]
@@ -43,7 +44,7 @@ impl Default for ServerNetworkConfig {
             bind_addr: [0, 0, 0, 0],
             protocol_id: PROTOCOL_ID,
             private_key: PRIVATE_KEY,
-            replication_interval: Duration::from_millis(100),
+            replication_interval: REPLICATION_INTERVAL,
         }
     }
 }
@@ -65,10 +66,14 @@ impl Plugin for ServerNetworkPlugin {
     fn build(&self, app: &mut App) {
         let config = self.config.clone();
         app.insert_resource(config.clone());
+
+        app.register_required_components_with::<ClientOf, ReplicationSender>(|| {
+            ReplicationSender::new(REPLICATION_INTERVAL, SendUpdatesMode::SinceLastAck, false)
+        });
+
         app.add_systems(Startup, move |commands: Commands| {
             start_server(commands, config.clone());
         });
-        app.add_observer(handle_new_client);
     }
 }
 
@@ -204,19 +209,4 @@ fn start_server(mut commands: Commands, config: ServerNetworkConfig) {
     }
 
     info!("Server started successfully");
-}
-
-fn handle_new_client(
-    trigger: On<Add, Connected>,
-    mut commands: Commands,
-    config: Res<ServerNetworkConfig>,
-) {
-    info!("New client connected: {:?}", trigger.entity);
-    commands
-        .entity(trigger.entity)
-        .insert(ReplicationSender::new(
-            config.replication_interval,
-            SendUpdatesMode::SinceLastAck,
-            false,
-        ));
 }
