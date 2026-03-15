@@ -131,20 +131,29 @@ fn validate_respawn_points(
 fn check_death_and_respawn(
     mut commands: Commands,
     timeline: Res<LocalTimeline>,
-    mut dead_query: Query<(
-        Entity,
-        &mut Health,
-        &mut Position,
-        Option<&mut LinearVelocity>,
-    )>,
+    mut dead_query: Query<
+        (
+            Entity,
+            &mut Health,
+            &mut Position,
+            Option<&mut LinearVelocity>,
+            Option<&CharacterMarker>,
+        ),
+        Without<RespawnPoint>,
+    >,
     respawn_query: Query<&Position, (With<RespawnPoint>, Without<CharacterMarker>)>,
 ) {
     let tick = timeline.tick();
-    for (entity, mut health, mut position, mut velocity) in &mut dead_query {
+    for (entity, mut health, mut position, velocity, character) in &mut dead_query {
         if !health.is_dead() {
             continue;
         }
-        let respawn_pos = nearest_respawn_pos(&position, &respawn_query);
+        let respawn_pos = if character.is_some() {
+            nearest_respawn_pos(&position, &respawn_query)
+        } else {
+            position.0
+        };
+
         info!("Entity {:?} died, respawning at {:?}", entity, respawn_pos);
         position.0 = respawn_pos;
         if let Some(mut velocity) = velocity {
