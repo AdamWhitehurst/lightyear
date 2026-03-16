@@ -37,7 +37,7 @@ Extract and internalize all rules. Organize by priority level (`[HIGHEST]`, `[HI
 
 ## Review Dimensions
 
-Every review covers four dimensions. Each finding is labelled **VIOLATION** or **SUGGESTION** 
+Every review covers five dimensions. Each finding is labelled **VIOLATION** or **SUGGESTION**
 
 ### 1. Rules Enforcement
 
@@ -60,9 +60,25 @@ Verify that everything referenced actually exists and is correct. A finding is a
 - API calls match real signatures
 - Error messages match actual conditions
 
-### 3. Elegance
+### 3. Code Quality
 
-Identify unnecessary complexity. A finding is a **SUGGESTION** unless it violates an explicit CLAUDE.md rule (e.g. "Avoid large functions" → **VIOLATION**).
+These are engineering quality standards. A finding is a **VIOLATION** when the principle is clearly broken, **SUGGESTION** when there is room for improvement.
+
+Check each of these explicitly:
+
+- [ ] **Naming expresses intent** — Every variable, function, type name clearly communicates what it represents or does. `calculate_total_price` not `calc` or `x`. If you need a comment to explain *what* something is, the name has failed.
+- [ ] **Single responsibility** — Each function does one thing. Test: can you describe what it does without using "and"? If not, it needs splitting.
+- [ ] **Minimal surprise** — Code behaves as you'd expect from reading it. No hidden side effects, no clever tricks requiring a double-take. Boring code is good code.
+- [ ] **Clear data flow** — You can trace how data enters, transforms, and exits without getting lost. State is managed deliberately, not scattered across distant locations.
+- [ ] **Low coupling, high cohesion** — Related logic lives together. Unrelated logic is separated. Changing one part doesn't ripple unpredictably into others. Module boundaries are clean.
+- [ ] **Graceful error handling** — Edge cases and failure modes are handled explicitly, not ignored. The code doesn't just handle the happy path.
+- [ ] **Testability** — Dependencies are injectable, pure functions preferred where possible, side effects are isolated. This is a natural byproduct of good design.
+- [ ] **DRY without being obscure** — Duplication is reduced, but not at the cost of readability. A little repetition is clearer than a convoluted shared abstraction.
+- [ ] **Consistent style** — Formatting, naming conventions, and patterns are uniform throughout the touched files.
+
+### 4. Elegance
+
+Identify unnecessary complexity — over-engineering, premature abstraction, solutions that are more complicated than the problem requires. A finding is a **SUGGESTION** unless it violates an explicit CLAUDE.md rule (e.g. "Avoid large functions" → **VIOLATION**).
 
 **In documents**:
 - Plan introduces types/abstractions that aren't needed
@@ -77,8 +93,9 @@ Identify unnecessary complexity. A finding is a **SUGGESTION** unless it violate
 - Unnecessary wrapper types or abstractions
 - One-time helpers that add complexity without value
 - Over-engineered solutions for simple problems
+- Framework built "just in case" for hypothetical future requirements
 
-### 4. Pattern Consistency
+### 5. Pattern Consistency
 
 Check that new work follows established codebase precedents. A finding is a **VIOLATION** if an existing pattern is clearly broken, **SUGGESTION** if a better pattern exists elsewhere in the codebase.
 
@@ -111,7 +128,7 @@ Check that new work follows established codebase precedents. A finding is a **VI
    - Referenced systems/components exist as described
    - Similar features exist that could be reused
 
-4. **Review across all four dimensions**
+4. **Review across all five dimensions**
 
 5. **Annotate the document** with `%%` lines directly below each finding:
 
@@ -121,7 +138,7 @@ Check that new work follows established codebase precedents. A finding is a **VI
    %% [SUGGESTION] <dimension> — <rationale>: <description and alternative>
    ```
 
-   Where `<dimension>` is one of: `Rules`, `Coherence`, `Elegance`, `Pattern`
+   Where `<dimension>` is one of: `Rules`, `Coherence`, `Quality`, `Elegance`, `Pattern`
    Where `<source>` is the rule source (e.g. `CLAUDE.md System Design`, `spec:plan template`)
 
    Examples:
@@ -134,7 +151,6 @@ Check that new work follows established codebase precedents. A finding is a **VI
        speed: f32,
        acceleration: f32,
    }
-   ```
    %% [SUGGESTION] Elegance — `GameplayConfig` in src/config.rs already has these fields. Reuse instead of new type.
 
    fn process_all_entities(world: &mut World) {
@@ -142,6 +158,16 @@ Check that new work follows established codebase precedents. A finding is a **VI
 
    let mut cache: HashMap<EntityId, Vec<Component>> = HashMap::new();
    %% [SUGGESTION] Pattern — existing code uses `EntityHashMap` from bevy::utils, not std HashMap. See src/gameplay/combat.rs:34.
+
+   fn proc(e: Entity, w: &World) -> bool {
+   %% [VIOLATION] Quality — Naming: `proc` does not express intent. Use a name that describes what processing occurs and what the bool means.
+
+   fn apply_damage_and_update_health_and_trigger_effects(
+   %% [VIOLATION] Quality — Single responsibility: function name contains multiple "and"s. Split into `apply_damage`, `update_health`, `trigger_effects`.
+
+   // Check if the entity has moved since last frame
+   let d = transform.translation - last_pos;
+   %% [SUGGESTION] Quality — Naming: `d` is opaque. Use `displacement` or `movement_delta`. The comment becomes unnecessary with a clear name.
    ```
 
 6. **Write the annotated document** back to the same file path
@@ -168,7 +194,7 @@ Check that new work follows established codebase precedents. A finding is a **VI
    **code-reviewer** agents for each file or logical group:
    - Provide the specific rules to enforce
    - Provide the relevant plan section
-   - Request findings across all four dimensions with file:line references
+   - Request findings across all five dimensions with file:line references
 
    **codebase-pattern-finder** agents to check:
    - How similar features are implemented elsewhere
@@ -181,13 +207,14 @@ Check that new work follows established codebase precedents. A finding is a **VI
 5. **Synthesize findings** into structured output:
 
 ```markdown
-## Critical Review Report
+## Review Report
 
 ### Summary
 | Dimension | Violations | Suggestions |
 |-----------|-----------|-------------|
 | Rules     | X         | X           |
 | Coherence | X         | X           |
+| Quality   | X         | X           |
 | Elegance  | X         | X           |
 | Pattern   | X         | X           |
 
@@ -211,7 +238,7 @@ Check that new work follows established codebase precedents. A finding is a **VI
 - [ ] Phase 1: <status and deviations>
 - [ ] Phase 2: <status and deviations>
 
-### Files Not Modified (expected by plan)
+### Files Not Modified
 - `path/to/file.rs` — plan specified changes but file unchanged
 ```
 
@@ -236,6 +263,17 @@ Always check these CLAUDE.md rules explicitly:
 - [ ] No regional comments
 - [ ] Small, atomic, self-describing functions
 - [ ] Elegant solutions (not just working ones)
+
+### Code Quality
+- [ ] Names express intent — no abbreviations, no generic names, no comments needed to explain *what*
+- [ ] Single responsibility — each function describable without "and"
+- [ ] Minimal surprise — no hidden side effects, no clever tricks
+- [ ] Clear data flow — data entry, transformation, and exit traceable without getting lost
+- [ ] Low coupling, high cohesion — clean module boundaries, related logic together
+- [ ] Error handling covers edge cases, not just the happy path
+- [ ] Testable structure — injectable dependencies, isolated side effects
+- [ ] DRY without obscurity — duplication reduced but not at cost of readability
+- [ ] Consistent style across touched files
 
 ### Build & Verification
 - [ ] No parallel cargo build/check/test commands
