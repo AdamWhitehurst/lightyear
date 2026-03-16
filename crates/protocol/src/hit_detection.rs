@@ -1,12 +1,13 @@
 use avian3d::prelude::*;
 use bevy::prelude::*;
+use bevy::reflect::TypeRegistryArc;
 
 use lightyear::prelude::{ControlledBy, LocalTimeline, Tick};
 
 use crate::ability::{
-    facing_direction, spawn_sub_ability, AbilityBulletOf, AbilityDefs, AbilityEffect, AbilityPhase,
-    ActiveAbility, ActiveBuffs, ActiveShield, EffectTarget, ForceFrame, HitTargets, HitboxOf,
-    MeleeHitbox, OnHitEffects,
+    facing_direction, spawn_sub_ability, AbilityAsset, AbilityBulletOf, AbilityDefs, AbilityEffect,
+    AbilityPhase, ActiveAbility, ActiveBuffs, ActiveShield, EffectTarget, ForceFrame, HitTargets,
+    HitboxOf, MeleeHitbox, OnHitEffects,
 };
 use crate::{Health, Invulnerable, PlayerId};
 
@@ -94,6 +95,8 @@ pub fn update_hitbox_positions(
 pub fn process_hitbox_hits(
     mut commands: Commands,
     ability_defs: Res<AbilityDefs>,
+    ability_assets: Res<Assets<AbilityAsset>>,
+    registry: Res<AppTypeRegistry>,
     timeline: Res<LocalTimeline>,
     server_query: Query<&ControlledBy>,
     player_id_query: Query<&PlayerId>,
@@ -128,6 +131,8 @@ pub fn process_hitbox_hits(
             apply_on_hit_effects(
                 &mut commands,
                 ability_defs.as_ref(),
+                ability_assets.as_ref(),
+                &registry.0,
                 tick,
                 &server_query,
                 &player_id_query,
@@ -164,6 +169,8 @@ pub fn cleanup_hitbox_entities(
 pub fn process_projectile_hits(
     mut commands: Commands,
     ability_defs: Res<AbilityDefs>,
+    ability_assets: Res<Assets<AbilityAsset>>,
+    registry: Res<AppTypeRegistry>,
     timeline: Res<LocalTimeline>,
     server_query: Query<&ControlledBy>,
     player_id_query: Query<&PlayerId>,
@@ -193,6 +200,8 @@ pub fn process_projectile_hits(
             apply_on_hit_effects(
                 &mut commands,
                 ability_defs.as_ref(),
+                ability_assets.as_ref(),
+                &registry.0,
                 tick,
                 &server_query,
                 &player_id_query,
@@ -262,6 +271,8 @@ fn resolve_force_frame(
 fn apply_on_hit_effects(
     commands: &mut Commands,
     ability_defs: &AbilityDefs,
+    ability_assets: &Assets<AbilityAsset>,
+    registry: &TypeRegistryArc,
     tick: Tick,
     server_query: &Query<&ControlledBy>,
     player_id_query: &Query<&PlayerId>,
@@ -330,6 +341,8 @@ fn apply_on_hit_effects(
                 spawn_sub_ability(
                     commands,
                     ability_defs,
+                    ability_assets,
+                    registry,
                     id,
                     target_entity,
                     on_hit.original_caster,

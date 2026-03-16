@@ -1,13 +1,12 @@
 #![enable(implicit_some)]
-(
-    startup_ticks: 3,
-    active_ticks: 4,
-    recovery_ticks: 10,
-    cooldown_ticks: 28,
-    effects: [
-        OnTick(effect: Teleport(distance: 6.0)),
-        OnTick(tick: 1, effect: Melee()),
-        OnHit(Damage(amount: 18.0, target: Victim)),
-        OnHit(ApplyForce(force: (0.0, 1.2, 4.0), frame: RelativePosition, target: Victim)),
-    ],
-)
+{
+    "protocol::ability::AbilityPhases": (startup: 3, active: 4, recovery: 10, cooldown: 28),
+    "protocol::ability::OnTickEffects": ([
+        (tick: 0, effect: Teleport(distance: 6.0)),
+        (tick: 1, effect: Melee()),
+    ]),
+    "protocol::ability::OnHitEffectDefs": ([
+        Damage(amount: 18.0, target: Victim),
+        ApplyForce(force: (0.0, 1.2, 4.0), frame: RelativePosition, target: Victim),
+    ]),
+}

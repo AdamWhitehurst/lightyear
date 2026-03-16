@@ -128,3 +128,12 @@ impl From<ron::error::Error> for WorldObjectLoadError {
         })
     }
 }
+
+impl From<crate::reflect_loader::ReflectLoadError> for WorldObjectLoadError {
+    fn from(e: crate::reflect_loader::ReflectLoadError) -> Self {
+        match e {
+            crate::reflect_loader::ReflectLoadError::Io(io) => Self::Io(io),
+            crate::reflect_loader::ReflectLoadError::Ron(ron) => Self::Ron(ron),
+        }
+    }
+}

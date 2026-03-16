@@ -1,11 +1,8 @@
 #![enable(implicit_some)]
-(
-    startup_ticks: 1,
-    active_ticks: 20,
-    recovery_ticks: 6,
-    cooldown_ticks: 60,
-    effects: [
-        OnTick(effect: Buff(stat: "speed", multiplier: 2.5, duration_ticks: 60, target: Caster)),
-        WhileActive(SetVelocity(speed: 20.0, target: Caster)),
-    ],
-)
+{
+    "protocol::ability::AbilityPhases": (startup: 5, active: 25, recovery: 6, cooldown: 60),
+    "protocol::ability::OnTickEffects": ([(tick: 0, effect: Buff(stat: "speed", multiplier: 2.5, duration_ticks: 60, target: Caster))]),
+    "protocol::ability::WhileActiveEffects": ([
+        SetVelocity(speed: 30.0, target: Caster),
+    ]),
+}

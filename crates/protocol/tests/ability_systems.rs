@@ -832,9 +832,9 @@ fn on_input_effects_dispatched_during_active() {
         .get::<OnInputEffects>(ability_entity)
         .expect("OnInputEffects should be present during Active phase");
     assert_eq!(on_input.0.len(), 1, "punch has 1 OnInput effect");
-    assert_eq!(on_input.0[0].0, PlayerActions::Ability1);
+    assert_eq!(on_input.0[0].action, PlayerActions::Ability1);
     assert_eq!(
-        on_input.0[0].1,
+        on_input.0[0].effect,
         AbilityEffect::Ability {
             id: "punch2".into(),
             target: EffectTarget::Caster

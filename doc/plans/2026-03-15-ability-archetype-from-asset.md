@@ -282,7 +282,7 @@ app.register_type::<AbilityPhases>()
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` compiles
+- [x] `cargo check-all` compiles
 
 ---
 
@@ -704,9 +704,9 @@ Add `pub mod reflect_loader;` and remove the `bevy_common_assets` dependency for
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` compiles
-- [ ] Existing world_object loader tests pass: `cargo test -p protocol world_object`
-- [ ] Deserialization smoke test passes (add a `#[test]` in `reflect_loader.rs` or
+- [x] `cargo check-all` compiles
+- [x] Existing world_object loader tests pass: `cargo test -p protocol world_object`
+- [x] Deserialization smoke test passes (add a `#[test]` in `reflect_loader.rs` or
   `ability_systems.rs` that deserializes a minimal RON `{ "protocol::ability::AbilityPhases":
   (startup: 1, active: 2, recovery: 3, cooldown: 4) }` and verifies the result — confirms newtype
   tuple struct syntax `([...])` works with `TypedReflectDeserializer`)
@@ -781,8 +781,8 @@ group effects by trigger type into the corresponding component.
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` compiles
-- [ ] `cargo server` starts without errors (assets load)
+- [x] `cargo check-all` compiles
+- [x] `cargo server` starts without errors (assets load)
 
 #### Manual Verification:
 - [ ] Activate at least one ability in-game (`cargo server` + `cargo client`) to confirm RON
@@ -1172,8 +1172,8 @@ Remove `dispatch_effect_markers` from the system chain. The chain becomes:
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` compiles
-- [ ] `cargo server` starts, loads abilities, no errors in log
+- [x] `cargo check-all` compiles
+- [x] `cargo server` starts, loads abilities, no errors in log
 
 #### Manual Verification:
 - [ ] Abilities activate and progress through phases in-game

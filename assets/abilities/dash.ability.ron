@@ -1,13 +1,7 @@
 #![enable(implicit_some)]
-(
-    startup_ticks: 2,
-    active_ticks: 8,
-    recovery_ticks: 4,
-    cooldown_ticks: 32,
-    effects: [
-        WhileActive(SetVelocity(
-            speed: 15.0,
-            target: Caster,
-        )),
-    ],
-)
+{
+    "protocol::ability::AbilityPhases": (startup: 2, active: 8, recovery: 4, cooldown: 32),
+    "protocol::ability::WhileActiveEffects": ([
+        SetVelocity(speed: 15.0, target: Caster),
+    ]),
+}

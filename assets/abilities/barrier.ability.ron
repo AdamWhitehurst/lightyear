@@ -1,10 +1,5 @@
 #![enable(implicit_some)]
-(
-    startup_ticks: 4,
-    active_ticks: 4,
-    recovery_ticks: 8,
-    cooldown_ticks: 80,
-    effects: [
-        OnTick(effect: Shield(absorb: 60.0)),
-    ],
-)
+{
+    "protocol::ability::AbilityPhases": (startup: 4, active: 4, recovery: 8, cooldown: 80),
+    "protocol::ability::OnTickEffects": ([(tick: 0, effect: Shield(absorb: 60.0))]),
+}

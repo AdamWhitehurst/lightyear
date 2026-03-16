@@ -1,12 +1,9 @@
 #![enable(implicit_some)]
-(
-    startup_ticks: 10,
-    active_ticks: 6,
-    recovery_ticks: 12,
-    cooldown_ticks: 50,
-    effects: [
-        OnTick(effect: AreaOfEffect(radius: 7.0, duration_ticks: 6, target: Victim)),
-        OnHit(Damage(amount: 10.0, target: Victim)),
-        OnHit(ApplyForce(force: (0.0, 1.5, 8.0), frame: RelativePosition, target: Victim)),
-    ],
-)
+{
+    "protocol::ability::AbilityPhases": (startup: 10, active: 6, recovery: 12, cooldown: 50),
+    "protocol::ability::OnTickEffects": ([(tick: 0, effect: AreaOfEffect(radius: 7.0, duration_ticks: 6, target: Victim))]),
+    "protocol::ability::OnHitEffectDefs": ([
+        Damage(amount: 10.0, target: Victim),
+        ApplyForce(force: (0.0, 1.5, 8.0), frame: RelativePosition, target: Victim),
+    ]),
+}

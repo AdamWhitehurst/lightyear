@@ -1,13 +1,12 @@
 #![enable(implicit_some)]
-(
-    startup_ticks: 2,
-    active_ticks: 10,
-    recovery_ticks: 6,
-    cooldown_ticks: 24,
-    effects: [
-        WhileActive(SetVelocity(speed: 18.0, target: Caster)),
-        OnTick(effect: Melee()),
-        OnHit(Damage(amount: 14.0, target: Victim)),
-        OnHit(ApplyForce(force: (0.0, 0.5, 3.0), frame: RelativePosition, target: Victim)),
-    ],
-)
+{
+    "protocol::ability::AbilityPhases": (startup: 2, active: 10, recovery: 6, cooldown: 24),
+    "protocol::ability::WhileActiveEffects": ([
+        SetVelocity(speed: 18.0, target: Caster),
+    ]),
+    "protocol::ability::OnTickEffects": ([(tick: 0, effect: Melee())]),
+    "protocol::ability::OnHitEffectDefs": ([
+        Damage(amount: 14.0, target: Victim),
+        ApplyForce(force: (0.0, 0.5, 3.0), frame: RelativePosition, target: Victim),
+    ]),
+}

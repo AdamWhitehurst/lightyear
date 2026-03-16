@@ -1,12 +1,10 @@
 use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext};
 use bevy::prelude::*;
-use bevy::reflect::serde::{TypeRegistrationDeserializer, TypedReflectDeserializer};
-use bevy::reflect::{PartialReflect, ReflectFromReflect, TypePath, TypeRegistry, TypeRegistryArc};
-use serde::de::{DeserializeSeed, Deserializer, MapAccess, Visitor};
-use std::fmt;
+use bevy::reflect::{TypePath, TypeRegistryArc};
 
 use super::types::{WorldObjectDef, WorldObjectLoadError};
+use crate::reflect_loader;
 
 /// Custom asset loader that uses `TypeRegistry` for reflect-based component deserialization.
 #[derive(TypePath)]
@@ -56,58 +54,10 @@ impl AssetLoader for WorldObjectLoader {
 /// ```
 pub fn deserialize_world_object(
     bytes: &[u8],
-    registry: &TypeRegistry,
+    registry: &bevy::reflect::TypeRegistry,
 ) -> Result<WorldObjectDef, WorldObjectLoadError> {
-    let mut deserializer = ron::de::Deserializer::from_bytes(bytes)?;
-    let components = ComponentMapDeserializer { registry }.deserialize(&mut deserializer)?;
-    deserializer.end()?;
+    let components = reflect_loader::deserialize_component_map(bytes, registry)?;
     Ok(WorldObjectDef { components })
-}
-
-struct ComponentMapDeserializer<'a> {
-    registry: &'a TypeRegistry,
-}
-
-impl<'a, 'de> DeserializeSeed<'de> for ComponentMapDeserializer<'a> {
-    type Value = Vec<Box<dyn PartialReflect>>;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_map(ComponentMapVisitor {
-            registry: self.registry,
-        })
-    }
-}
-
-struct ComponentMapVisitor<'a> {
-    registry: &'a TypeRegistry,
-}
-
-impl<'a, 'de> Visitor<'de> for ComponentMapVisitor<'a> {
-    type Value = Vec<Box<dyn PartialReflect>>;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "a map of component type paths to component data")
-    }
-
-    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-        let mut components = Vec::new();
-        while let Some(registration) =
-            map.next_key_seed(TypeRegistrationDeserializer::new(self.registry))?
-        {
-            let value =
-                map.next_value_seed(TypedReflectDeserializer::new(registration, self.registry))?;
-            // Attempt to convert the dynamic representation to a concrete type.
-            let value = self
-                .registry
-                .get(registration.type_id())
-                .and_then(|tr| tr.data::<ReflectFromReflect>())
-                .and_then(|fr| fr.from_reflect(value.as_partial_reflect()))
-                .map(PartialReflect::into_partial_reflect)
-                .unwrap_or(value);
-            components.push(value);
-        }
-        Ok(components)
-    }
 }
 
 #[cfg(test)]
@@ -115,6 +65,7 @@ mod tests {
     use super::*;
     use crate::world_object::types::{ObjectCategory, VisualKind};
     use crate::Health;
+    use bevy::reflect::TypeRegistry;
 
     fn test_registry() -> TypeRegistry {
         let mut registry = TypeRegistry::default();

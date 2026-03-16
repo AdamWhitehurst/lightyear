@@ -4,7 +4,7 @@
     (
         AbilityId("punch"), 
         AbilityId("speed_burst"),
-        AbilityId("shockwave"), 
-        None,
+        AbilityId("ground_pound"), 
+        AbilityId("fireball"), 
     )
 )

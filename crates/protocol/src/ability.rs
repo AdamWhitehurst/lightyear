@@ -1,8 +1,11 @@
 use avian3d::prelude::*;
+use bevy::asset::io::Reader;
 use bevy::asset::AssetPath;
+use bevy::asset::{AssetLoader, LoadContext};
 use bevy::ecs::entity::{EntityMapper, MapEntities};
+use bevy::ecs::reflect::ReflectComponent;
 use bevy::prelude::*;
-use bevy_common_assets::ron::RonAssetPlugin;
+use bevy::reflect::{PartialReflect, TypeRegistryArc};
 use leafwing_input_manager::prelude::ActionState;
 use lightyear::prelude::PredictionDespawnCommandsExt;
 use lightyear::prelude::{
@@ -12,6 +15,7 @@ use lightyear::prelude::{
 use lightyear::utils::collections::EntityHashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -196,18 +200,38 @@ impl AbilityDef {
     }
 }
 
+/// Tick-based phase durations and cooldown. Loaded from RON archetype.
+#[derive(Component, Clone, Debug, PartialEq, Reflect, Serialize, Deserialize, Default)]
+#[reflect(Component, Serialize, Deserialize)]
+pub struct AbilityPhases {
+    pub startup: u16,
+    pub active: u16,
+    pub recovery: u16,
+    pub cooldown: u16,
+}
+
+impl AbilityPhases {
+    pub fn phase_duration(&self, phase: &AbilityPhase) -> u16 {
+        match phase {
+            AbilityPhase::Startup => self.startup,
+            AbilityPhase::Active => self.active,
+            AbilityPhase::Recovery => self.recovery,
+        }
+    }
+}
+
 /// Manifest listing ability IDs, used by WASM builds where `load_folder` is unavailable.
 #[derive(Clone, Debug, Serialize, Deserialize, Asset, TypePath)]
 pub struct AbilityManifest(pub Vec<String>);
 
-/// Resource holding loaded ability definitions, keyed by `AbilityId`.
-#[derive(Resource, Clone, Debug)]
+/// Resource holding loaded ability asset handles, keyed by `AbilityId`.
+#[derive(Resource, Clone, Debug, Default)]
 pub struct AbilityDefs {
-    pub abilities: HashMap<AbilityId, AbilityDef>,
+    pub abilities: HashMap<AbilityId, Handle<AbilityAsset>>,
 }
 
 impl AbilityDefs {
-    pub fn get(&self, id: &AbilityId) -> Option<&AbilityDef> {
+    pub fn get(&self, id: &AbilityId) -> Option<&Handle<AbilityAsset>> {
         self.abilities.get(id)
     }
 }
@@ -318,23 +342,174 @@ pub struct OnHitEffects {
     pub depth: u8,
 }
 
-/// One-shot: inserted on matching Active tick offset; consumed by apply_on_tick_effects.
-#[derive(Component)]
-pub struct OnTickEffects(pub Vec<AbilityEffect>);
+/// Active-phase tick effect with offset metadata.
+#[derive(Clone, Debug, PartialEq, Reflect, Serialize, Deserialize)]
+pub struct TickEffect {
+    /// Active-phase tick offset. Defaults to 0.
+    #[serde(default)]
+    pub tick: u16,
+    pub effect: AbilityEffect,
+}
 
-/// Persistent: present every Active tick; removed when phase exits Active.
-#[derive(Component)]
+/// Archetype component: all tick-triggered effects with their offsets.
+/// Persists on the ActiveAbility entity for the ability's lifetime.
+/// Apply systems filter by current tick offset directly — no intermediate dispatch component.
+#[derive(Component, Clone, Debug, PartialEq, Reflect, Serialize, Deserialize, Default)]
+#[reflect(Component, Serialize, Deserialize)]
+pub struct OnTickEffects(pub Vec<TickEffect>);
+
+/// Archetype component: effects that fire every tick during Active phase.
+#[derive(Component, Clone, Debug, PartialEq, Reflect, Serialize, Deserialize, Default)]
+#[reflect(Component, Serialize, Deserialize)]
 pub struct WhileActiveEffects(pub Vec<AbilityEffect>);
 
-/// One-shot: inserted when Active → Recovery transition happens.
-/// Consumed by apply_on_end_effects.
-#[derive(Component)]
+/// Archetype component: effects that fire when Active → Recovery.
+#[derive(Component, Clone, Debug, PartialEq, Reflect, Serialize, Deserialize, Default)]
+#[reflect(Component, Serialize, Deserialize)]
 pub struct OnEndEffects(pub Vec<AbilityEffect>);
 
-/// Persistent: present every Active tick. Each entry is (action, effect).
-/// System checks just_pressed on caster's ActionState.
-#[derive(Component)]
-pub struct OnInputEffects(pub Vec<(PlayerActions, AbilityEffect)>);
+/// Input-triggered effect with action metadata.
+#[derive(Clone, Debug, PartialEq, Reflect, Serialize, Deserialize)]
+pub struct InputEffect {
+    pub action: PlayerActions,
+    pub effect: AbilityEffect,
+}
+
+/// Archetype component: input-triggered effects during Active phase.
+#[derive(Component, Clone, Debug, PartialEq, Reflect, Serialize, Deserialize, Default)]
+#[reflect(Component, Serialize, Deserialize)]
+pub struct OnInputEffects(pub Vec<InputEffect>);
+
+/// Archetype component: effects applied when a hitbox/projectile hits a target.
+/// Does NOT contain caster/depth — those come from ActiveAbility at dispatch time.
+#[derive(Component, Clone, Debug, PartialEq, Reflect, Serialize, Deserialize, Default)]
+#[reflect(Component, Serialize, Deserialize)]
+pub struct OnHitEffectDefs(pub Vec<AbilityEffect>);
+
+/// A bundle of reflected components loaded from a `.ability.ron` file.
+/// Replaces `AbilityDef` as the asset type.
+#[derive(Asset, TypePath)]
+pub struct AbilityAsset {
+    pub components: Vec<Box<dyn PartialReflect>>,
+}
+
+impl Clone for AbilityAsset {
+    fn clone(&self) -> Self {
+        Self {
+            components: self
+                .components
+                .iter()
+                .map(|c| {
+                    c.reflect_clone()
+                        .expect("ability component must be cloneable")
+                        .into_partial_reflect()
+                })
+                .collect(),
+        }
+    }
+}
+
+impl fmt::Debug for AbilityAsset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AbilityAsset")
+            .field(
+                "components",
+                &self
+                    .components
+                    .iter()
+                    .map(|c| c.reflect_type_path())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// Extract AbilityPhases from an AbilityAsset's reflected components.
+pub fn extract_phases(asset: &AbilityAsset) -> Option<&AbilityPhases> {
+    let target_id = std::any::TypeId::of::<AbilityPhases>();
+    for reflected in &asset.components {
+        let info = reflected
+            .get_represented_type_info()
+            .expect("AbilityAsset should have type info");
+
+        if info.type_id() == target_id {
+            return reflected.try_downcast_ref::<AbilityPhases>();
+        }
+    }
+    None
+}
+
+/// Insert all reflected components from an `AbilityAsset` onto an entity.
+fn apply_ability_archetype(
+    commands: &mut Commands,
+    entity: Entity,
+    asset: &AbilityAsset,
+    registry: TypeRegistryArc,
+) {
+    let components: Vec<Box<dyn PartialReflect>> = asset
+        .components
+        .iter()
+        .map(|c| {
+            c.reflect_clone()
+                .expect("ability component must be cloneable")
+                .into_partial_reflect()
+        })
+        .collect();
+
+    commands.queue(move |world: &mut World| {
+        let registry = registry.read();
+        let mut entity_mut = world.entity_mut(entity);
+        for component in &components {
+            let type_path = component.reflect_type_path();
+            let Some(registration) = registry.get_with_type_path(type_path) else {
+                warn!("Ability component type not registered: {type_path}");
+                continue;
+            };
+            let Some(reflect_component) = registration.data::<ReflectComponent>() else {
+                warn!("Type missing #[reflect(Component)]: {type_path}");
+                continue;
+            };
+            reflect_component.insert(&mut entity_mut, component.as_ref(), &registry);
+        }
+    });
+}
+
+/// Custom asset loader for `.ability.ron` files using reflect-based deserialization.
+#[derive(TypePath)]
+struct AbilityAssetLoader {
+    type_registry: TypeRegistryArc,
+}
+
+impl FromWorld for AbilityAssetLoader {
+    fn from_world(world: &mut World) -> Self {
+        Self {
+            type_registry: world.resource::<AppTypeRegistry>().0.clone(),
+        }
+    }
+}
+
+impl AssetLoader for AbilityAssetLoader {
+    type Asset = AbilityAsset;
+    type Settings = ();
+    type Error = crate::reflect_loader::ReflectLoadError;
+
+    fn extensions(&self) -> &[&str] {
+        &["ability.ron"]
+    }
+
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        let registry = self.type_registry.read();
+        let components = crate::reflect_loader::deserialize_component_map(&bytes, &registry)?;
+        Ok(AbilityAsset { components })
+    }
+}
 
 /// Damage absorption shield on a character. Intercepts damage before Health.
 #[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -385,7 +560,7 @@ struct AbilityManifestHandle(Handle<AbilityManifest>);
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Resource)]
-struct PendingAbilityHandles(Vec<Handle<AbilityDef>>);
+struct PendingAbilityHandles(Vec<Handle<AbilityAsset>>);
 
 /// Internal handle for the default ability slots asset — used only for loading and hot-reload.
 ///
@@ -405,13 +580,31 @@ pub struct AbilityPlugin;
 
 impl Plugin for AbilityPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(RonAssetPlugin::<AbilityDef>::new(&["ability.ron"]));
-        app.add_plugins(RonAssetPlugin::<AbilitySlots>::new(&["ability_slots.ron"]));
+        app.register_type::<AbilityPhases>()
+            .register_type::<OnTickEffects>()
+            .register_type::<TickEffect>()
+            .register_type::<WhileActiveEffects>()
+            .register_type::<OnHitEffectDefs>()
+            .register_type::<OnEndEffects>()
+            .register_type::<OnInputEffects>()
+            .register_type::<InputEffect>()
+            .register_type::<AbilityEffect>()
+            .register_type::<EffectTarget>()
+            .register_type::<ForceFrame>()
+            .register_type::<PlayerActions>();
+
+        app.init_asset::<AbilityAsset>()
+            .init_asset_loader::<AbilityAssetLoader>();
+        app.add_plugins(
+            bevy_common_assets::ron::RonAssetPlugin::<AbilitySlots>::new(&["ability_slots.ron"]),
+        );
 
         #[cfg(target_arch = "wasm32")]
-        app.add_plugins(RonAssetPlugin::<AbilityManifest>::new(&[
-            "abilities.manifest.ron",
-        ]));
+        app.add_plugins(
+            bevy_common_assets::ron::RonAssetPlugin::<AbilityManifest>::new(&[
+                "abilities.manifest.ron",
+            ]),
+        );
 
         app.add_systems(Startup, (load_ability_defs, load_default_ability_slots));
 
@@ -464,19 +657,22 @@ fn trigger_individual_ability_loads(
     mut commands: Commands,
 ) {
     if pending.is_some() {
+        trace!("PendingAbilityHandles already exists");
         return;
     }
     let Some(manifest_handle) = manifest_handle else {
+        trace!("ability manifest handle not yet loaded");
         return;
     };
     let Some(manifest) = manifest_assets.get(&manifest_handle.0) else {
+        trace!("ability manifest asset not yet available");
         return;
     };
-    let handles: Vec<Handle<AbilityDef>> = manifest
+    let handles: Vec<Handle<AbilityAsset>> = manifest
         .0
         .iter()
         .map(|id| {
-            let h = asset_server.load(format!("abilities/{id}.ability.ron"));
+            let h: Handle<AbilityAsset> = asset_server.load(format!("abilities/{id}.ability.ron"));
             tracked.add(h.clone());
             h
         })
@@ -489,20 +685,22 @@ fn insert_ability_defs(
     mut commands: Commands,
     folder_handle: Option<Res<AbilityFolderHandle>>,
     loaded_folders: Res<Assets<LoadedFolder>>,
-    ability_assets: Res<Assets<AbilityDef>>,
     asset_server: Res<AssetServer>,
     existing: Option<Res<AbilityDefs>>,
 ) {
     if existing.is_some() {
+        trace!("AbilityDefs already inserted");
         return;
     }
     let Some(folder_handle) = folder_handle else {
+        trace!("ability folder handle not yet loaded");
         return;
     };
     let Some(folder) = loaded_folders.get(&folder_handle.0) else {
+        trace!("ability folder not yet available in Assets<LoadedFolder>");
         return;
     };
-    let abilities = collect_abilities_from_folder(folder, &*ability_assets, &*asset_server);
+    let abilities = collect_ability_handles_from_folder(folder, &asset_server);
     info!("Loaded {} ability definitions", abilities.len());
     commands.insert_resource(AbilityDefs { abilities });
 }
@@ -511,25 +709,35 @@ fn insert_ability_defs(
 fn insert_ability_defs(
     mut commands: Commands,
     pending: Option<Res<PendingAbilityHandles>>,
-    ability_assets: Res<Assets<AbilityDef>>,
+    ability_assets: Res<Assets<AbilityAsset>>,
     asset_server: Res<AssetServer>,
     existing: Option<Res<AbilityDefs>>,
 ) {
     if existing.is_some() {
+        trace!("AbilityDefs already inserted");
         return;
     }
-    let Some(pending) = pending else { return };
-    let abilities: HashMap<AbilityId, AbilityDef> = pending
+    let Some(pending) = pending else {
+        trace!("PendingAbilityHandles not yet available");
+        return;
+    };
+    let abilities: HashMap<AbilityId, Handle<AbilityAsset>> = pending
         .0
         .iter()
         .filter_map(|handle| {
-            let def = ability_assets.get(handle)?;
+            // Verify asset is loaded before including
+            ability_assets.get(handle)?;
             let path = asset_server.get_path(handle.id())?;
             let id = ability_id_from_path(&path)?;
-            Some((id, def.clone()))
+            Some((id, handle.clone()))
         })
         .collect();
     if abilities.len() != pending.0.len() {
+        trace!(
+            "not all ability assets loaded yet ({}/{})",
+            abilities.len(),
+            pending.0.len()
+        );
         return;
     }
     info!("Loaded {} ability definitions", abilities.len());
@@ -541,11 +749,11 @@ fn reload_ability_defs(
     mut commands: Commands,
     folder_handle: Option<Res<AbilityFolderHandle>>,
     loaded_folders: Res<Assets<LoadedFolder>>,
-    ability_assets: Res<Assets<AbilityDef>>,
     asset_server: Res<AssetServer>,
-    mut events: MessageReader<AssetEvent<AbilityDef>>,
+    mut events: MessageReader<AssetEvent<AbilityAsset>>,
 ) {
     let Some(folder_handle) = folder_handle else {
+        // Folder handle not yet loaded during startup — drain events to avoid stale backlog
         events.clear();
         return;
     };
@@ -553,13 +761,14 @@ fn reload_ability_defs(
         .read()
         .any(|e| matches!(e, AssetEvent::Modified { .. }));
     if !has_changes {
+        // No ability asset modifications this frame
         return;
     }
     let Some(folder) = loaded_folders.get(&folder_handle.0) else {
         warn!("ability assets changed but LoadedFolder not available");
         return;
     };
-    let abilities = collect_abilities_from_folder(folder, &*ability_assets, &*asset_server);
+    let abilities = collect_ability_handles_from_folder(folder, &asset_server);
     info!("Hot-reloaded {} ability definitions", abilities.len());
     commands.insert_resource(AbilityDefs { abilities });
 }
@@ -568,11 +777,12 @@ fn reload_ability_defs(
 fn reload_ability_defs(
     mut commands: Commands,
     pending: Option<Res<PendingAbilityHandles>>,
-    ability_assets: Res<Assets<AbilityDef>>,
+    ability_assets: Res<Assets<AbilityAsset>>,
     asset_server: Res<AssetServer>,
-    mut events: MessageReader<AssetEvent<AbilityDef>>,
+    mut events: MessageReader<AssetEvent<AbilityAsset>>,
 ) {
     let Some(pending) = pending else {
+        // Pending handles not yet available during startup — drain events to avoid stale backlog
         events.clear();
         return;
     };
@@ -580,19 +790,25 @@ fn reload_ability_defs(
         .read()
         .any(|e| matches!(e, AssetEvent::Modified { .. }));
     if !has_changes {
+        // No ability asset modifications this frame
         return;
     }
-    let abilities: HashMap<AbilityId, AbilityDef> = pending
+    let abilities: HashMap<AbilityId, Handle<AbilityAsset>> = pending
         .0
         .iter()
         .filter_map(|handle| {
-            let def = ability_assets.get(handle)?;
+            ability_assets.get(handle)?;
             let path = asset_server.get_path(handle.id())?;
             let id = ability_id_from_path(&path)?;
-            Some((id, def.clone()))
+            Some((id, handle.clone()))
         })
         .collect();
     if abilities.len() != pending.0.len() {
+        trace!(
+            "not all ability assets loaded yet for reload ({}/{})",
+            abilities.len(),
+            pending.0.len()
+        );
         return;
     }
     info!("Hot-reloaded {} ability definitions", abilities.len());
@@ -605,11 +821,10 @@ fn ability_id_from_path(path: &AssetPath) -> Option<AbilityId> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn collect_abilities_from_folder(
+fn collect_ability_handles_from_folder(
     folder: &LoadedFolder,
-    ability_assets: &Assets<AbilityDef>,
     asset_server: &AssetServer,
-) -> HashMap<AbilityId, AbilityDef> {
+) -> HashMap<AbilityId, Handle<AbilityAsset>> {
     folder
         .handles
         .iter()
@@ -619,10 +834,9 @@ fn collect_abilities_from_folder(
             if !name.ends_with(".ability.ron") {
                 return None;
             }
-            let typed = handle.clone().typed::<AbilityDef>();
-            let def = ability_assets.get(&typed)?;
             let id = ability_id_from_path(&path)?;
-            Some((id, def.clone()))
+            let typed = handle.clone().typed::<AbilityAsset>();
+            Some((id, typed))
         })
         .collect()
 }
@@ -676,10 +890,13 @@ pub fn slot_to_ability_action(slot: usize) -> Option<PlayerActions> {
     ABILITY_ACTIONS.get(slot).copied()
 }
 
-/// Activate an ability when a hotkey is pressed. Spawns an ActiveAbility entity.
+/// Activate an ability when a hotkey is pressed. Spawns an ActiveAbility entity
+/// with all archetype components from the ability asset.
 pub fn ability_activation(
     mut commands: Commands,
     ability_defs: Res<AbilityDefs>,
+    ability_assets: Res<Assets<AbilityAsset>>,
+    registry: Res<AppTypeRegistry>,
     default_slots: Res<DefaultAbilitySlots>,
     timeline: Res<LocalTimeline>,
     mut query: Query<(
@@ -702,35 +919,46 @@ pub fn ability_activation(
             let Some(ref ability_id) = slots.0[slot_idx] else {
                 continue;
             };
-            let Some(def) = ability_defs.get(ability_id) else {
+            let Some(handle) = ability_defs.get(ability_id) else {
                 warn!("Ability {:?} not found in defs", ability_id);
                 continue;
             };
-            if cooldowns.is_on_cooldown(slot_idx, tick, def.cooldown_ticks) {
+            let Some(asset) = ability_assets.get(handle) else {
+                warn!("Ability {:?} asset not loaded", ability_id);
+                continue;
+            };
+            let Some(phases) = extract_phases(asset) else {
+                warn!("Ability {:?} missing AbilityPhases component", ability_id);
+                continue;
+            };
+            if cooldowns.is_on_cooldown(slot_idx, tick, phases.cooldown) {
                 continue;
             }
 
             cooldowns.last_used[slot_idx] = Some(tick);
-
             let salt = (player_id.0.to_bits()) << 32 | (slot_idx as u64) << 16 | 0u64;
 
-            let mut cmd = commands.spawn((
-                ActiveAbility {
-                    def_id: ability_id.clone(),
-                    caster: entity,
-                    original_caster: entity,
-                    target: entity,
-                    phase: AbilityPhase::Startup,
-                    phase_start_tick: tick,
-                    ability_slot: slot_idx as u8,
-                    depth: 0,
-                },
-                PreSpawned::default_with_salt(salt),
-                Name::new("ActiveAbility"),
-            ));
+            let entity_id = commands
+                .spawn((
+                    ActiveAbility {
+                        def_id: ability_id.clone(),
+                        caster: entity,
+                        original_caster: entity,
+                        target: entity,
+                        phase: AbilityPhase::Startup,
+                        phase_start_tick: tick,
+                        ability_slot: slot_idx as u8,
+                        depth: 0,
+                    },
+                    PreSpawned::default_with_salt(salt),
+                    Name::new("ActiveAbility"),
+                ))
+                .id();
+
+            apply_ability_archetype(&mut commands, entity_id, asset, registry.0.clone());
 
             if let Ok(controlled_by) = server_query.get(entity) {
-                cmd.insert((
+                commands.entity(entity_id).insert((
                     Replicate::to_clients(NetworkTarget::All),
                     PredictionTarget::to_clients(NetworkTarget::All),
                     *controlled_by,
@@ -744,11 +972,11 @@ fn advance_ability_phase(
     commands: &mut Commands,
     entity: Entity,
     active: &mut ActiveAbility,
-    def: &AbilityDef,
+    phases: &AbilityPhases,
     tick: Tick,
 ) {
     let elapsed = tick - active.phase_start_tick;
-    let phase_complete = elapsed >= def.phase_duration(&active.phase) as i16;
+    let phase_complete = elapsed >= phases.phase_duration(&active.phase) as i16;
 
     if !phase_complete {
         return;
@@ -769,145 +997,40 @@ fn advance_ability_phase(
     }
 }
 
-/// Advance ability phases based on tick counts.
+/// Advance ability phases based on tick counts. Constructs `OnHitEffects` on
+/// Startup->Active transition and removes it when leaving Active.
 pub fn update_active_abilities(
     mut commands: Commands,
-    ability_defs: Res<AbilityDefs>,
     timeline: Res<LocalTimeline>,
-    mut query: Query<(Entity, &mut ActiveAbility)>,
+    mut query: Query<(
+        Entity,
+        &mut ActiveAbility,
+        &AbilityPhases,
+        Option<&OnHitEffectDefs>,
+    )>,
 ) {
     let tick = timeline.tick();
 
-    for (entity, mut active) in &mut query {
-        let Some(def) = ability_defs.get(&active.def_id) else {
-            warn!("Ability {:?} not found", active.def_id);
-            commands.entity(entity).prediction_despawn();
-            continue;
-        };
+    for (entity, mut active, phases, on_hit_defs) in &mut query {
+        let prev_phase = active.phase.clone();
+        advance_ability_phase(&mut commands, entity, &mut active, phases, tick);
 
-        advance_ability_phase(&mut commands, entity, &mut active, def, tick);
-    }
-}
-
-/// Insert/remove effect marker components based on `ActiveAbility` phase.
-pub fn dispatch_effect_markers(
-    mut commands: Commands,
-    ability_defs: Res<AbilityDefs>,
-    timeline: Res<LocalTimeline>,
-    query: Query<(Entity, &ActiveAbility)>,
-) {
-    let tick = timeline.tick();
-
-    for (entity, active) in &query {
-        let Some(def) = ability_defs.get(&active.def_id) else {
-            warn!(
-                "dispatch_effect_markers: ability {:?} not found",
-                active.def_id
-            );
-            continue;
-        };
-
-        if active.phase == AbilityPhase::Active {
-            dispatch_active_phase_markers(&mut commands, entity, active, def, tick);
-        } else {
-            remove_active_phase_markers(&mut commands, entity);
-            if active.phase == AbilityPhase::Recovery && active.phase_start_tick == tick {
-                dispatch_on_end_markers(&mut commands, entity, def);
+        if active.phase == AbilityPhase::Active && prev_phase != AbilityPhase::Active {
+            if let Some(defs) = on_hit_defs {
+                if !defs.0.is_empty() {
+                    commands.entity(entity).insert(OnHitEffects {
+                        effects: defs.0.clone(),
+                        caster: active.caster,
+                        original_caster: active.original_caster,
+                        depth: active.depth,
+                    });
+                }
             }
         }
-    }
-}
 
-fn dispatch_active_phase_markers(
-    commands: &mut Commands,
-    entity: Entity,
-    active: &ActiveAbility,
-    def: &AbilityDef,
-    tick: Tick,
-) {
-    let first_active_tick = active.phase_start_tick == tick;
-    let active_offset = (tick - active.phase_start_tick) as u16;
-
-    {
-        let on_tick: Vec<AbilityEffect> = def
-            .effects
-            .iter()
-            .filter_map(|t| match t {
-                EffectTrigger::OnTick { tick: t, effect } if *t == active_offset => {
-                    Some(effect.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        if !on_tick.is_empty() {
-            commands.entity(entity).insert(OnTickEffects(on_tick));
+        if active.phase != AbilityPhase::Active && prev_phase == AbilityPhase::Active {
+            commands.entity(entity).remove::<OnHitEffects>();
         }
-    }
-
-    if first_active_tick {
-        let on_hit: Vec<AbilityEffect> = def
-            .effects
-            .iter()
-            .filter_map(|t| match t {
-                EffectTrigger::OnHit(e) => Some(e.clone()),
-                _ => None,
-            })
-            .collect();
-        if !on_hit.is_empty() {
-            commands.entity(entity).insert(OnHitEffects {
-                effects: on_hit,
-                caster: active.caster,
-                original_caster: active.original_caster,
-                depth: active.depth,
-            });
-        }
-    }
-
-    let while_active: Vec<AbilityEffect> = def
-        .effects
-        .iter()
-        .filter_map(|t| match t {
-            EffectTrigger::WhileActive(e) => Some(e.clone()),
-            _ => None,
-        })
-        .collect();
-    if !while_active.is_empty() {
-        commands
-            .entity(entity)
-            .insert(WhileActiveEffects(while_active));
-    }
-
-    let on_input: Vec<(PlayerActions, AbilityEffect)> = def
-        .effects
-        .iter()
-        .filter_map(|t| match t {
-            EffectTrigger::OnInput { action, effect } => Some((*action, effect.clone())),
-            _ => None,
-        })
-        .collect();
-    if !on_input.is_empty() {
-        commands.entity(entity).insert(OnInputEffects(on_input));
-    }
-}
-
-fn remove_active_phase_markers(commands: &mut Commands, entity: Entity) {
-    commands.entity(entity).remove::<OnTickEffects>();
-    commands.entity(entity).remove::<WhileActiveEffects>();
-    commands.entity(entity).remove::<OnHitEffects>();
-    commands.entity(entity).remove::<OnInputEffects>();
-}
-
-fn dispatch_on_end_markers(commands: &mut Commands, entity: Entity, def: &AbilityDef) {
-    let on_end: Vec<AbilityEffect> = def
-        .effects
-        .iter()
-        .filter_map(|t| match t {
-            EffectTrigger::OnEnd(e) => Some(e.clone()),
-            _ => None,
-        })
-        .collect();
-    if !on_end.is_empty() {
-        commands.entity(entity).insert(OnEndEffects(on_end));
     }
 }
 
@@ -937,10 +1060,12 @@ fn compute_sub_ability_salt(player_id: PlayerId, slot: u8, depth: u8, id: &str) 
 }
 
 /// Spawn a sub-ability entity for recursive ability composition.
-/// Caps at depth 4 to prevent infinite recursion.
+/// Caps at depth 4 to prevent infinite recursion. Applies archetype components from the asset.
 pub(crate) fn spawn_sub_ability(
     commands: &mut Commands,
     ability_defs: &AbilityDefs,
+    ability_assets: &Assets<AbilityAsset>,
+    registry: &TypeRegistryArc,
     id: &str,
     target_entity: Entity,
     original_caster: Entity,
@@ -955,10 +1080,14 @@ pub(crate) fn spawn_sub_ability(
         return;
     }
     let ability_id = AbilityId(id.to_string());
-    if ability_defs.get(&ability_id).is_none() {
+    let Some(handle) = ability_defs.get(&ability_id) else {
         warn!("Sub-ability {:?} not found in defs", id);
         return;
-    }
+    };
+    let Some(asset) = ability_assets.get(handle) else {
+        warn!("Sub-ability {:?} asset not loaded", id);
+        return;
+    };
     let Some(&player_id) = player_id_query.get(original_caster).ok() else {
         warn!(
             "Sub-ability spawn: original_caster {:?} missing PlayerId",
@@ -969,23 +1098,27 @@ pub(crate) fn spawn_sub_ability(
     let depth = parent_depth + 1;
     let salt = compute_sub_ability_salt(player_id, parent_slot, depth, id);
 
-    let mut cmd = commands.spawn((
-        ActiveAbility {
-            def_id: ability_id,
-            caster: target_entity,
-            original_caster,
-            target: target_entity,
-            phase: AbilityPhase::Startup,
-            phase_start_tick: tick,
-            ability_slot: parent_slot,
-            depth,
-        },
-        PreSpawned::default_with_salt(salt),
-        Name::new("ActiveAbility"),
-    ));
+    let entity_id = commands
+        .spawn((
+            ActiveAbility {
+                def_id: ability_id,
+                caster: target_entity,
+                original_caster,
+                target: target_entity,
+                phase: AbilityPhase::Startup,
+                phase_start_tick: tick,
+                ability_slot: parent_slot,
+                depth,
+            },
+            PreSpawned::default_with_salt(salt),
+            Name::new("ActiveAbility"),
+        ))
+        .id();
+
+    apply_ability_archetype(commands, entity_id, asset, registry.clone());
 
     if let Ok(controlled_by) = server_query.get(original_caster) {
-        cmd.insert((
+        commands.entity(entity_id).insert((
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::All),
             *controlled_by,
@@ -994,9 +1127,12 @@ pub(crate) fn spawn_sub_ability(
 }
 
 /// Process OnTick effects: spawn hitbox entities, projectiles, or sub-abilities.
+/// Only fires during Active phase; filters by tick offset within the phase.
 pub fn apply_on_tick_effects(
     mut commands: Commands,
     ability_defs: Res<AbilityDefs>,
+    ability_assets: Res<Assets<AbilityAsset>>,
+    registry: Res<AppTypeRegistry>,
     timeline: Res<LocalTimeline>,
     server_query: Query<&ControlledBy>,
     player_id_query: Query<&PlayerId>,
@@ -1010,8 +1146,16 @@ pub fn apply_on_tick_effects(
 ) {
     let tick = timeline.tick();
     for (entity, effects, active, on_hit_effects) in &query {
-        for effect in &effects.0 {
-            match effect {
+        if active.phase != AbilityPhase::Active {
+            continue;
+        }
+
+        let active_offset = (tick - active.phase_start_tick) as u16;
+        for tick_effect in &effects.0 {
+            if tick_effect.tick != active_offset {
+                continue;
+            }
+            match &tick_effect.effect {
                 AbilityEffect::Melee { .. } => {
                     spawn_melee_hitbox(
                         &mut commands,
@@ -1048,11 +1192,13 @@ pub fn apply_on_tick_effects(
                     });
                 }
                 AbilityEffect::Ability { id, target } => {
-                    let target_entity = resolve_caster_target(&target, active);
+                    let target_entity = resolve_caster_target(target, active);
                     spawn_sub_ability(
                         &mut commands,
                         ability_defs.as_ref(),
-                        &id,
+                        ability_assets.as_ref(),
+                        &registry.0,
+                        id,
                         target_entity,
                         active.original_caster,
                         active.ability_slot,
@@ -1078,19 +1224,18 @@ pub fn apply_on_tick_effects(
                 } => {
                     apply_buff(
                         &mut commands,
-                        resolve_caster_target(&target, active),
-                        &stat,
+                        resolve_caster_target(target, active),
+                        stat,
                         *multiplier,
                         *duration_ticks,
                         tick,
                     );
                 }
                 _ => {
-                    warn!("Unhandled OnTick effect: {:?}", effect);
+                    warn!("Unhandled OnTick effect: {:?}", tick_effect.effect);
                 }
             }
         }
-        commands.entity(entity).remove::<OnTickEffects>();
     }
 }
 
@@ -1180,11 +1325,15 @@ fn spawn_aoe_hitbox(
 }
 
 /// Apply WhileActive effects each tick (e.g. SetVelocity for dashes).
+/// Only fires during Active phase.
 pub fn apply_while_active_effects(
     query: Query<(&WhileActiveEffects, &ActiveAbility)>,
     mut caster_query: Query<(&Rotation, &mut LinearVelocity)>,
 ) {
     for (effects, active) in &query {
+        if active.phase != AbilityPhase::Active {
+            continue;
+        }
         for effect in &effects.0 {
             match effect {
                 AbilityEffect::SetVelocity { speed, target } => {
@@ -1203,10 +1352,13 @@ pub fn apply_while_active_effects(
     }
 }
 
-/// Process OnEnd effects — handles effects that fire when ability exits Active phase.
+/// Process OnEnd effects — fires on the first Recovery tick (Active->Recovery transition).
+/// Does NOT remove OnEndEffects; it's a persistent archetype component.
 pub fn apply_on_end_effects(
     mut commands: Commands,
     ability_defs: Res<AbilityDefs>,
+    ability_assets: Res<Assets<AbilityAsset>>,
+    registry: Res<AppTypeRegistry>,
     timeline: Res<LocalTimeline>,
     server_query: Query<&ControlledBy>,
     player_id_query: Query<&PlayerId>,
@@ -1214,11 +1366,14 @@ pub fn apply_on_end_effects(
     mut caster_query: Query<(&mut Position, &Rotation, &mut LinearVelocity)>,
 ) {
     let tick = timeline.tick();
-    for (entity, effects, active) in &query {
+    for (_entity, effects, active) in &query {
+        if active.phase != AbilityPhase::Recovery || active.phase_start_tick != tick {
+            continue;
+        }
         for effect in &effects.0 {
             match effect {
                 AbilityEffect::SetVelocity { speed, target } => {
-                    let target_entity = resolve_caster_target(&target, active);
+                    let target_entity = resolve_caster_target(target, active);
                     if let Ok((_, rotation, mut velocity)) = caster_query.get_mut(target_entity) {
                         let direction = facing_direction(rotation);
                         velocity.x = direction.x * speed;
@@ -1226,11 +1381,13 @@ pub fn apply_on_end_effects(
                     }
                 }
                 AbilityEffect::Ability { id, target } => {
-                    let target_entity = resolve_caster_target(&target, active);
+                    let target_entity = resolve_caster_target(target, active);
                     spawn_sub_ability(
                         &mut commands,
                         ability_defs.as_ref(),
-                        &id,
+                        ability_assets.as_ref(),
+                        &registry.0,
+                        id,
                         target_entity,
                         active.original_caster,
                         active.ability_slot,
@@ -1265,8 +1422,8 @@ pub fn apply_on_end_effects(
                 } => {
                     apply_buff(
                         &mut commands,
-                        resolve_caster_target(&target, active),
-                        &stat,
+                        resolve_caster_target(target, active),
+                        stat,
                         *multiplier,
                         *duration_ticks,
                         tick,
@@ -1277,15 +1434,17 @@ pub fn apply_on_end_effects(
                 }
             }
         }
-        commands.entity(entity).remove::<OnEndEffects>();
     }
 }
 
 /// Process OnInput effects -- checks caster's ActionState for just_pressed inputs
 /// and applies matched effects (typically spawning sub-abilities for combo chaining).
+/// Only fires during Active phase.
 pub fn apply_on_input_effects(
     mut commands: Commands,
     ability_defs: Res<AbilityDefs>,
+    ability_assets: Res<Assets<AbilityAsset>>,
+    registry: Res<AppTypeRegistry>,
     timeline: Res<LocalTimeline>,
     server_query: Query<&ControlledBy>,
     player_id_query: Query<&PlayerId>,
@@ -1294,20 +1453,25 @@ pub fn apply_on_input_effects(
 ) {
     let tick = timeline.tick();
     for (_entity, effects, active) in &query {
+        if active.phase != AbilityPhase::Active {
+            continue;
+        }
         let Ok(action_state) = action_query.get(active.caster) else {
             continue;
         };
-        for (action, effect) in &effects.0 {
-            if !action_state.just_pressed(action) {
+        for input_effect in &effects.0 {
+            if !action_state.just_pressed(&input_effect.action) {
                 continue;
             }
-            match effect {
+            match &input_effect.effect {
                 AbilityEffect::Ability { id, target } => {
-                    let target_entity = resolve_caster_target(&target, active);
+                    let target_entity = resolve_caster_target(target, active);
                     spawn_sub_ability(
                         &mut commands,
                         ability_defs.as_ref(),
-                        &id,
+                        ability_assets.as_ref(),
+                        &registry.0,
+                        id,
                         target_entity,
                         active.original_caster,
                         active.ability_slot,
@@ -1318,7 +1482,7 @@ pub fn apply_on_input_effects(
                     );
                 }
                 _ => {
-                    warn!("Unhandled OnInput effect: {:?}", effect);
+                    warn!("Unhandled OnInput effect: {:?}", input_effect.effect);
                 }
             }
         }
@@ -1374,7 +1538,7 @@ pub fn expire_buffs(
     }
 }
 
-/// Safety net: remove all effect markers when `ActiveAbility` is removed.
+/// Safety net: remove all effect/archetype markers when `ActiveAbility` is removed.
 pub fn cleanup_effect_markers_on_removal(
     trigger: On<Remove, ActiveAbility>,
     mut commands: Commands,
@@ -1383,9 +1547,11 @@ pub fn cleanup_effect_markers_on_removal(
         cmd.try_remove::<OnTickEffects>();
         cmd.try_remove::<WhileActiveEffects>();
         cmd.try_remove::<OnHitEffects>();
+        cmd.try_remove::<OnHitEffectDefs>();
         cmd.try_remove::<OnEndEffects>();
         cmd.try_remove::<OnInputEffects>();
         cmd.try_remove::<ProjectileSpawnEffect>();
+        cmd.try_remove::<AbilityPhases>();
     }
 }
 
