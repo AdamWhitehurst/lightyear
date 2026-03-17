@@ -622,6 +622,47 @@ impl Plugin for AbilityPlugin {
                 sync_default_ability_slots,
             ),
         );
+
+        let ready = in_state(crate::app_state::AppState::Ready);
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                ability_activation,
+                update_active_abilities,
+                apply_on_tick_effects,
+                apply_while_active_effects,
+                apply_on_end_effects,
+                apply_on_input_effects,
+                ability_projectile_spawn,
+            )
+                .chain()
+                .run_if(ready.clone()),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                crate::hit_detection::update_hitbox_positions,
+                crate::hit_detection::process_hitbox_hits,
+                crate::hit_detection::process_projectile_hits,
+                crate::hit_detection::cleanup_hitbox_entities,
+            )
+                .chain()
+                .after(apply_on_tick_effects)
+                .run_if(ready.clone()),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (expire_buffs, aoe_hitbox_lifetime, ability_bullet_lifetime)
+                .after(crate::hit_detection::process_hitbox_hits)
+                .after(crate::hit_detection::process_projectile_hits)
+                .run_if(ready.clone()),
+        );
+        app.add_systems(PreUpdate, handle_ability_projectile_spawn);
+        app.add_observer(despawn_ability_projectile_spawn);
+        app.add_observer(cleanup_effect_markers_on_removal);
     }
 }
 

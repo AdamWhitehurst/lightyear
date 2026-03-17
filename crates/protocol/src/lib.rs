@@ -310,44 +310,7 @@ impl Plugin for SharedGameplayPlugin {
 
         let ready = in_state(AppState::Ready);
 
-        app.add_systems(
-            FixedUpdate,
-            (
-                ability::ability_activation,
-                ability::update_active_abilities,
-                ability::apply_on_tick_effects,
-                ability::apply_while_active_effects,
-                ability::apply_on_end_effects,
-                ability::apply_on_input_effects,
-                ability::ability_projectile_spawn,
-            )
-                .chain()
-                .run_if(ready.clone()),
-        );
-
-        app.add_systems(
-            FixedUpdate,
-            (
-                hit_detection::update_hitbox_positions,
-                hit_detection::process_hitbox_hits,
-                hit_detection::process_projectile_hits,
-                hit_detection::cleanup_hitbox_entities,
-            )
-                .chain()
-                .after(ability::apply_on_tick_effects)
-                .run_if(ready.clone()),
-        );
-
-        app.add_systems(FixedUpdate, ability::expire_buffs.run_if(ready.clone()));
-        app.add_systems(
-            FixedUpdate,
-            ability::aoe_hitbox_lifetime.run_if(ready.clone()),
-        );
-        app.add_systems(FixedUpdate, update_facing.run_if(ready.clone()));
-        app.add_systems(PreUpdate, ability::handle_ability_projectile_spawn);
-        app.add_systems(FixedUpdate, ability::ability_bullet_lifetime.run_if(ready));
-        app.add_observer(ability::despawn_ability_projectile_spawn);
-        app.add_observer(ability::cleanup_effect_markers_on_removal);
+        app.add_systems(FixedUpdate, update_facing.run_if(ready));
     }
 }
 

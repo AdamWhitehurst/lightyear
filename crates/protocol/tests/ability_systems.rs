@@ -1,184 +1,323 @@
 use avian3d::prelude::CollidingEntities;
+use bevy::ecs::reflect::ReflectComponent;
 use bevy::prelude::*;
+use bevy::reflect::PartialReflect;
 use leafwing_input_manager::prelude::ActionState;
 use lightyear::prelude::{ComponentRegistry, LocalTimeline, PeerId, Server, Tick};
 use lightyear_replication::prespawn::PreSpawnedReceiver;
 use protocol::ability::{
-    ActiveBuff, ActiveBuffs, ActiveShield, HitTargets, HitboxOf, MeleeHitbox, OnEndEffects,
-    OnInputEffects,
+    AbilityAsset, AbilityPhases, ActiveBuff, ActiveBuffs, ActiveShield, HitTargets, HitboxOf,
+    InputEffect, MeleeHitbox, OnEndEffects, OnHitEffectDefs, OnHitEffects, OnInputEffects,
+    OnTickEffects, TickEffect, WhileActiveEffects,
 };
-use protocol::{hit_detection, *};
+use protocol::*;
 use std::collections::HashMap;
 
-fn test_defs() -> HashMap<AbilityId, AbilityDef> {
-    let mut m = HashMap::new();
-    m.insert(
-        AbilityId("punch".into()),
-        AbilityDef {
-            startup_ticks: 4,
-            active_ticks: 20,
-            recovery_ticks: 0,
-            cooldown_ticks: 16,
-            effects: vec![
-                EffectTrigger::OnTick {
+/// Build an `AbilityAsset` from explicit component lists.
+fn build_ability_asset(
+    phases: AbilityPhases,
+    on_tick: Vec<TickEffect>,
+    while_active: Vec<AbilityEffect>,
+    on_hit: Vec<AbilityEffect>,
+    on_end: Vec<AbilityEffect>,
+    on_input: Vec<InputEffect>,
+) -> AbilityAsset {
+    let mut components: Vec<Box<dyn PartialReflect>> =
+        vec![Box::new(phases).into_partial_reflect()];
+    if !on_tick.is_empty() {
+        components.push(Box::new(OnTickEffects(on_tick)).into_partial_reflect());
+    }
+    if !while_active.is_empty() {
+        components.push(Box::new(WhileActiveEffects(while_active)).into_partial_reflect());
+    }
+    if !on_hit.is_empty() {
+        components.push(Box::new(OnHitEffectDefs(on_hit)).into_partial_reflect());
+    }
+    if !on_end.is_empty() {
+        components.push(Box::new(OnEndEffects(on_end)).into_partial_reflect());
+    }
+    if !on_input.is_empty() {
+        components.push(Box::new(OnInputEffects(on_input)).into_partial_reflect());
+    }
+    AbilityAsset { components }
+}
+
+/// Insert an ability into both `Assets<AbilityAsset>` and `AbilityDefs`.
+fn insert_test_ability(app: &mut App, id: &str, asset: AbilityAsset) {
+    let handle = app
+        .world_mut()
+        .resource_mut::<Assets<AbilityAsset>>()
+        .add(asset);
+    app.world_mut()
+        .resource_mut::<AbilityDefs>()
+        .abilities
+        .insert(AbilityId(id.to_string()), handle);
+}
+
+/// Spawn an `ActiveAbility` entity with archetype components applied immediately.
+/// When spawning directly in Active phase, also inserts `OnHitEffects` to match
+/// the production Startup->Active transition behavior.
+fn spawn_test_active_ability(app: &mut App, active: ActiveAbility) -> Entity {
+    let def_id = active.def_id.clone();
+    let phase = active.phase.clone();
+    let caster = active.caster;
+    let original_caster = active.original_caster;
+    let depth = active.depth;
+    let entity = app.world_mut().spawn(active).id();
+    apply_test_archetype(app, entity, &def_id);
+
+    // Mirror what update_active_abilities does on Startup->Active transition:
+    // insert OnHitEffects from OnHitEffectDefs when starting in Active phase.
+    if phase == AbilityPhase::Active {
+        if let Some(defs) = app.world().get::<OnHitEffectDefs>(entity) {
+            if !defs.0.is_empty() {
+                let effects = defs.0.clone();
+                app.world_mut().entity_mut(entity).insert(OnHitEffects {
+                    effects,
+                    caster,
+                    original_caster,
+                    depth,
+                });
+            }
+        }
+    }
+    entity
+}
+
+/// Apply archetype components from an ability's asset to an entity via the type registry.
+fn apply_test_archetype(app: &mut App, entity: Entity, ability_id: &AbilityId) {
+    let (asset, registry_arc) = {
+        let world = app.world();
+        let ability_defs = world.resource::<AbilityDefs>();
+        let handle = ability_defs
+            .get(ability_id)
+            .unwrap_or_else(|| panic!("ability {:?} not in defs", ability_id))
+            .clone();
+        let assets = world.resource::<Assets<AbilityAsset>>();
+        let asset = assets
+            .get(&handle)
+            .unwrap_or_else(|| panic!("ability {:?} asset not loaded", ability_id))
+            .clone();
+        let registry_arc = world.resource::<AppTypeRegistry>().0.clone();
+        (asset, registry_arc)
+    };
+
+    let registry = registry_arc.read();
+    let mut entity_mut = app.world_mut().entity_mut(entity);
+    for component in &asset.components {
+        let type_path = component.reflect_type_path();
+        let registration = registry
+            .get_with_type_path(type_path)
+            .unwrap_or_else(|| panic!("Ability component type not registered: {type_path}"));
+        let reflect_component = registration
+            .data::<ReflectComponent>()
+            .unwrap_or_else(|| panic!("Type missing #[reflect(Component)]: {type_path}"));
+        reflect_component.insert(&mut entity_mut, component.as_ref(), &registry);
+    }
+}
+
+/// Standard test ability definitions.
+fn test_defs() -> Vec<(String, AbilityAsset)> {
+    vec![
+        (
+            "punch".into(),
+            build_ability_asset(
+                AbilityPhases {
+                    startup: 4,
+                    active: 20,
+                    recovery: 0,
+                    cooldown: 16,
+                },
+                vec![TickEffect {
                     tick: 0,
                     effect: AbilityEffect::Melee {
                         id: None,
                         target: EffectTarget::Caster,
                     },
-                },
-                EffectTrigger::OnHit(AbilityEffect::Damage {
-                    amount: 5.0,
-                    target: EffectTarget::Victim,
-                }),
-                EffectTrigger::OnHit(AbilityEffect::ApplyForce {
-                    force: Vec3::new(0.0, 0.9, 2.85),
-                    frame: ForceFrame::RelativePosition,
-                    target: EffectTarget::Victim,
-                }),
-                EffectTrigger::OnInput {
+                }],
+                vec![],
+                vec![
+                    AbilityEffect::Damage {
+                        amount: 5.0,
+                        target: EffectTarget::Victim,
+                    },
+                    AbilityEffect::ApplyForce {
+                        force: Vec3::new(0.0, 0.9, 2.85),
+                        frame: ForceFrame::RelativePosition,
+                        target: EffectTarget::Victim,
+                    },
+                ],
+                vec![],
+                vec![InputEffect {
                     action: PlayerActions::Ability1,
                     effect: AbilityEffect::Ability {
                         id: "punch2".into(),
                         target: EffectTarget::Caster,
                     },
+                }],
+            ),
+        ),
+        (
+            "punch2".into(),
+            build_ability_asset(
+                AbilityPhases {
+                    startup: 4,
+                    active: 20,
+                    recovery: 0,
+                    cooldown: 0,
                 },
-            ],
-        },
-    );
-    m.insert(
-        AbilityId("punch2".into()),
-        AbilityDef {
-            startup_ticks: 4,
-            active_ticks: 20,
-            recovery_ticks: 0,
-            cooldown_ticks: 0,
-            effects: vec![
-                EffectTrigger::OnTick {
+                vec![TickEffect {
                     tick: 0,
                     effect: AbilityEffect::Melee {
                         id: None,
                         target: EffectTarget::Caster,
                     },
-                },
-                EffectTrigger::OnHit(AbilityEffect::Damage {
-                    amount: 6.0,
-                    target: EffectTarget::Victim,
-                }),
-                EffectTrigger::OnHit(AbilityEffect::ApplyForce {
-                    force: Vec3::new(0.0, 1.05, 3.32),
-                    frame: ForceFrame::RelativePosition,
-                    target: EffectTarget::Victim,
-                }),
-                EffectTrigger::OnInput {
+                }],
+                vec![],
+                vec![
+                    AbilityEffect::Damage {
+                        amount: 6.0,
+                        target: EffectTarget::Victim,
+                    },
+                    AbilityEffect::ApplyForce {
+                        force: Vec3::new(0.0, 1.05, 3.32),
+                        frame: ForceFrame::RelativePosition,
+                        target: EffectTarget::Victim,
+                    },
+                ],
+                vec![],
+                vec![InputEffect {
                     action: PlayerActions::Ability1,
                     effect: AbilityEffect::Ability {
                         id: "punch3".into(),
                         target: EffectTarget::Caster,
                     },
+                }],
+            ),
+        ),
+        (
+            "punch3".into(),
+            build_ability_asset(
+                AbilityPhases {
+                    startup: 4,
+                    active: 6,
+                    recovery: 10,
+                    cooldown: 0,
                 },
-            ],
-        },
-    );
-    m.insert(
-        AbilityId("punch3".into()),
-        AbilityDef {
-            startup_ticks: 4,
-            active_ticks: 6,
-            recovery_ticks: 10,
-            cooldown_ticks: 0,
-            effects: vec![
-                EffectTrigger::OnTick {
+                vec![TickEffect {
                     tick: 0,
                     effect: AbilityEffect::Melee {
                         id: None,
                         target: EffectTarget::Caster,
                     },
+                }],
+                vec![],
+                vec![
+                    AbilityEffect::Damage {
+                        amount: 10.0,
+                        target: EffectTarget::Victim,
+                    },
+                    AbilityEffect::ApplyForce {
+                        force: Vec3::new(0.0, 2.4, 7.65),
+                        frame: ForceFrame::RelativePosition,
+                        target: EffectTarget::Victim,
+                    },
+                ],
+                vec![],
+                vec![],
+            ),
+        ),
+        (
+            "dash".into(),
+            build_ability_asset(
+                AbilityPhases {
+                    startup: 2,
+                    active: 8,
+                    recovery: 4,
+                    cooldown: 64,
                 },
-                EffectTrigger::OnHit(AbilityEffect::Damage {
-                    amount: 10.0,
-                    target: EffectTarget::Victim,
-                }),
-                EffectTrigger::OnHit(AbilityEffect::ApplyForce {
-                    force: Vec3::new(0.0, 2.4, 7.65),
-                    frame: ForceFrame::RelativePosition,
-                    target: EffectTarget::Victim,
-                }),
-            ],
-        },
-    );
-    m.insert(
-        AbilityId("dash".into()),
-        AbilityDef {
-            startup_ticks: 2,
-            active_ticks: 8,
-            recovery_ticks: 4,
-            cooldown_ticks: 64,
-            effects: vec![EffectTrigger::WhileActive(AbilityEffect::SetVelocity {
-                speed: 15.0,
-                target: EffectTarget::Caster,
-            })],
-        },
-    );
-    m.insert(
-        AbilityId("fireball".into()),
-        AbilityDef {
-            startup_ticks: 6,
-            active_ticks: 2,
-            recovery_ticks: 8,
-            cooldown_ticks: 96,
-            effects: vec![
-                EffectTrigger::OnTick {
+                vec![],
+                vec![AbilityEffect::SetVelocity {
+                    speed: 15.0,
+                    target: EffectTarget::Caster,
+                }],
+                vec![],
+                vec![],
+                vec![],
+            ),
+        ),
+        (
+            "fireball".into(),
+            build_ability_asset(
+                AbilityPhases {
+                    startup: 6,
+                    active: 2,
+                    recovery: 8,
+                    cooldown: 96,
+                },
+                vec![TickEffect {
                     tick: 0,
                     effect: AbilityEffect::Projectile {
                         id: None,
                         speed: 20.0,
                         lifetime_ticks: 192,
                     },
-                },
-                EffectTrigger::OnHit(AbilityEffect::Damage {
-                    amount: 25.0,
-                    target: EffectTarget::Victim,
-                }),
-                EffectTrigger::OnHit(AbilityEffect::ApplyForce {
-                    force: Vec3::new(0.0, 2.4, 7.65),
-                    frame: ForceFrame::RelativePosition,
-                    target: EffectTarget::Victim,
-                }),
-            ],
-        },
-    );
-    m
+                }],
+                vec![],
+                vec![
+                    AbilityEffect::Damage {
+                        amount: 25.0,
+                        target: EffectTarget::Victim,
+                    },
+                    AbilityEffect::ApplyForce {
+                        force: Vec3::new(0.0, 2.4, 7.65),
+                        frame: ForceFrame::RelativePosition,
+                        target: EffectTarget::Victim,
+                    },
+                ],
+                vec![],
+                vec![],
+            ),
+        ),
+    ]
 }
 
 fn test_app() -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
-    // Minimal lightyear infrastructure for PreSpawned::default_with_salt to work.
-    // The on_add hook needs: ComponentRegistry resource, Server + PreSpawnedReceiver
-    // component types registered. LocalTimeline is inserted as a resource by tests.
+    app.add_plugins(AssetPlugin::default());
+    app.add_plugins(bevy::state::app::StatesPlugin);
+    app.add_plugins(protocol::AppStatePlugin);
+    app.add_plugins(AbilityPlugin);
     app.init_resource::<ComponentRegistry>();
     app.world_mut().register_component::<Server>();
     app.world_mut().register_component::<PreSpawnedReceiver>();
+
+    // Pre-insert AbilityDefs so the plugin's insert_ability_defs system no-ops
+    let defs = test_defs();
+    let mut ability_handles = HashMap::new();
+    {
+        let mut assets = app.world_mut().resource_mut::<Assets<AbilityAsset>>();
+        for (id, asset) in defs {
+            let handle = assets.add(asset);
+            ability_handles.insert(AbilityId(id), handle);
+        }
+    }
     app.insert_resource(AbilityDefs {
-        abilities: test_defs(),
+        abilities: ability_handles,
     });
     app.insert_resource(DefaultAbilitySlots::default());
-    app.add_systems(
-        Update,
-        (
-            ability::ability_activation,
-            ability::update_active_abilities,
-            ability::dispatch_effect_markers,
-            ability::apply_on_tick_effects,
-            ability::apply_while_active_effects,
-            ability::apply_on_end_effects,
-            ability::apply_on_input_effects,
-            ability::ability_projectile_spawn,
-        )
-            .chain(),
-    );
-    app.add_systems(Update, ability::ability_bullet_lifetime);
+
+    // Run FixedUpdate exactly once per app.update() call
+    app.insert_resource(bevy::time::TimeUpdateStrategy::FixedTimesteps(1));
+
+    // Transition to AppState::Ready so ability systems' run conditions pass.
+    // Requires one update to process the state transition.
+    app.world_mut()
+        .resource_mut::<NextState<protocol::AppState>>()
+        .set(protocol::AppState::Ready);
+    app.update();
+
     app
 }
 
@@ -323,16 +462,19 @@ fn phase_startup_to_active() {
     insert_timeline(app.world_mut(), 100);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("punch".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Startup,
-        phase_start_tick: Tick(100),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("punch".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Startup,
+            phase_start_tick: Tick(100),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     advance_timeline(app.world_mut(), 4);
     app.update();
@@ -348,16 +490,19 @@ fn phase_active_to_recovery() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("punch3".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("punch3".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     advance_timeline(app.world_mut(), 6);
     app.update();
@@ -373,16 +518,19 @@ fn phase_recovery_completes() {
     insert_timeline(app.world_mut(), 300);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("dash".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Recovery,
-        phase_start_tick: Tick(300),
-        ability_slot: 1,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("dash".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Recovery,
+            phase_start_tick: Tick(300),
+            ability_slot: 1,
+            depth: 0,
+        },
+    );
 
     advance_timeline(app.world_mut(), 4);
     app.update();
@@ -455,9 +603,9 @@ fn on_hit_effects_dispatched_on_first_active_tick() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    let ability_entity = app
-        .world_mut()
-        .spawn(ActiveAbility {
+    let ability_entity = spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
             def_id: AbilityId("punch".into()),
             caster: char_entity,
             original_caster: char_entity,
@@ -466,8 +614,8 @@ fn on_hit_effects_dispatched_on_first_active_tick() {
             phase_start_tick: Tick(200),
             ability_slot: 0,
             depth: 0,
-        })
-        .id();
+        },
+    );
 
     app.update();
 
@@ -491,9 +639,9 @@ fn on_hit_effects_removed_on_recovery() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    let ability_entity = app
-        .world_mut()
-        .spawn(ActiveAbility {
+    let ability_entity = spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
             def_id: AbilityId("punch3".into()),
             caster: char_entity,
             original_caster: char_entity,
@@ -502,8 +650,8 @@ fn on_hit_effects_removed_on_recovery() {
             phase_start_tick: Tick(200),
             ability_slot: 0,
             depth: 0,
-        })
-        .id();
+        },
+    );
 
     // First update: dispatches markers (Active phase, tick 200)
     app.update();
@@ -513,7 +661,7 @@ fn on_hit_effects_removed_on_recovery() {
     advance_timeline(app.world_mut(), 6);
     app.update();
 
-    // Now in Recovery — OnHitEffects should be removed
+    // Now in Recovery -- OnHitEffects should be removed
     let active = app
         .world()
         .get::<ActiveAbility>(ability_entity)
@@ -531,16 +679,19 @@ fn melee_hitbox_entity_spawned() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("punch".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("punch".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     app.update();
 
@@ -561,16 +712,19 @@ fn hitbox_entity_has_correct_on_hit_effects() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("punch".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("punch".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     app.update();
 
@@ -595,33 +749,33 @@ fn on_end_effects_dispatched_on_active_to_recovery() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    // Add a test ability with OnEnd effects
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("dash_with_end".into()),
-            AbilityDef {
-                startup_ticks: 2,
-                active_ticks: 4,
-                recovery_ticks: 4,
-                cooldown_ticks: 32,
-                effects: vec![
-                    EffectTrigger::WhileActive(AbilityEffect::SetVelocity {
-                        speed: 15.0,
-                        target: EffectTarget::Caster,
-                    }),
-                    EffectTrigger::OnEnd(AbilityEffect::SetVelocity {
-                        speed: 0.0,
-                        target: EffectTarget::Caster,
-                    }),
-                ],
+    insert_test_ability(
+        &mut app,
+        "dash_with_end",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 2,
+                active: 4,
+                recovery: 4,
+                cooldown: 32,
             },
-        );
+            vec![],
+            vec![AbilityEffect::SetVelocity {
+                speed: 15.0,
+                target: EffectTarget::Caster,
+            }],
+            vec![],
+            vec![AbilityEffect::SetVelocity {
+                speed: 0.0,
+                target: EffectTarget::Caster,
+            }],
+            vec![],
+        ),
+    );
 
-    let ability_entity = app
-        .world_mut()
-        .spawn(ActiveAbility {
+    let ability_entity = spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
             def_id: AbilityId("dash_with_end".into()),
             caster: char_entity,
             original_caster: char_entity,
@@ -630,14 +784,14 @@ fn on_end_effects_dispatched_on_active_to_recovery() {
             phase_start_tick: Tick(200),
             ability_slot: 1,
             depth: 0,
-        })
-        .id();
+        },
+    );
 
-    // First tick: Active phase, no OnEndEffects yet
+    // First tick: Active phase. OnEndEffects is present as archetype component but
+    // apply_on_end_effects only fires on Recovery entry tick.
     app.update();
-    assert!(app.world().get::<OnEndEffects>(ability_entity).is_none());
 
-    // Advance past active_ticks (4 ticks) → triggers Active→Recovery
+    // Advance past active_ticks (4 ticks) -> triggers Active->Recovery
     advance_timeline(app.world_mut(), 4);
     app.update();
 
@@ -648,8 +802,7 @@ fn on_end_effects_dispatched_on_active_to_recovery() {
         .expect("ActiveAbility should still exist in Recovery");
     assert_eq!(active.phase, AbilityPhase::Recovery);
 
-    // OnEndEffects is consumed (removed) by apply_on_end_effects in the same tick,
-    // so we verify the effect was applied: velocity should be set to 0
+    // OnEndEffects was applied: velocity should be set to 0
     let velocity = app
         .world()
         .get::<avian3d::prelude::LinearVelocity>(char_entity)
@@ -668,37 +821,43 @@ fn sub_ability_spawned_on_cast() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    // Add a "chain_test" ability that spawns "punch" as a sub-ability on cast
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("chain_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![EffectTrigger::OnTick {
-                    tick: 0,
-                    effect: AbilityEffect::Ability {
-                        id: "punch".into(),
-                        target: EffectTarget::Caster,
-                    },
-                }],
+    insert_test_ability(
+        &mut app,
+        "chain_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Ability {
+                    id: "punch".into(),
+                    target: EffectTarget::Caster,
+                },
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("chain_test".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("chain_test".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     app.update();
 
@@ -719,42 +878,48 @@ fn sub_ability_depth_limited() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    // Add ability that tries to recurse
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("recurse".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![EffectTrigger::OnTick {
-                    tick: 0,
-                    effect: AbilityEffect::Ability {
-                        id: "punch".into(),
-                        target: EffectTarget::Caster,
-                    },
-                }],
+    insert_test_ability(
+        &mut app,
+        "recurse",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Ability {
+                    id: "punch".into(),
+                    target: EffectTarget::Caster,
+                },
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ),
+    );
 
-    // Spawn at depth 4 — should NOT spawn sub-ability
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("recurse".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 4,
-    });
+    // Spawn at depth 4 -- should NOT spawn sub-ability
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("recurse".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 4,
+        },
+    );
 
     app.update();
 
-    // Only the parent should exist — sub-ability blocked by depth limit
+    // Only the parent should exist -- sub-ability blocked by depth limit
     assert_eq!(count_active_abilities(app.world_mut()), 1);
     assert!(
         find_active_ability_for_def(app.world_mut(), "punch").is_none(),
@@ -770,16 +935,19 @@ fn sub_ability_phase_management() {
     let char_entity = spawn_character(app.world_mut());
 
     // Use punch3 which has recovery_ticks > 0 for a full phase cycle test
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("punch3".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Startup,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 1,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("punch3".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Startup,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 1,
+        },
+    );
 
     app.update();
 
@@ -788,7 +956,7 @@ fn sub_ability_phase_management() {
     assert_eq!(sub.phase, AbilityPhase::Startup);
     assert_eq!(sub.depth, 1);
 
-    // Advance 4 ticks: punch3 Startup (4 ticks) completes → Active
+    // Advance 4 ticks: punch3 Startup (4 ticks) completes -> Active
     advance_timeline(app.world_mut(), 4);
     app.update();
 
@@ -796,7 +964,7 @@ fn sub_ability_phase_management() {
         find_active_ability_for_def(app.world_mut(), "punch3").expect("punch3 should still exist");
     assert_eq!(sub.phase, AbilityPhase::Active);
 
-    // Advance 6 more ticks: punch3 Active (6 ticks) completes → Recovery
+    // Advance 6 more ticks: punch3 Active (6 ticks) completes -> Recovery
     advance_timeline(app.world_mut(), 6);
     app.update();
 
@@ -811,9 +979,9 @@ fn on_input_effects_dispatched_during_active() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    let ability_entity = app
-        .world_mut()
-        .spawn(ActiveAbility {
+    let ability_entity = spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
             def_id: AbilityId("punch".into()),
             caster: char_entity,
             original_caster: char_entity,
@@ -822,8 +990,8 @@ fn on_input_effects_dispatched_during_active() {
             phase_start_tick: Tick(200),
             ability_slot: 0,
             depth: 0,
-        })
-        .id();
+        },
+    );
 
     app.update();
 
@@ -843,15 +1011,16 @@ fn on_input_effects_dispatched_during_active() {
 }
 
 #[test]
-fn on_input_effects_removed_on_recovery() {
+fn on_input_effects_removed_on_despawn() {
     let mut app = test_app();
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    let ability_entity = app
-        .world_mut()
-        .spawn(ActiveAbility {
-            def_id: AbilityId("punch".into()),
+    // Use punch3 which has recovery_ticks=10 for a clean lifecycle
+    let ability_entity = spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("punch3".into()),
             caster: char_entity,
             original_caster: char_entity,
             target: char_entity,
@@ -859,39 +1028,40 @@ fn on_input_effects_removed_on_recovery() {
             phase_start_tick: Tick(200),
             ability_slot: 0,
             depth: 0,
-        })
-        .id();
+        },
+    );
 
-    // First update: Active phase, OnInputEffects dispatched
+    // First update: Active phase, OnTickEffects present from archetype
     app.update();
-    assert!(app.world().get::<OnInputEffects>(ability_entity).is_some());
-
-    // Advance past active_ticks (20 ticks for punch)
-    advance_timeline(app.world_mut(), 20);
-    app.update();
-
-    // punch has recovery_ticks=0, so it goes directly to despawn.
-    // OnInputEffects should no longer be present.
     assert!(
-        app.world().get::<OnInputEffects>(ability_entity).is_none(),
-        "OnInputEffects should be removed when leaving Active phase"
+        app.world().get::<OnTickEffects>(ability_entity).is_some(),
+        "archetype components should be present during Active phase"
+    );
+
+    // Advance past active_ticks (6 ticks for punch3) -> Recovery
+    advance_timeline(app.world_mut(), 6);
+    app.update();
+
+    let active = app
+        .world()
+        .get::<ActiveAbility>(ability_entity)
+        .expect("should be in Recovery");
+    assert_eq!(active.phase, AbilityPhase::Recovery);
+
+    // Advance past recovery_ticks (10 ticks) -> despawn
+    advance_timeline(app.world_mut(), 10);
+    app.update();
+
+    // Entity should be despawned; cleanup observer removes archetype components
+    assert!(
+        app.world().get_entity(ability_entity).is_err(),
+        "Ability entity should be despawned after recovery completes"
     );
 }
 
 fn test_app_with_hit_detection() -> App {
-    let mut app = test_app();
-    app.add_systems(
-        Update,
-        (
-            hit_detection::update_hitbox_positions,
-            hit_detection::process_hitbox_hits,
-            hit_detection::process_projectile_hits,
-            hit_detection::cleanup_hitbox_entities,
-        )
-            .chain()
-            .after(ability::apply_on_tick_effects),
-    );
-    app
+    // AbilityPlugin already registers hit detection systems
+    test_app()
 }
 
 fn spawn_target(world: &mut World, pos: Vec3) -> Entity {
@@ -914,46 +1084,50 @@ fn aoe_hitbox_damages_target() {
     let caster = spawn_character(app.world_mut());
     let target = spawn_target(app.world_mut(), Vec3::new(3.0, 0.0, 0.0));
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("aoe_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 1,
-                recovery_ticks: 4,
-                cooldown_ticks: 0,
-                effects: vec![
-                    EffectTrigger::OnTick {
-                        tick: 0,
-                        effect: AbilityEffect::AreaOfEffect {
-                            id: None,
-                            target: EffectTarget::Caster,
-                            radius: 5.0,
-                            duration_ticks: None,
-                        },
-                    },
-                    EffectTrigger::OnHit(AbilityEffect::Damage {
-                        amount: 25.0,
-                        target: EffectTarget::Victim,
-                    }),
-                ],
+    insert_test_ability(
+        &mut app,
+        "aoe_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 1,
+                recovery: 4,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::AreaOfEffect {
+                    id: None,
+                    target: EffectTarget::Caster,
+                    radius: 5.0,
+                    duration_ticks: None,
+                },
+            }],
+            vec![],
+            vec![AbilityEffect::Damage {
+                amount: 25.0,
+                target: EffectTarget::Victim,
+            }],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("aoe_test".into()),
-        caster,
-        original_caster: caster,
-        target: caster,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("aoe_test".into()),
+            caster,
+            original_caster: caster,
+            target: caster,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
-    // Update 1: dispatch markers + spawn AoE hitbox entity
+    // Update 1: spawn AoE hitbox entity
     app.update();
 
     // Simulate physics: populate CollidingEntities on the hitbox with the target
@@ -969,7 +1143,7 @@ fn aoe_hitbox_damages_target() {
         .unwrap()
         .insert(target);
 
-    // Advance timeline: ability will transition Active → Recovery
+    // Advance timeline: ability will transition Active -> Recovery
     advance_timeline(app.world_mut(), 1);
 
     // Update 2: hit detection should process the collision BEFORE cleanup despawns the hitbox
@@ -989,33 +1163,40 @@ fn teleport_moves_caster() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("teleport_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![EffectTrigger::OnTick {
-                    tick: 0,
-                    effect: AbilityEffect::Teleport { distance: 10.0 },
-                }],
+    insert_test_ability(
+        &mut app,
+        "teleport_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Teleport { distance: 10.0 },
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("teleport_test".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("teleport_test".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     app.update();
 
@@ -1050,44 +1231,48 @@ fn shield_absorbs_damage() {
         ))
         .id();
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("shield_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![
-                    EffectTrigger::OnTick {
-                        tick: 0,
-                        effect: AbilityEffect::Melee {
-                            id: None,
-                            target: EffectTarget::Caster,
-                        },
-                    },
-                    EffectTrigger::OnHit(AbilityEffect::Damage {
-                        amount: 30.0,
-                        target: EffectTarget::Victim,
-                    }),
-                ],
+    insert_test_ability(
+        &mut app,
+        "shield_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Melee {
+                    id: None,
+                    target: EffectTarget::Caster,
+                },
+            }],
+            vec![],
+            vec![AbilityEffect::Damage {
+                amount: 30.0,
+                target: EffectTarget::Victim,
+            }],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("shield_test".into()),
-        caster,
-        original_caster: caster,
-        target: caster,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("shield_test".into()),
+            caster,
+            original_caster: caster,
+            target: caster,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
-    // First update: dispatch markers, spawn hitbox
+    // First update: spawn hitbox
     app.update();
 
     let hitbox_entity = app
@@ -1136,42 +1321,46 @@ fn shield_overflow_damages_health() {
         ))
         .id();
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("shield_overflow_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![
-                    EffectTrigger::OnTick {
-                        tick: 0,
-                        effect: AbilityEffect::Melee {
-                            id: None,
-                            target: EffectTarget::Caster,
-                        },
-                    },
-                    EffectTrigger::OnHit(AbilityEffect::Damage {
-                        amount: 50.0,
-                        target: EffectTarget::Victim,
-                    }),
-                ],
+    insert_test_ability(
+        &mut app,
+        "shield_overflow_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Melee {
+                    id: None,
+                    target: EffectTarget::Caster,
+                },
+            }],
+            vec![],
+            vec![AbilityEffect::Damage {
+                amount: 50.0,
+                target: EffectTarget::Victim,
+            }],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("shield_overflow_test".into()),
-        caster,
-        original_caster: caster,
-        target: caster,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("shield_overflow_test".into()),
+            caster,
+            original_caster: caster,
+            target: caster,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     app.update();
 
@@ -1189,7 +1378,7 @@ fn shield_overflow_damages_health() {
 
     app.update();
 
-    // Shield depleted → removed
+    // Shield depleted -> removed
     assert!(
         app.world().get::<ActiveShield>(target).is_none(),
         "Shield should be removed after being fully depleted"
@@ -1209,38 +1398,45 @@ fn buff_inserted_on_target() {
     insert_timeline(app.world_mut(), 200);
     let char_entity = spawn_character(app.world_mut());
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("buff_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![EffectTrigger::OnTick {
-                    tick: 0,
-                    effect: AbilityEffect::Buff {
-                        stat: "speed".into(),
-                        multiplier: 1.5,
-                        duration_ticks: 100,
-                        target: EffectTarget::Caster,
-                    },
-                }],
+    insert_test_ability(
+        &mut app,
+        "buff_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Buff {
+                    stat: "speed".into(),
+                    multiplier: 1.5,
+                    duration_ticks: 100,
+                    target: EffectTarget::Caster,
+                },
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("buff_test".into()),
-        caster: char_entity,
-        original_caster: char_entity,
-        target: char_entity,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("buff_test".into()),
+            caster: char_entity,
+            original_caster: char_entity,
+            target: char_entity,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
     app.update();
 
@@ -1304,44 +1500,48 @@ fn buff_increases_damage() {
 
     let target = spawn_target(app.world_mut(), Vec3::new(1.0, 0.0, 0.0));
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("buff_dmg_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 4,
-                recovery_ticks: 2,
-                cooldown_ticks: 0,
-                effects: vec![
-                    EffectTrigger::OnTick {
-                        tick: 0,
-                        effect: AbilityEffect::Melee {
-                            id: None,
-                            target: EffectTarget::Caster,
-                        },
-                    },
-                    EffectTrigger::OnHit(AbilityEffect::Damage {
-                        amount: 10.0,
-                        target: EffectTarget::Victim,
-                    }),
-                ],
+    insert_test_ability(
+        &mut app,
+        "buff_dmg_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 4,
+                recovery: 2,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::Melee {
+                    id: None,
+                    target: EffectTarget::Caster,
+                },
+            }],
+            vec![],
+            vec![AbilityEffect::Damage {
+                amount: 10.0,
+                target: EffectTarget::Victim,
+            }],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("buff_dmg_test".into()),
-        caster,
-        original_caster: caster,
-        target: caster,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("buff_dmg_test".into()),
+            caster,
+            original_caster: caster,
+            target: caster,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
-    // First update: dispatch markers, spawn hitbox
+    // First update: spawn hitbox
     app.update();
 
     let hitbox_entity = app
@@ -1396,47 +1596,51 @@ fn run_force_test(
         .unwrap()
         .0 = target_rotation;
 
-    app.world_mut()
-        .resource_mut::<AbilityDefs>()
-        .abilities
-        .insert(
-            AbilityId("force_test".into()),
-            AbilityDef {
-                startup_ticks: 0,
-                active_ticks: 1,
-                recovery_ticks: 4,
-                cooldown_ticks: 0,
-                effects: vec![
-                    EffectTrigger::OnTick {
-                        tick: 0,
-                        effect: AbilityEffect::AreaOfEffect {
-                            id: None,
-                            target: EffectTarget::Caster,
-                            radius: 10.0,
-                            duration_ticks: None,
-                        },
-                    },
-                    EffectTrigger::OnHit(AbilityEffect::ApplyForce {
-                        force,
-                        frame,
-                        target: EffectTarget::Victim,
-                    }),
-                ],
+    insert_test_ability(
+        &mut app,
+        "force_test",
+        build_ability_asset(
+            AbilityPhases {
+                startup: 0,
+                active: 1,
+                recovery: 4,
+                cooldown: 0,
             },
-        );
+            vec![TickEffect {
+                tick: 0,
+                effect: AbilityEffect::AreaOfEffect {
+                    id: None,
+                    target: EffectTarget::Caster,
+                    radius: 10.0,
+                    duration_ticks: None,
+                },
+            }],
+            vec![],
+            vec![AbilityEffect::ApplyForce {
+                force,
+                frame,
+                target: EffectTarget::Victim,
+            }],
+            vec![],
+            vec![],
+        ),
+    );
 
-    app.world_mut().spawn(ActiveAbility {
-        def_id: AbilityId("force_test".into()),
-        caster,
-        original_caster: caster,
-        target: caster,
-        phase: AbilityPhase::Active,
-        phase_start_tick: Tick(200),
-        ability_slot: 0,
-        depth: 0,
-    });
+    spawn_test_active_ability(
+        &mut app,
+        ActiveAbility {
+            def_id: AbilityId("force_test".into()),
+            caster,
+            original_caster: caster,
+            target: caster,
+            phase: AbilityPhase::Active,
+            phase_start_tick: Tick(200),
+            ability_slot: 0,
+            depth: 0,
+        },
+    );
 
-    // Update 1: dispatch markers + spawn AoE hitbox
+    // Update 1: spawn AoE hitbox
     app.update();
 
     let hitbox_entity = app
@@ -1453,7 +1657,7 @@ fn run_force_test(
 
     advance_timeline(app.world_mut(), 1);
 
-    // Update 2: process hit → apply force
+    // Update 2: process hit -> apply force
     app.update();
 
     app.world()
@@ -1464,7 +1668,7 @@ fn run_force_test(
 
 #[test]
 fn force_frame_world() {
-    // Caster and victim have arbitrary rotations — World frame ignores both.
+    // Caster and victim have arbitrary rotations -- World frame ignores both.
     let vel = run_force_test(
         Vec3::new(1.0, 0.0, 0.0),
         ForceFrame::World,
@@ -1481,7 +1685,7 @@ fn force_frame_world() {
 
 #[test]
 fn force_frame_caster() {
-    // Caster rotated 90° around Y: local +X maps to world -Z.
+    // Caster rotated 90 deg around Y: local +X maps to world -Z.
     let vel = run_force_test(
         Vec3::new(1.0, 0.0, 0.0),
         ForceFrame::Caster,
@@ -1498,7 +1702,7 @@ fn force_frame_caster() {
 
 #[test]
 fn force_frame_victim() {
-    // Victim rotated 90° around Y: local +X maps to world -Z.
+    // Victim rotated 90 deg around Y: local +X maps to world -Z.
     let vel = run_force_test(
         Vec3::new(1.0, 0.0, 0.0),
         ForceFrame::Victim,
@@ -1515,8 +1719,8 @@ fn force_frame_victim() {
 
 #[test]
 fn force_frame_relative_position() {
-    // Victim directly in +X from source. The RelativePosition frame maps +Z → world +X.
-    // Force (0, 0, 1) = "push toward victim" → world +X.
+    // Victim directly in +X from source. The RelativePosition frame maps +Z -> world +X.
+    // Force (0, 0, 1) = "push toward victim" -> world +X.
     let vel = run_force_test(
         Vec3::new(0.0, 0.0, 1.0),
         ForceFrame::RelativePosition,
@@ -1527,14 +1731,14 @@ fn force_frame_relative_position() {
     assert_vec3_approx(
         vel,
         Vec3::new(1.0, 0.0, 0.0),
-        "RelativePosition: +Z maps to caster→victim direction",
+        "RelativePosition: +Z maps to caster->victim direction",
     );
 }
 
 #[test]
 fn force_frame_relative_rotation() {
-    // Caster identity, victim 90°Y: relative = victim * caster.inverse() = 90°Y.
-    // 90°Y * Vec3::X = Vec3::NEG_Z.
+    // Caster identity, victim 90 deg Y: relative = victim * caster.inverse() = 90 deg Y.
+    // 90 deg Y * Vec3::X = Vec3::NEG_Z.
     let vel = run_force_test(
         Vec3::new(1.0, 0.0, 0.0),
         ForceFrame::RelativeRotation,
@@ -1546,5 +1750,115 @@ fn force_frame_relative_rotation() {
         vel,
         Vec3::new(0.0, 0.0, -1.0),
         "RelativeRotation: victim_rot * caster_rot.inverse() * force",
+    );
+}
+
+#[test]
+fn archetype_loads_from_ron_bytes() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.add_plugins(AssetPlugin::default());
+    app.register_type::<AbilityPhases>()
+        .register_type::<OnTickEffects>()
+        .register_type::<TickEffect>()
+        .register_type::<WhileActiveEffects>()
+        .register_type::<OnHitEffectDefs>()
+        .register_type::<OnEndEffects>()
+        .register_type::<OnInputEffects>()
+        .register_type::<InputEffect>()
+        .register_type::<AbilityEffect>()
+        .register_type::<EffectTarget>()
+        .register_type::<ForceFrame>();
+
+    let registry = app.world().resource::<AppTypeRegistry>().0.clone();
+    let reg = registry.read();
+
+    let ron_bytes = br#"
+    {
+        "protocol::ability::AbilityPhases": (startup: 4, active: 20, recovery: 0, cooldown: 16),
+        "protocol::ability::OnTickEffects": ([(tick: 0, effect: Melee())]),
+        "protocol::ability::OnHitEffectDefs": ([
+            Damage(amount: 5.0, target: Victim),
+        ]),
+        "protocol::ability::WhileActiveEffects": ([
+            SetVelocity(speed: 15.0, target: Caster),
+        ]),
+    }
+    "#;
+
+    let components = protocol::reflect_loader::deserialize_component_map(ron_bytes, &reg).unwrap();
+    drop(reg);
+
+    assert_eq!(components.len(), 4);
+
+    // Apply to entity and verify
+    let entity = app.world_mut().spawn_empty().id();
+    let reg = registry.read();
+    let mut entity_mut = app.world_mut().entity_mut(entity);
+    for component in &components {
+        let type_path = component.reflect_type_path();
+        let registration = reg.get_with_type_path(type_path).unwrap();
+        let reflect_component = registration.data::<ReflectComponent>().unwrap();
+        reflect_component.insert(&mut entity_mut, component.as_ref(), &reg);
+    }
+    drop(reg);
+
+    let phases = app.world().get::<AbilityPhases>(entity).unwrap();
+    assert_eq!(phases.startup, 4);
+    assert_eq!(phases.active, 20);
+    assert_eq!(phases.recovery, 0);
+    assert_eq!(phases.cooldown, 16);
+
+    let on_tick = app.world().get::<OnTickEffects>(entity).unwrap();
+    assert_eq!(on_tick.0.len(), 1);
+    assert_eq!(on_tick.0[0].tick, 0);
+
+    let while_active = app.world().get::<WhileActiveEffects>(entity).unwrap();
+    assert_eq!(while_active.0.len(), 1);
+
+    let on_hit = app.world().get::<OnHitEffectDefs>(entity).unwrap();
+    assert_eq!(on_hit.0.len(), 1);
+}
+
+#[test]
+fn archetype_ability_full_lifecycle() {
+    let mut app = test_app();
+    let world = app.world_mut();
+    insert_timeline(world, 0);
+    let character = spawn_character(world);
+
+    world
+        .get_mut::<ActionState<PlayerActions>>(character)
+        .unwrap()
+        .press(&PlayerActions::Ability1);
+    app.update();
+
+    let (ability_entity, active) = find_active_ability(app.world_mut()).unwrap();
+    assert_eq!(active.phase, AbilityPhase::Startup);
+
+    // Verify archetype components are present from spawn
+    assert!(app.world().get::<AbilityPhases>(ability_entity).is_some());
+    assert!(app.world().get::<OnTickEffects>(ability_entity).is_some());
+    assert!(app.world().get::<OnHitEffectDefs>(ability_entity).is_some());
+    assert!(app.world().get::<OnInputEffects>(ability_entity).is_some());
+
+    // Advance through startup to active phase (punch has 4 startup ticks)
+    for _ in 0..4 {
+        advance_timeline(app.world_mut(), 1);
+        app.update();
+    }
+
+    let (_, active) = find_active_ability(app.world_mut()).unwrap();
+    assert_eq!(active.phase, AbilityPhase::Active);
+
+    // MeleeHitbox should have spawned on first Active tick
+    let hitbox_count = app
+        .world_mut()
+        .query::<&MeleeHitbox>()
+        .iter(app.world())
+        .count();
+    assert_eq!(
+        hitbox_count, 1,
+        "melee hitbox should spawn on first Active tick"
     );
 }

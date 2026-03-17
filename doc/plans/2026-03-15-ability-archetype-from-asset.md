@@ -1425,8 +1425,8 @@ fn archetype_ability_full_lifecycle() {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All tests pass: `cargo test-all`
-- [ ] New integration tests pass
+- [x] All tests pass: `cargo test-all`
+- [x] New integration tests pass
 
 ---
 
