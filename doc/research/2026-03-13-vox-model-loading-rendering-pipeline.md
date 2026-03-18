@@ -302,7 +302,6 @@ WASM does not have file watching, but the asset system still supports programmat
 ## Related Research
 
 - [doc/research/2026-03-13-vox-loading-without-scenes.md](doc/research/2026-03-13-vox-loading-without-scenes.md) — Earlier research on dot_vox vs bevy_vox_scene
-- [doc/research/2026-03-12-streaming-ron-assets-to-web-clients.md](doc/research/2026-03-12-streaming-ron-assets-to-web-clients.md) — Web asset streaming patterns
 
 ## Design Decisions
 
