@@ -10,3 +10,4 @@
 - meaningful proc gen terrain
 - composable Character templates that are loadable Asset files. Character template asset files are composed of other ron asset files
 - /spec:find-rules
+- monocraft ui font
