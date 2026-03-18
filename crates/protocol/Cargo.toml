@@ -8,12 +8,15 @@ test_utils = []
 
 [dependencies]
 avian3d = { workspace = true, features = ["serialize"] }
-bevy = { workspace = true, features = ["bevy_color", "bevy_state", "bevy_asset"] }
+bevy = { workspace = true, features = ["bevy_color", "bevy_state", "bevy_asset", "bevy_mesh", "bevy_render"] }
 voxel_map_engine = { workspace = true }
 leafwing-input-manager = { workspace = true }
 lightyear = { workspace = true, features = ["avian3d", "leafwing"] }
 ron = { workspace = true }
 bevy_common_assets = { workspace = true }
+dot_vox = { workspace = true }
+ndshape = { path = "../../git/ndshape-rs" }
+block-mesh = { path = "../../git/block-mesh-rs" }
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]

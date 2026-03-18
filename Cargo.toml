@@ -40,6 +40,7 @@ lightyear_replication = { git = "https://github.com/AdamWhitehurst/lightyear", b
 protocol = { path = "crates/protocol" }
 ron = "0.12"
 bevy_common_assets = { version = "0.15", features = ["ron"] }
+dot_vox = "5"
 serde = "1.0"
 
 # WASM-specific dependencies

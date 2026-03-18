@@ -13,6 +13,7 @@ pub mod hit_detection;
 pub mod map;
 pub mod physics;
 pub mod reflect_loader;
+pub mod vox_model;
 pub mod world_object;
 
 pub use ability::{

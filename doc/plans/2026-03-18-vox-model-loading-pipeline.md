@@ -28,8 +28,7 @@ Build the pipeline that turns `.vox` files into rendered, collidable meshes in-g
 - Collider generation from vox mesh (trimesh) with fallback to RON `ColliderConstructor`
 
 ### Key Discoveries:
-- `block-mesh-rs` is a local git dependency at `git/block-mesh-rs` ([Cargo.toml:56-57](Cargo.toml#L56-L57))
-%% [VIOLATION] Coherence — Cargo.toml:56-57 shows ndshape and ndcopy patches, not block-mesh-rs. Actual location: crates/voxel_map_engine/Cargo.toml:11 as path dependency.
+- `block-mesh-rs` is a local git dependency at `git/block-mesh-rs` (used as path dependency in crate Cargo.toml files)
 - `ndshape` is also local at `git/ndshape-rs`, patched in workspace `[patch.crates-io]`
 - The meshing loop in `mesh_chunk_greedy` uses `ConstShape` — vox models need `RuntimeShape` since dimensions vary per model
 - `MergeVoxel::MergeValue = u8` (palette index) — greedy meshing won't merge faces with different palette indices, which is correct for vertex colors
@@ -312,10 +311,10 @@ fn srgb_to_linear(c: u8) -> f32 {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` passes
+- [x] `cargo check-all` passes
 
 #### Manual Verification:
-- [ ] Unit test: create a tiny 2x2x2 `dot_vox::Model` programmatically, call `mesh_vox_model`, verify mesh has expected vertex count and colors
+- [x] Unit test: create a tiny 2x2x2 `dot_vox::Model` programmatically, call `mesh_vox_model`, verify mesh has expected vertex count and colors
 
 ---
 
