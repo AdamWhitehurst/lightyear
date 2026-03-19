@@ -449,13 +449,18 @@ impl Plugin for TerrainPlugin {
         app.init_asset_loader::<TerrainDefLoader>();
         // Type registrations for terrain components are already done in VoxelPlugin.
         // TerrainPlugin only handles the asset pipeline.
-        app.add_systems(Startup, load_terrain_defs);
+        app.add_systems(Startup, loading::load_terrain_defs);
         app.add_systems(Update,
-            insert_terrain_defs.run_if(not(resource_exists::<TerrainDefRegistry>)),
-      %% Where are insert_terrain_defs and load_terrain_defs defined?
+            loading::insert_terrain_defs.run_if(not(resource_exists::<TerrainDefRegistry>)),
         );
     }
 }
+```
+
+Both functions are defined in `crates/protocol/src/terrain/loading.rs` (section 5 above). They follow the same pattern as `world_object/loading.rs`:
+
+- `load_terrain_defs`: Startup system. Native: `asset_server.load_folder("terrain")` + add to `TrackedAssets`. WASM: load `terrain.manifest.ron`, then individual files.
+- `insert_terrain_defs`: Update system gated by `not(resource_exists::<TerrainDefRegistry>)`. Waits for all terrain assets to load, then collects them into `TerrainDefRegistry` using `terrain_id_from_path` (strips `.terrain.ron` suffix from filename).
 ```
 
 #### 7. Register module in protocol
@@ -550,10 +555,24 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
     let height = entity.get::<HeightMap>().cloned();
     let moisture = entity.get::<MoistureMap>().cloned();
     let biomes = entity.get::<BiomeRules>().cloned();
-  %% We should add `debug_assert!`s to enforce expectations like: biome rules must exist if moisture specified, or shouldn't have biomes, mositure if no heightmap
+
+    // Validate component combinations.
+    debug_assert!(
+        moisture.is_none() || height.is_some(),
+        "MoistureMap without HeightMap is meaningless — moisture is only sampled during heightmap generation"
+    );
+    debug_assert!(
+        biomes.is_none() || height.is_some(),
+        "BiomeRules without HeightMap is meaningless — biome selection requires terrain height"
+    );
+    debug_assert!(
+        moisture.is_some() || biomes.is_none(),
+        "BiomeRules without MoistureMap: biome selection needs moisture values. \
+         Use a MoistureMap or remove BiomeRules (defaults to Solid(0))"
+    );
 
     match height {
-        Some(h) => Arc::new(move |chunk_pos| {
+        Some(h) => VoxelGenerator(Arc::new(move |chunk_pos| {
             generate_heightmap_chunk(
                 chunk_pos,
                 seed,
@@ -561,8 +580,8 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
                 moisture.as_ref(),
                 biomes.as_ref(),
             )
-        }),
-        None => Arc::new(flat_terrain_voxels),
+        })),
+        None => VoxelGenerator(Arc::new(flat_terrain_voxels)),
     }
 }
 ```
@@ -574,68 +593,94 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
 2. Apply terrain components onto the map entity via `apply_object_components`
 3. Build generator from the entity's terrain components
 
-The flow changes from:
-```rust
-// Before
-let config = VoxelMapConfig::new(..., Arc::new(flat_terrain_voxels));
-```
-To:
-```rust
-// After
-// 1. Spawn entity with placeholder generator
-let config = VoxelMapConfig::new(..., Arc::new(flat_terrain_voxels));
-let entity = commands.spawn((VoxelMapInstance::new(5), config, ...)).id();
-%% Why do we need a placeholder entity with a placeholder config?
-%% Should VoxelMapConfig contain the generator at all? Why not make the VoxelGenerator its own component and eliminate the need for `NeedsGeneratorBuild`, because systems can check e.g. `Without<VoxelGenerator>`?
+**Architectural change**: Move `generator` out of `VoxelMapConfig` and make `VoxelGenerator` itself a component. This eliminates the need for placeholder generators and `NeedsGeneratorBuild` entirely — systems simply check `Without<VoxelGenerator>` to skip maps that don't have a generator yet.
 
-// 2. Apply terrain def components
-let terrain_def = terrain_registry.get("overworld").expect("overworld terrain must be loaded");
-apply_object_components(&mut commands, entity, terrain_def.components.clone(), type_registry.0.clone());
+**File**: `crates/voxel_map_engine/src/config.rs`
+**Changes**: Remove `generator` field from `VoxelMapConfig`. Change `VoxelGenerator` from a type alias to a component:
 
-// 3. In a follow-up system (one frame later), build the real generator
+```rust
+/// The chunk generation function for a map instance.
+///
+/// Separate component from `VoxelMapConfig` so maps can exist without a
+/// generator while terrain components are being applied (deferred commands).
+#[derive(Component, Clone)]
+pub struct VoxelGenerator(pub Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync>);
 ```
 
-**Problem**: `apply_object_components` defers insertion via `commands.queue()`. The entity won't have terrain components until the next command flush. The generator cannot be built in the same system call.
+Remove the `generator` parameter from `VoxelMapConfig::new`. Update all code that reads `config.generator` to query `VoxelGenerator` instead. Call sites change from `(generator)(pos)` to `(generator.0)(pos)`.
 
-**Solution**: Use a two-phase approach with a marker component:
-%% Can we chain the systems and apply commands in-between the two systems somehow to avoid the 1 frame delay?
+**Why**: `apply_object_components` defers insertion via `commands.queue()`, so terrain components aren't available until the next command flush. By making the generator a separate component, we split map spawning into two natural steps:
+1. `spawn_overworld`: Spawns entity with `VoxelMapConfig` + terrain components (deferred). No generator yet.
+2. `build_terrain_generators` system: Queries entities with terrain components but `Without<VoxelGenerator>`. Calls `build_generator`, inserts `VoxelGenerator`.
+
+Lifecycle systems (`ensure_pending_chunks`, `update_chunks`) already need to query the generator — they simply add `With<VoxelGenerator>` to their query filter. No placeholder, no marker component, no wasted frame.
+
+**Command flush timing**: Insert `apply_deferred` between `build_terrain_generators` and the lifecycle chain to ensure terrain components are flushed before the generator build runs in the same frame:
 
 ```rust
-/// Marker: this map entity needs its generator built from terrain components.
-#[derive(Component)]
-pub struct NeedsGeneratorBuild;
+// In ServerMapPlugin system registration:
+app.add_systems(Update, (
+    build_terrain_generators,
+    apply_deferred,
+    // ... existing VoxelPlugin lifecycle chain ...
+).chain());
 ```
 
-Phase A (`spawn_overworld`): Spawn with `flat_terrain_voxels` placeholder + `NeedsGeneratorBuild`. Apply terrain def via `apply_object_components`.
+Or, since `VoxelPlugin` registers its own lifecycle chain, the server plugin adds `build_terrain_generators` to run before `VoxelPlugin`'s systems with an `apply_deferred` barrier between them. The exact ordering depends on how system sets are structured — the key invariant is: `apply_object_components` flush → `build_terrain_generators` → chunk lifecycle.
 
-Phase B (new system `build_terrain_generators`): Runs in `Update`, queries for `(Entity, &mut VoxelMapConfig, &VoxelMapInstance)` with `With<NeedsGeneratorBuild>`. Reads terrain components from the entity via `EntityRef`, calls `build_generator`, replaces `config.generator`, removes `NeedsGeneratorBuild`.
+**Flow**:
 
 ```rust
+// spawn_overworld (Startup):
+let config = VoxelMapConfig::new(seed, generation_version, 2, None, 5);
+// No generator field — VoxelMapConfig is just config data now.
+
+let map = commands.spawn((
+    VoxelMapInstance::new(5), config, Transform::default(), MapInstanceId::Overworld,
+)).id();
+
+if let Some(terrain_def) = terrain_registry.get("overworld") {
+    apply_object_components(&mut commands, map, terrain_def.components.clone(), type_registry.0.clone());
+}
+// No VoxelGenerator yet. Lifecycle systems skip this entity.
+
+// build_terrain_generators (Update, runs after apply_deferred):
 fn build_terrain_generators(
     mut commands: Commands,
+    query: Query<(Entity, &VoxelMapConfig), (
+        With<VoxelMapInstance>,
+        Without<VoxelGenerator>,
+    )>,
     world: &World,
-    mut query: Query<(Entity, &mut VoxelMapConfig), With<NeedsGeneratorBuild>>,
 ) {
-    for (entity, mut config) in &mut query {
+    for (entity, config) in &query {
         let entity_ref = world.entity(entity);
-        config.generator = build_generator(entity_ref, config.seed);
-        commands.entity(entity).remove::<NeedsGeneratorBuild>();
+        let generator = build_generator(entity_ref, config.seed);
+        commands.entity(entity).insert(VoxelGenerator(generator));
         info!("Built terrain generator for map entity {entity:?}");
     }
 }
 ```
 
-**Timing**: The `NeedsGeneratorBuild` marker ensures no chunks are generated with the placeholder. The `update_chunks` system (which spawns generation tasks) runs after `build_terrain_generators` in the chain, so the first chunk generation uses the real generator. Alternatively, `ensure_pending_chunks` could skip inserting `PendingChunks` while `NeedsGeneratorBuild` is present — this is cleaner:
+**Lifecycle gating**: In `ensure_pending_chunks`, add `With<VoxelGenerator>` filter:
 
 ```rust
-// In ensure_pending_chunks: skip entities that still need generator build
 fn ensure_pending_chunks(
     mut commands: Commands,
-    query: Query<Entity, (With<VoxelMapInstance>, Without<PendingChunks>, Without<NeedsGeneratorBuild>)>,
+    query: Query<Entity, (With<VoxelMapInstance>, With<VoxelGenerator>, Without<PendingChunks>)>,
 ) { ... }
 ```
 
-This approach is cleaner because it naturally gates chunk generation behind terrain setup completion, without requiring system ordering guarantees.
+Maps without a generator simply don't start loading chunks — clean and explicit.
+
+**Files that need updating for `generator` field removal**:
+- `config.rs`: Remove field, remove from `new()` params
+- `generation.rs`: `spawn_chunk_gen_task` takes `&VoxelGenerator` — call sites pass `&generator.0` or destructure
+- `lifecycle.rs`: `spawn_missing_chunks` queries `&VoxelGenerator` as a component instead of reading from config
+- `instance.rs`: `overworld()`, `homebase()`, `arena()` constructors no longer take `generator` param
+- `server/src/map.rs`: All map spawn sites drop the generator arg from `VoxelMapConfig::new`
+- `client/src/map.rs`: `generator_for_map` returns `VoxelGenerator(Arc::new(flat_terrain_voxels))` to insert as a component
+- Existing tests that construct `VoxelMapConfig` with a generator param
 
 #### 3. Modify `spawn_overworld`
 **File**: `crates/server/src/map.rs`
@@ -878,9 +923,92 @@ The `poisson_disk_2d` function implements Bridson's algorithm:
 /// Returns a list of (x, z) points within [0, width) × [0, height) with
 /// minimum spacing `r` between any two points.
 fn poisson_disk_2d(r: f64, width: f64, height: f64, seed: u64) -> Vec<(f64, f64)> {
-    // ... ~50 lines implementing the standard algorithm ...
-    // Uses a simple LCG seeded from `seed` for determinism.
-  %% Elaborate on the actual code for this
+    const K: usize = 30; // candidates per active point
+
+    let cell_size = r / std::f64::consts::SQRT_2;
+    let grid_w = (width / cell_size).ceil() as usize;
+    let grid_h = (height / cell_size).ceil() as usize;
+    let mut grid: Vec<Option<usize>> = vec![None; grid_w * grid_h];
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    let mut active: Vec<usize> = Vec::new();
+    let mut rng = LcgRng::new(seed);
+
+    // Seed point
+    let first = (rng.next_f64() * width, rng.next_f64() * height);
+    let gi = (first.0 / cell_size) as usize;
+    let gj = (first.1 / cell_size) as usize;
+    grid[gj * grid_w + gi] = Some(0);
+    points.push(first);
+    active.push(0);
+
+    while let Some(&active_idx) = active.last() {
+        let (px, py) = points[active_idx];
+        let mut found = false;
+
+        for _ in 0..K {
+            let angle = rng.next_f64() * std::f64::consts::TAU;
+            let dist = r + rng.next_f64() * r; // uniform in [r, 2r]
+            let nx = px + angle.cos() * dist;
+            let ny = py + angle.sin() * dist;
+
+            if nx < 0.0 || nx >= width || ny < 0.0 || ny >= height {
+                continue;
+            }
+
+            let gi = (nx / cell_size) as usize;
+            let gj = (ny / cell_size) as usize;
+
+            // Check 5×5 neighborhood in grid
+            let mut too_close = false;
+            for di in 0..5usize {
+                for dj in 0..5usize {
+                    let ni = gi.wrapping_add(di).wrapping_sub(2);
+                    let nj = gj.wrapping_add(dj).wrapping_sub(2);
+                    if ni >= grid_w || nj >= grid_h { continue; }
+                    if let Some(idx) = grid[nj * grid_w + ni] {
+                        let (qx, qy) = points[idx];
+                        let dx = nx - qx;
+                        let dy = ny - qy;
+                        if dx * dx + dy * dy < r * r {
+                            too_close = true;
+                            break;
+                        }
+                    }
+                }
+                if too_close { break; }
+            }
+
+            if !too_close {
+                let new_idx = points.len();
+                grid[gj * grid_w + gi] = Some(new_idx);
+                points.push((nx, ny));
+                active.push(new_idx);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            active.pop();
+        }
+    }
+    points
+}
+
+/// Minimal deterministic LCG (linear congruential generator).
+struct LcgRng(u64);
+
+impl LcgRng {
+    fn new(seed: u64) -> Self { Self(seed) }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
 }
 ```
 
@@ -1025,10 +1153,11 @@ pub struct ChunkEntity {
     pub object_id: String,
     /// Current world-space position.
     pub position: Vec3,
-    /// Whether this object has been destroyed.
-    pub destroyed: bool,
-    /// Component overrides from baseline definition.
-    /// Key: type path, Value: RON-serialized component data.
+    /// Component overrides from baseline `WorldObjectDef`.
+    /// Key: fully-qualified type path, Value: RON-serialized component data.
+    /// On load: spawn from def baseline, then deserialize+apply each override.
+    /// Dead objects have `Health { current: 0.0, ... }` in overrides — no separate
+    /// `destroyed` flag needed.
     pub component_overrides: HashMap<String, String>,
 }
 
@@ -1093,13 +1222,14 @@ fn spawn_chunk_world_objects(
             });
 
             match persisted_entry {
-                Some(entry) if entry.destroyed => continue, // skip destroyed
                 Some(entry) => {
-                    // Spawn with overridden position/components
+                    // Spawn from def baseline, then apply persisted overrides.
+                    // If Health.current == 0, the entity spawns "dead" and the
+                    // respawn timer system handles it normally.
                     spawn_with_overrides(&mut commands, entry, &defs, ...);
                 }
                 None => {
-                    // Spawn fresh from definition
+                    // No persisted state — spawn fresh from definition
                     spawn_from_def(&mut commands, obj, &defs, ...);
                 }
             }
@@ -1107,7 +1237,7 @@ fn spawn_chunk_world_objects(
 
         // Spawn non-procedural entities (player-placed)
         for entry in &persisted {
-            if entry.procedural_id.is_none() && !entry.destroyed {
+            if entry.procedural_id.is_none() {
                 spawn_with_overrides(&mut commands, entry, &defs, ...);
             }
         }
@@ -1191,47 +1321,134 @@ pub struct ProceduralSpawnId(pub u64);
 
 Inserted by `spawn_chunk_world_objects` when spawning procedural objects.
 
-#### 5. Destroyed object tracking
-When a world object is destroyed (e.g., tree chopped down), the system must:
-1. Mark it destroyed in the ECS (remove from world or set a `Destroyed` marker)
-2. When the chunk unloads, serialize it as `destroyed: true`
-3. When the chunk reloads, the merge step skips spawning it
+#### 5. Component persistence (no separate "destroyed" tracking)
 
-The `Destroyed` marker approach:
+No `DestroyedObject` marker or `destroyed: bool` field needed. Instead, persist all serializable components on chunk entities. A dead object is simply one whose `Health.current == 0.0` — the health component is saved and restored like any other.
+
+**On chunk unload** (serialization): For each entity with `ChunkEntityRef` matching the unloading chunk, iterate the entity's components using Bevy's reflection. For each component that has `ReflectComponent` and `ReflectSerialize` registered, serialize it as RON via `TypedReflectSerializer`. Store in `component_overrides: HashMap<String, String>` keyed by type path.
+
+**On chunk load** (deserialization): Spawn the entity from its `WorldObjectDef` baseline (gives default components), then for each entry in `component_overrides`, deserialize the RON string via `TypedReflectDeserializer` and insert via `ReflectComponent::apply` (overwrites the baseline value).
+
+This is straightforward because the infrastructure already exists:
+- `ReflectComponent::insert` is used by `apply_object_components` (proven pattern)
+- `TypedReflectSerializer` / `TypedReflectDeserializer` are used by `reflect_loader` for RON
+- The type registry resolves type paths to concrete types
+
 ```rust
-#[derive(Component)]
-pub struct DestroyedObject;
+/// Serialize all reflected components on an entity into the override map.
+fn serialize_entity_components(
+    entity_ref: EntityRef,
+    registry: &TypeRegistry,
+    baseline_type_paths: &HashSet<String>, // type paths from WorldObjectDef
+) -> HashMap<String, String> {
+    let mut overrides = HashMap::new();
+    for component_id in entity_ref.archetype().components() {
+        let Some(info) = entity_ref.world().components().get_info(component_id) else { continue };
+        let type_id = info.type_id().unwrap();
+        let Some(registration) = registry.get(type_id) else { continue };
+
+        // Only serialize components that are part of the world object definition
+        // (skip engine components like Transform, ChunkEntityRef, etc.)
+        if !baseline_type_paths.contains(registration.type_info().type_path()) { continue }
+
+        let Some(reflect_comp) = registration.data::<ReflectComponent>() else { continue };
+        let Some(component) = reflect_comp.reflect(entity_ref) else { continue };
+
+        // Serialize to RON
+        let serializer = TypedReflectSerializer::new(component, registry);
+        match ron::ser::to_string_pretty(&serializer, ron::ser::PrettyConfig::default()) {
+            Ok(ron_str) => {
+                overrides.insert(
+                    registration.type_info().type_path().to_string(),
+                    ron_str,
+                );
+            }
+            Err(e) => warn!("Failed to serialize component {}: {e}", registration.type_info().type_path()),
+        }
+    }
+    overrides
+}
 ```
 
-When an object's health reaches 0, insert `DestroyedObject` and despawn visuals. On chunk unload, entities with `DestroyedObject` are serialized with `destroyed: true`. On chunk load, procedural spawns with matching `procedural_id` and `destroyed: true` are skipped.
-%% Do we need `DestroyedObject` or `destroyed: bool` at all? Can't we just save the `Health` component which will imply "dead" by having a value of `0`?
+**Dead object handling**: When `Health.current` reaches 0 and the entity is despawned from the world, the entity no longer exists in the ECS. To persist this, the death handler must:
+1. Before despawning, serialize the entity's components into `component_overrides`
+2. Store a `ChunkEntity` with the serialized state (health=0 will be in the overrides)
+3. Write to a "pending save" buffer on the map instance
 
-#### 6. Component override diffing
-For the initial implementation, only persist `destroyed` state and `position` changes. Full component override diffing (serialize any changed component as RON via reflection) is complex and can be added later. The `component_overrides` field stays as `HashMap<String, String>` but is initially always empty.
-%% We DO want to persist serializable components, not just destroyed and position. Why is this complex? Can't we just insert the saved component values and overwrite whatever spawn-default they had? 
+On chunk reload, the merge step spawns the entity from baseline + applies overrides. The entity spawns with `Health { current: 0.0, max: 50.0 }`. The existing respawn timer system detects `current == 0` and handles it normally (either respawn after timer or stay dead).
 
-#### 7. Save chunk entities during world save
+Alternatively, simpler: don't despawn the ECS entity on death at all. Just set health to 0, despawn visuals, disable colliders. The entity persists in the ECS and gets serialized normally on chunk unload. This avoids the "serialize before despawn" dance. The respawn timer system can restore the entity when the timer expires.
+
+**Decision**: Keep dead entities alive in the ECS with health=0. This is simpler and consistent with the existing `RespawnTimerConfig` pattern.
+
+#### 6. Save triggers (no dirty tracking)
+
+No per-entity dirty tracking needed. Following Minecraft's model, chunk entities are saved at two points:
+
+1. **Chunk unload**: When a chunk leaves the loaded set (`ChunkUnloading` event), all entities in that chunk are serialized and written to disk. This is the primary save path.
+2. **Server shutdown**: `save_world_on_shutdown` iterates all currently loaded chunks and saves their entities.
+
+Entity state changes between chunk load and unload are held in memory (the live ECS components). This is safe because:
+- Entity state changes are infrequent (tree gets damaged, resource gets harvested)
+- The data is small (a few components per entity)
+- A crash between edits and chunk unload loses at most the in-flight changes — same as Minecraft's behavior
+- The existing voxel dirty/debounce system handles frequent block edits; entity state doesn't need the same treatment
+
+#### 7. Save all chunk entities on shutdown
 **File**: `crates/server/src/map.rs`
-**Changes**: In `save_dirty_chunks_debounced` and `save_world_on_shutdown`, also save entities for chunks that have dirty entity state. Add a `dirty_chunk_entities: HashSet<IVec3>` to `VoxelMapInstance` (or a separate tracking component).
-%% How do we know what chunk entities are dirty? This section needs elaboration
+**Changes**: In `save_world_on_shutdown`, iterate all loaded chunks (not just dirty ones) and save their entity state. This ensures no data loss on shutdown.
 
-#### 8. Integrate with existing shutdown save
-**File**: `crates/server/src/map.rs`
-**Changes**: `save_world_on_shutdown` iterates all loaded chunks' entities and saves them.
-## Elaborate
+```rust
+fn save_all_chunk_entities_on_shutdown(
+    map_query: Query<(Entity, &VoxelMapInstance, &VoxelMapConfig)>,
+    chunk_entity_query: Query<(Entity, &ChunkEntityRef, &WorldObjectId)>,
+    world: &World,
+    type_registry: Res<AppTypeRegistry>,
+) {
+    let registry = type_registry.0.read();
+    for (map_entity, instance, config) in &map_query {
+        let Some(save_dir) = &config.save_dir else { continue };
+
+        // Group chunk entities by chunk position
+        let mut by_chunk: HashMap<IVec3, Vec<ChunkEntity>> = HashMap::new();
+        for (entity, chunk_ref, obj_id) in &chunk_entity_query {
+            if chunk_ref.map_entity != map_entity { continue }
+            let entity_ref = world.entity(entity);
+            let overrides = serialize_entity_components(entity_ref, &registry, ...);
+            by_chunk.entry(chunk_ref.chunk_pos).or_default().push(ChunkEntity {
+                procedural_id: entity_ref.get::<ProceduralSpawnId>().map(|id| id.0),
+                object_id: obj_id.0.clone(),
+                position: entity_ref.get::<Position>().map(|p| p.0).unwrap_or_default(),
+                component_overrides: overrides,
+            });
+        }
+
+        for (chunk_pos, entities) in &by_chunk {
+            if let Err(e) = save_chunk_entities(save_dir, *chunk_pos, entities) {
+                error!("Failed to save chunk entities at {chunk_pos}: {e}");
+            }
+        }
+    }
+}
+```
+
+This runs as part of the existing `save_world_on_shutdown` flow, after voxel saves.
 
 ### Success Criteria:
 
 #### Automated Verification:
 - [ ] `cargo check-all` passes
 - [ ] Unit tests for `save_chunk_entities` / `load_chunk_entities` (round-trip)
-- [ ] Unit tests for merge logic (procedural + persisted, destroyed skipping)
+- [ ] Unit tests for merge logic (procedural + persisted, component override application)
+- [ ] Unit tests for `serialize_entity_components` (round-trip through RON)
 
 #### Manual Verification:
-- [ ] Destroy a tree, walk away (chunk unloads), walk back — tree stays destroyed
+- [ ] Damage a tree, walk away (chunk unloads), walk back — tree retains reduced health
+- [ ] Kill a tree (health=0), walk away, return — tree spawns dead, respawn timer runs
 - [ ] Trees spawn at same positions on chunk reload (deterministic)
-- [ ] Server restart: overworld terrain regenerates, persisted entity state (destroyed trees) preserved
+- [ ] Server restart: overworld terrain regenerates, persisted entity state preserved
 - [ ] New trees appear in newly explored chunks
+- [ ] Entity files appear in `worlds/overworld/entities/` directory
 
 ---
 
