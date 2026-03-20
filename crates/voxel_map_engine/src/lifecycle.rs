@@ -1,3 +1,4 @@
+use bevy::log::info_span;
 use bevy::prelude::*;
 use bevy::tasks::futures::check_ready;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
@@ -94,7 +95,10 @@ pub fn update_chunks(
     }
     for (map_entity, mut instance, config, generator, mut pending, map_transform) in &mut map_query
     {
-        let desired = collect_desired_positions(map_entity, map_transform, config, &target_query);
+        let desired = {
+            let _span = info_span!("collect_desired_positions").entered();
+            collect_desired_positions(map_entity, map_transform, config, &target_query)
+        };
 
         if desired.is_empty() && !instance.loaded_chunks.is_empty() {
             info!(
@@ -103,7 +107,10 @@ pub fn update_chunks(
             );
         }
 
-        remove_out_of_range_chunks(&mut instance, &desired, config.save_dir.as_deref());
+        {
+            let _span = info_span!("remove_out_of_range_chunks").entered();
+            remove_out_of_range_chunks(&mut instance, &desired, config.save_dir.as_deref());
+        }
         if config.generates_chunks {
             spawn_missing_chunks(&mut instance, &mut pending, config, generator, &desired);
         }
@@ -268,7 +275,10 @@ fn handle_completed_chunk(
 ) {
     instance.loaded_chunks.insert(result.position);
 
-    let chunk_data = ChunkData::from_voxels(&result.voxels);
+    let chunk_data = {
+        let _span = info_span!("palettize_chunk").entered();
+        ChunkData::from_voxels(&result.voxels)
+    };
     instance.insert_chunk_data(result.position, chunk_data);
 
     let Some(mesh) = result.mesh else {
@@ -350,7 +360,10 @@ pub fn spawn_remesh_tasks(mut map_query: Query<(&mut VoxelMapInstance, &mut Pend
                 trace!("spawn_remesh_tasks: chunk {chunk_pos} no longer in octree, skipping");
                 continue;
             };
-            let voxels = chunk_data.voxels.to_voxels();
+            let voxels = {
+                let _span = info_span!("expand_palette").entered();
+                chunk_data.voxels.to_voxels()
+            };
             let task = pool.spawn(async move { mesh_chunk_greedy(&voxels) });
             pending.tasks.push(RemeshTask { chunk_pos, task });
         }

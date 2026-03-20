@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bevy::log::info_span;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 
@@ -39,8 +40,14 @@ pub fn spawn_chunk_gen_task(
         if let Some(ref dir) = save_dir {
             match crate::persistence::load_chunk(dir, position) {
                 Ok(Some(chunk_data)) => {
-                    let voxels = chunk_data.voxels.to_voxels();
-                    let mesh = mesh_chunk_greedy(&voxels);
+                    let voxels = {
+                        let _span = info_span!("disk_load_expand").entered();
+                        chunk_data.voxels.to_voxels()
+                    };
+                    let mesh = {
+                        let _span = info_span!("mesh_chunk").entered();
+                        mesh_chunk_greedy(&voxels)
+                    };
                     return ChunkGenResult {
                         position,
                         mesh,
@@ -63,8 +70,14 @@ pub fn spawn_chunk_gen_task(
 }
 
 fn generate_chunk(position: IVec3, generator: &dyn Fn(IVec3) -> Vec<WorldVoxel>) -> ChunkGenResult {
-    let voxels = generator(position);
-    let mesh = mesh_chunk_greedy(&voxels);
+    let voxels = {
+        let _span = info_span!("terrain_gen").entered();
+        generator(position)
+    };
+    let mesh = {
+        let _span = info_span!("mesh_chunk").entered();
+        mesh_chunk_greedy(&voxels)
+    };
     ChunkGenResult {
         position,
         mesh,

@@ -1,4 +1,5 @@
 use bevy::asset::RenderAssetUsages;
+use bevy::log::info_span;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use block_mesh::{GreedyQuadsBuffer, RIGHT_HANDED_Y_UP_CONFIG, greedy_quads};
@@ -12,19 +13,23 @@ pub fn mesh_chunk_greedy(voxels: &[WorldVoxel]) -> Option<Mesh> {
 
     let mut buffer = GreedyQuadsBuffer::new(voxels.len());
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
-    greedy_quads(
-        voxels,
-        &PaddedChunkShape {},
-        [0; 3],
-        [17; 3],
-        &faces,
-        &mut buffer,
-    );
+    {
+        let _span = info_span!("greedy_quads").entered();
+        greedy_quads(
+            voxels,
+            &PaddedChunkShape {},
+            [0; 3],
+            [17; 3],
+            &faces,
+            &mut buffer,
+        );
+    }
 
     if buffer.quads.num_quads() == 0 {
         return None;
     }
 
+    let _span = info_span!("assemble_vertices").entered();
     let num_vertices = buffer.quads.num_quads() * 4;
     let num_indices = buffer.quads.num_quads() * 6;
 

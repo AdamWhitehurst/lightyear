@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bevy::log::info_span;
 use bevy::prelude::*;
 use ndshape::ConstShape;
 use noise::{
@@ -194,11 +195,16 @@ pub fn generate_heightmap_chunk(
     let height_noise = build_noise_fn(&height_map.noise, seed);
     let moisture_noise = moisture_map.map(|m| build_noise_fn(&m.noise, seed));
 
-    let height_cache = build_height_cache(chunk_pos, &*height_noise, height_map);
-    let moisture_cache = moisture_noise
-        .as_ref()
-        .map(|noise| build_2d_cache(chunk_pos, &**noise));
+    let height_cache = {
+        let _span = info_span!("build_height_cache").entered();
+        build_height_cache(chunk_pos, &*height_noise, height_map)
+    };
+    let moisture_cache = moisture_noise.as_ref().map(|noise| {
+        let _span = info_span!("build_moisture_cache").entered();
+        build_2d_cache(chunk_pos, &**noise)
+    });
 
+    let _span = info_span!("fill_voxels").entered();
     let total = PaddedChunkShape::SIZE as usize;
     let mut voxels = vec![WorldVoxel::Air; total];
 
