@@ -803,7 +803,7 @@ fn execute_server_transition(
         ensure_map_exists(commands, target_map_id, registry, config_query, save_path);
     commands
         .entity(player_entity)
-        .insert(ChunkTarget::new(map_entity, 4));
+        .insert(ChunkTarget::new(map_entity, 10));
 
     let spawn_position = crate::gameplay::DEFAULT_SPAWN_POS;
     commands.entity(player_entity).insert((

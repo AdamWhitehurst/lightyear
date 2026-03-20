@@ -127,7 +127,7 @@ fn attach_chunk_target_to_player(
         let map_entity = registry.get(map_id);
         commands
             .entity(entity)
-            .insert(ChunkTarget::new(map_entity, 4));
+            .insert(ChunkTarget::new(map_entity, 10));
     }
 }
 

@@ -314,7 +314,7 @@ fn handle_connected(
             Health::new(100.0),
             RespawnTimerConfig::default(),
             AbilityCooldowns::default(),
-            ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 4),
+            ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 10),
         ));
 
     let room = room_registry.get_or_create(&MapInstanceId::Overworld, &mut commands);
