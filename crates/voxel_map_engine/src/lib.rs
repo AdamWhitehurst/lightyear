@@ -9,6 +9,7 @@ pub mod meshing;
 pub mod palette;
 pub mod persistence;
 pub mod raycast;
+pub mod terrain;
 pub mod types;
 
 use bevy::prelude::*;
@@ -17,6 +18,14 @@ pub struct VoxelPlugin;
 
 impl Plugin for VoxelPlugin {
     fn build(&self, app: &mut App) {
+        app.register_type::<terrain::HeightMap>();
+        app.register_type::<terrain::MoistureMap>();
+        app.register_type::<terrain::BiomeRules>();
+        app.register_type::<terrain::BiomeRule>();
+        app.register_type::<terrain::NoiseDef>();
+        app.register_type::<terrain::NoiseType>();
+        app.register_type::<terrain::FractalType>();
+
         app.add_systems(Startup, lifecycle::init_default_material);
         app.add_systems(
             Update,
@@ -45,5 +54,6 @@ pub mod prelude {
     pub use crate::meshing::*;
     pub use crate::palette::*;
     pub use crate::raycast::*;
+    pub use crate::terrain::*;
     pub use crate::types::*;
 }

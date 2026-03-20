@@ -77,13 +77,16 @@ noise = "0.9"
 
 ```rust
 use bevy::prelude::*;
+use ndshape::ConstShape;
 use noise::{
-    Fbm, HybridMulti, NoiseFn, OpenSimplex, Perlin, RidgedMulti, ScaleBias, SuperSimplex,
-    Value, Worley,
+    Fbm, HybridMulti, MultiFractal, NoiseFn, OpenSimplex, Perlin, RidgedMulti, ScalePoint,
+    Seedable, SuperSimplex, Value, Worley,
 };
 use serde::{Deserialize, Serialize};
 
-/// Which base noise algorithm to use.
+use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
+
+/// Base noise algorithm.
 #[derive(Clone, Debug, Serialize, Deserialize, Reflect, Default)]
 pub enum NoiseType {
     #[default]
@@ -94,17 +97,18 @@ pub enum NoiseType {
     SuperSimplex,
 }
 
-/// Which fractal layering to apply. `None` uses the raw base noise.
+/// Fractal layering applied on top of a base noise. `Raw` uses the base noise directly.
 #[derive(Clone, Debug, Serialize, Deserialize, Reflect, Default)]
 pub enum FractalType {
     #[default]
     Fbm,
     RidgedMulti,
     HybridMulti,
-    None,
+    /// No fractal layering; use raw base noise.
+    Raw,
 }
 
-/// Noise sampling parameters. Embedded in noise-driven components.
+/// Noise sampling parameters that define how a noise function is constructed.
 #[derive(Clone, Debug, Serialize, Deserialize, Reflect)]
 pub struct NoiseDef {
     pub noise_type: NoiseType,
@@ -116,7 +120,8 @@ pub struct NoiseDef {
     pub persistence: f64,
 }
 
-/// Drives terrain height. Presence = noise-based terrain. Absence = flat at y=0.
+/// Terrain height noise configuration. Presence enables noise-based terrain;
+/// absence produces a flat plane at y=0.
 #[derive(Component, Clone, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Component, Serialize, Deserialize)]
 pub struct HeightMap {
@@ -125,14 +130,14 @@ pub struct HeightMap {
     pub amplitude: f64,
 }
 
-/// Drives biome moisture sampling. Only meaningful alongside `BiomeRules`.
+/// Moisture noise configuration for biome selection.
 #[derive(Component, Clone, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Component, Serialize, Deserialize)]
 pub struct MoistureMap {
     pub noise: NoiseDef,
 }
 
-/// Biome selection rules. Multiple biomes per map.
+/// Ordered list of biome selection rules. First matching rule wins.
 #[derive(Component, Clone, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Component, Serialize, Deserialize)]
 pub struct BiomeRules(pub Vec<BiomeRule>);
@@ -151,56 +156,61 @@ pub struct BiomeRule {
 
 #### 3. Implement noise construction
 **File**: `crates/voxel_map_engine/src/terrain.rs` (continued)
-**Changes**: `build_noise_fn` returns a `Box<dyn NoiseFn<f64, 2> + Send + Sync>` from a `NoiseDef` + world seed.
+**Changes**: `build_noise_fn` returns a `Box<dyn NoiseFn<f64, 2>>` from a `NoiseDef` + world seed.
 
-The `noise` crate's `NoiseFn` trait is generic over dimensionality. All terrain sampling uses 2D `[f64; 2]` inputs (x, z world coordinates). The function constructs the base noise generator from `NoiseType`, wraps it in a fractal combinator from `FractalType`, and applies `ScaleBias` with `scale = frequency` (the frequency parameter controls the spatial scale of features).
+The `noise` crate's `NoiseFn` trait is generic over dimensionality. All terrain sampling uses 2D `[f64; 2]` inputs (x, z world coordinates). The function dispatches on `(NoiseType, FractalType)` to construct the appropriate noise generator. For fractal types (`Fbm`, `RidgedMulti`, `HybridMulti`), frequency is set via `MultiFractal::set_frequency()`. For `FractalType::Raw`, the base noise is wrapped in `ScalePoint` to scale input coordinates by `frequency`.
 
 Seed combination: `(seed as u32).wrapping_add(def.seed_offset)` — each noise layer gets a distinct seed derived from the world seed plus the configured offset.
 
+The 20 combinations (5 noise types × 4 fractal types) are factored into four generic helper functions (`build_raw`, `build_fbm`, `build_ridged`, `build_hybrid`) bounded by `Default + Seedable + NoiseFn<f64, 2> + 'static`, with the top-level match dispatching to the appropriate helper:
+
 ```rust
-/// Construct a 2D noise function from a `NoiseDef` and world seed.
-pub fn build_noise_fn(
-    def: &NoiseDef,
-    seed: u64,
-) -> Box<dyn NoiseFn<f64, 2> + Send + Sync> {
-    let s = (seed as u32).wrapping_add(def.seed_offset);
+/// Constructs a 2D noise function from a [`NoiseDef`] and world seed.
+pub fn build_noise_fn(def: &NoiseDef, seed: u64) -> Box<dyn NoiseFn<f64, 2>> {
+    let combined_seed = (seed as u32).wrapping_add(def.seed_offset);
+
     match (&def.noise_type, &def.fractal) {
-        (NoiseType::Perlin, FractalType::Fbm) => Box::new(
-            Fbm::<Perlin>::new(s)
-                .set_octaves(def.octaves as usize)
-                .set_frequency(def.frequency)
-                .set_lacunarity(def.lacunarity)
-                .set_persistence(def.persistence),
-        ),
-        (NoiseType::Perlin, FractalType::RidgedMulti) => Box::new(
-            RidgedMulti::<Perlin>::new(s)
-                .set_octaves(def.octaves as usize)
-                .set_frequency(def.frequency)
-                .set_lacunarity(def.lacunarity),
-        ),
-        // ... other combinations follow the same pattern.
-        // Each (NoiseType, FractalType) pair constructs the appropriate type.
-        // FractalType::None wraps the raw generator in ScaleBias for frequency control.
+        (NoiseType::Perlin, FractalType::Raw) => build_raw(Perlin::new(combined_seed), def),
+        (NoiseType::OpenSimplex, FractalType::Raw) => build_raw(OpenSimplex::new(combined_seed), def),
+        // ... all 20 arms enumerated, dispatching to build_raw/build_fbm/build_ridged/build_hybrid
     }
 }
+
+fn build_raw<T: NoiseFn<f64, 2> + 'static>(base: T, def: &NoiseDef) -> Box<dyn NoiseFn<f64, 2>> {
+    Box::new(ScalePoint::new(base).set_x_scale(def.frequency).set_y_scale(def.frequency))
+}
+
+fn build_fbm<T: Default + Seedable + NoiseFn<f64, 2> + 'static>(
+    seed: u32, def: &NoiseDef,
+) -> Box<dyn NoiseFn<f64, 2>> {
+    Box::new(
+        Fbm::<T>::new(seed)
+            .set_octaves(def.octaves as usize)
+            .set_frequency(def.frequency)
+            .set_lacunarity(def.lacunarity)
+            .set_persistence(def.persistence),
+    )
+}
+
+// build_ridged and build_hybrid follow the same pattern with RidgedMulti<T> and HybridMulti<T>.
 ```
 
-All 20 combinations (5 noise types × 4 fractal types) must be enumerated because `noise` crate types are concrete generics (`Fbm<Perlin>`, `Fbm<OpenSimplex>`, etc.) and cannot be type-erased at the inner level. The `Box<dyn NoiseFn<f64, 2>>` erasure happens at the outer level.
+The `Box<dyn NoiseFn<f64, 2>>` erasure happens at the outer level — inner noise types are concrete generics that cannot be type-erased.
 
-For `FractalType::None`, the raw noise generator is sampled directly. The `frequency` parameter is applied by scaling the input coordinates before sampling (the caller multiplies `world_x * frequency`), not via `ScaleBias` on output.
+Note: The return type omits `Send + Sync` bounds because `build_noise_fn` is called inside the generator closure (which itself is `Send + Sync`), and the boxed noise function is consumed within the same closure invocation, never sent across threads independently.
 
 #### 4. Implement heightmap chunk generation
 **File**: `crates/voxel_map_engine/src/terrain.rs` (continued)
-**Changes**: `generate_heightmap_chunk` — the core generation function.
+**Changes**: `generate_heightmap_chunk` — the core generation function. Uses 2D cache arrays to avoid redundant noise evaluation per Y level.
 
 ```rust
-use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
-use ndshape::ConstShape;
+const PADDED_XZ: usize = 18;
+const CACHE_LEN: usize = PADDED_XZ * PADDED_XZ;
 
-/// Generate a chunk with noise-based terrain.
+/// Generates voxel data for a single padded chunk (18^3) using heightmap noise.
 ///
-/// Pre-computes a 2D heightmap (and optional moisture map) for the chunk's
-/// (x, z) footprint, then fills voxels based on height and biome rules.
+/// When `moisture_map` and `biome_rules` are both provided, biome-aware material
+/// selection is used. Otherwise all solid voxels use material index 0.
 pub fn generate_heightmap_chunk(
     chunk_pos: IVec3,
     seed: u64,
@@ -211,81 +221,93 @@ pub fn generate_heightmap_chunk(
     let height_noise = build_noise_fn(&height_map.noise, seed);
     let moisture_noise = moisture_map.map(|m| build_noise_fn(&m.noise, seed));
 
-    // Pre-compute 2D heightmap for the 18×18 padded footprint.
-    let padded = 18usize;
-    let mut height_cache = [0.0f64; 18 * 18];
-    let mut moisture_cache = [0.0f64; 18 * 18];
+    let height_cache = build_height_cache(chunk_pos, &*height_noise, height_map);
+    let moisture_cache = moisture_noise
+        .as_ref()
+        .map(|noise| build_2d_cache(chunk_pos, &**noise));
 
-    for pz in 0..padded {
-        for px in 0..padded {
-            let world_x = chunk_pos.x * CHUNK_SIZE as i32 + px as i32 - 1;
-            let world_z = chunk_pos.z * CHUNK_SIZE as i32 + pz as i32 - 1;
-            let idx = pz * padded + px;
+    let total = PaddedChunkShape::SIZE as usize;
+    let mut voxels = vec![WorldVoxel::Air; total];
 
-            let h = height_noise.get([world_x as f64, world_z as f64]);
-            height_cache[idx] = height_map.base_height as f64 + h * height_map.amplitude;
-
-            if let Some(ref mn) = moisture_noise {
-                moisture_cache[idx] = mn.get([world_x as f64, world_z as f64]);
-            }
-        }
-    }
-
-    let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
-    for i in 0..PaddedChunkShape::SIZE {
-        let [px, py, pz] = PaddedChunkShape::delinearize(i);
+    for i in 0..total {
+        let [px, py, pz] = PaddedChunkShape::delinearize(i as u32);
         let world_y = chunk_pos.y * CHUNK_SIZE as i32 + py as i32 - 1;
-        let idx_2d = pz as usize * padded + px as usize;
-        let terrain_height = height_cache[idx_2d];
+        let terrain_height = height_cache[xz_index(px, pz)];
 
-        if (world_y as f64) <= terrain_height {
-            let material = select_material(
-                biome_rules,
-                &moisture_noise,
-                terrain_height,
-                moisture_cache[idx_2d],
-                world_y as f64,
+        if world_y as f64 <= terrain_height {
+            let material = pick_material(
+                world_y, terrain_height, xz_index(px, pz),
+                moisture_cache.as_ref(), biome_rules,
             );
-            voxels[i as usize] = WorldVoxel::Solid(material);
+            voxels[i] = WorldVoxel::Solid(material);
         }
     }
     voxels
 }
 
-fn select_material(
-    biome_rules: Option<&BiomeRules>,
-    moisture_noise: &Option<Box<dyn NoiseFn<f64, 2> + Send + Sync>>,
-    terrain_height: f64,
-    moisture: f64,
-    world_y: f64,
-) -> u8 {
-    let Some(rules) = biome_rules else { return 0; };
-    if moisture_noise.is_none() { return 0; }
+fn xz_index(px: u32, pz: u32) -> usize {
+    px as usize * PADDED_XZ + pz as usize
+}
 
-    // Normalize height to 0..1 range for biome selection.
-    // The raw noise output from Fbm is roughly in [-1, 1], so terrain_height
-    // varies around base_height. We normalize based on the noise value itself.
-    let biome = select_biome(&rules.0, terrain_height, moisture);
-    let depth = (terrain_height - world_y) as u32;
-    if depth < biome.subsurface_depth {
+fn build_height_cache(
+    chunk_pos: IVec3, noise: &dyn NoiseFn<f64, 2>, height_map: &HeightMap,
+) -> [f64; CACHE_LEN] {
+    let mut cache = [0.0; CACHE_LEN];
+    for px in 0..PADDED_XZ as u32 {
+        for pz in 0..PADDED_XZ as u32 {
+            let world_x = chunk_pos.x * CHUNK_SIZE as i32 + px as i32 - 1;
+            let world_z = chunk_pos.z * CHUNK_SIZE as i32 + pz as i32 - 1;
+            let sample = noise.get([world_x as f64, world_z as f64]);
+            cache[xz_index(px, pz)] = height_map.base_height as f64 + sample * height_map.amplitude;
+        }
+    }
+    cache
+}
+
+fn build_2d_cache(chunk_pos: IVec3, noise: &dyn NoiseFn<f64, 2>) -> [f64; CACHE_LEN] {
+    let mut cache = [0.0; CACHE_LEN];
+    for px in 0..PADDED_XZ as u32 {
+        for pz in 0..PADDED_XZ as u32 {
+            let world_x = chunk_pos.x * CHUNK_SIZE as i32 + px as i32 - 1;
+            let world_z = chunk_pos.z * CHUNK_SIZE as i32 + pz as i32 - 1;
+            cache[xz_index(px, pz)] = noise.get([world_x as f64, world_z as f64]);
+        }
+    }
+    cache
+}
+
+fn pick_material(
+    world_y: i32,
+    terrain_height: f64,
+    cache_idx: usize,
+    moisture_cache: Option<&[f64; CACHE_LEN]>,
+    biome_rules: Option<&BiomeRules>,
+) -> u8 {
+    let (Some(moisture), Some(rules)) = (moisture_cache, biome_rules) else {
+        return 0;
+    };
+
+    let biome = select_biome(&rules.0, terrain_height, moisture[cache_idx]);
+    let depth_below_surface = (terrain_height - world_y as f64) as u32;
+
+    if depth_below_surface < biome.subsurface_depth {
         biome.surface_material
     } else {
         biome.subsurface_material
     }
 }
 
-/// Select the best-matching biome for the given height and moisture values.
-///
-/// Returns the first biome whose ranges contain both values.
-/// Falls back to the first biome in the list if no ranges match.
-fn select_biome(rules: &[BiomeRule], height: f64, moisture: f64) -> &BiomeRule {
+/// Returns the first biome whose height and moisture ranges both contain the
+/// given values. Falls back to the first rule if none match.
+pub fn select_biome<'a>(rules: &'a [BiomeRule], height: f64, moisture: f64) -> &'a BiomeRule {
+    debug_assert!(!rules.is_empty(), "BiomeRules must contain at least one rule");
     rules
         .iter()
-        .find(|b| {
-            height >= b.height_range.0
-                && height <= b.height_range.1
-                && moisture >= b.moisture_range.0
-                && moisture <= b.moisture_range.1
+        .find(|r| {
+            height >= r.height_range.0
+                && height <= r.height_range.1
+                && moisture >= r.moisture_range.0
+                && moisture <= r.moisture_range.1
         })
         .unwrap_or(&rules[0])
 }
@@ -313,13 +335,13 @@ app.register_type::<terrain::BiomeRule>();
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` passes
-- [ ] Unit tests for `build_noise_fn` (deterministic output for same seed)
-- [ ] Unit tests for `generate_heightmap_chunk` (non-flat output with HeightMap, flat-equivalent without)
-- [ ] Unit tests for `select_biome` (correct biome selection, fallback behavior)
+- [x] `cargo check-all` passes
+- [x] Unit tests for `build_noise_fn` (deterministic output for same seed, different output for different seeds)
+- [x] Unit tests for `generate_heightmap_chunk` (non-flat terrain at origin, all-solid underground, biome material diversity)
+- [x] Unit tests for `select_biome` (exact match, fallback to first rule, first-wins on overlap)
 
 #### Manual Verification:
-- [ ] None required — no runtime integration yet.
+- [x] None required — no runtime integration yet.
 
 ---
 
