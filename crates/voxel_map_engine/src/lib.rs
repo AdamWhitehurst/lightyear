@@ -8,6 +8,7 @@ pub mod mesh_cache;
 pub mod meshing;
 pub mod palette;
 pub mod persistence;
+pub mod propagator;
 pub mod raycast;
 pub mod terrain;
 pub mod ticket;
@@ -54,6 +55,7 @@ pub mod prelude {
     pub use crate::mesh_cache::*;
     pub use crate::meshing::*;
     pub use crate::palette::*;
+    pub use crate::propagator::*;
     pub use crate::raycast::*;
     pub use crate::terrain::*;
     pub use crate::ticket::*;

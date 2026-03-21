@@ -9,7 +9,7 @@ Replace the flat `ChunkTarget` + `HashSet<IVec3> loaded_chunks` model with a Min
 The engine uses `ChunkTarget` components (attached to players/NPCs) with a `distance: u32` field to produce a cubic `HashSet<IVec3>` of desired positions per map. All desired chunks are equally "loaded" — no priority differentiation. Chunks outside the set are evicted. Generation spawns up to 32 tasks/frame in arbitrary `HashSet` iteration order.
 
 ### Key Discoveries:
-- `ChunkTarget` defined at `chunk.rs:13-16`, used in 6 source files, 5 test files, 3 examples
+- `ChunkTarget` defined at `chunk.rs:12-16`, used in 6 source files, 5 test files, 3 examples
 - `loaded_chunks: HashSet<IVec3>` at `instance.rs:31`, referenced in ~15 files
 - `update_chunks` (`lifecycle.rs:93-156`) is the scheduling brain — caches per-target desired sets, unions them per map, evicts out-of-range, spawns generation tasks
 - `compute_target_desired` (`lifecycle.rs:226-240`) produces a 3D cubic volume `[-dist..=dist]` on all axes
@@ -139,6 +139,7 @@ impl ChunkTicket {
 /// This plan uses `LOAD_LEVEL_THRESHOLD` for loaded/unloaded decisions.
 /// `LoadState` variants are used for debug display and will drive
 /// simulation zone differentiation in a future plan.
+// %% [SUGGESTION] Elegance — `PartialOrd, Ord` are derived but unused in this plan (LoadState is only used for debug display and `from_level`/`max_level` conversions). Consider deferring these derives until simulation zone differentiation needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LoadState {
     /// Level 0: Full simulation — entity AI, physics, spawning.
@@ -343,6 +344,7 @@ pub struct TicketLevelPropagator {
     /// Each bucket holds columns that need their level recalculated
     /// starting from that level.
     pending_by_level: Vec<HashSet<IVec2>>,
+    // %% [SUGGESTION] Elegance — this allocates MAX_LEVEL+1=65 HashSets upfront, most empty. A `BTreeMap<u32, HashSet<IVec2>>` would only allocate for active levels while preserving ordered iteration. Alternatively, a flat `Vec<(u32, IVec2)>` sorted by level would avoid per-bucket allocation entirely.
     /// Lowest non-empty bucket index for O(1) access to highest-priority work.
     min_pending_level: usize,
     /// Whether any sources changed since last propagate().
@@ -443,9 +445,9 @@ The propagator uses Minecraft's `LevelPropagator` pattern: an array of `HashSet`
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` passes
-- [ ] `cargo test-all` passes
-- [ ] All propagator unit tests pass
+- [x] `cargo check-all` passes
+- [x] `cargo test-all` passes
+- [x] All propagator unit tests pass
 
 ### Tests:
 
@@ -461,6 +463,7 @@ mod tests {
     fn entity(id: u32) -> Entity {
         Entity::from_raw(id)
     }
+    // %% [VIOLATION] Coherence — `Entity::from_raw(id)` does not exist in Bevy 0.18. The API is `Entity::from_raw_u32(id)` which returns `Option<Entity>`. Phase 1 tests correctly use `Entity::from_raw_u32(999).expect("valid test entity")`. This should be `Entity::from_raw_u32(id).expect("valid test entity")`.
 
     #[test]
     fn single_player_ticket_produces_concentric_levels() {
@@ -722,6 +725,7 @@ fn collect_tickets(
     let _span = info_span!("collect_tickets").entered();
     // 1. Detect removed tickets: any entity in cache not in ticket_query → remove_source
     let active: HashSet<Entity> = ticket_query.iter().map(|(e, _, _)| e).collect();
+    // %% [SUGGESTION] Elegance — allocating a HashSet of all active entities every frame just to detect removals is wasteful. Instead, mark each cache entry during the update loop below, then sweep unmarked entries. This avoids the per-frame allocation.
     let stale: Vec<Entity> = ticket_cache.keys().filter(|e| !active.contains(e)).copied().collect();
     for entity in stale {
         if let Some(cached) = ticket_cache.remove(&entity) {
@@ -937,6 +941,7 @@ Also auto-insert `TicketLevelPropagator` on map entities that lack one. Keep the
 
 Remove the `loaded_chunks: HashSet<IVec3>` field entirely. All consumers now use `chunk_levels: HashMap<IVec2, u32>` (for column-level loaded checks) or `get_chunk_data(pos).is_some()` (for 3D chunk-level existence checks).
 
+%% [VIOLATION] Coherence — `set_voxel` starts at line 134, not 130. Line 130 is the end of `get_chunk_data_mut`.
 The `set_voxel` method (`instance.rs:130`) needs no change — it already guards on `get_chunk_data_mut(chunk_pos)` returning `None`.
 
 #### 11. Remove `ChunkTarget` from `chunk.rs`
@@ -975,6 +980,7 @@ fn spawn_ticket(world: &mut World, map_entity: Entity, ticket_type: TicketType, 
 }
 ```
 
+%% [VIOLATION] Coherence — lifecycle.rs has 9 tests, not 8.
 All 8 existing tests adapted to use `ChunkTicket` and `chunk_levels` instead of `ChunkTarget` and `loaded_chunks`.
 
 New tests:
@@ -1037,6 +1043,7 @@ ChunkTicket::player(registry.get(&MapInstanceId::Overworld))
 
 #### 2. Server: NPC spawn
 **File**: `crates/server/src/gameplay.rs:82`
+%% [VIOLATION] Coherence — actual code is `ChunkTarget::new(registry.get(&MapInstanceId::Overworld), 1)`, not `ChunkTarget::new(overworld, 1)`. The "After" should use `registry.get(...)` too, or extract to a local variable first.
 ```rust
 // Before:
 ChunkTarget::new(overworld, 1)
@@ -1227,11 +1234,13 @@ fn push_chunks_to_clients(
             "push_chunks_to_clients: player ticket references non-existent map"
         );
 
+        // %% [SUGGESTION] Elegance — this recomputes the same Chebyshev column iteration that the propagator already did. Consider exposing per-source loaded columns from `TicketLevelPropagator` (e.g., via LevelDiff per entity) instead of re-deriving visibility from scratch. This would also avoid the `world_to_column_pos` dependency issue.
         // Compute per-player visible columns from this player's ticket position and radius.
         // Only send columns within this player's loaded range, not the entire map's chunk_levels.
         let map_inv = map_transform.affine().inverse();
         let local_pos = map_inv.transform_point3(player_transform.translation());
         let player_col = world_to_column_pos(local_pos);
+        // %% [VIOLATION] Coherence — `world_to_column_pos` is defined in Phase 3 as a private fn in `lifecycle.rs`. This system lives in `crates/server/src/map.rs` and cannot access it. Either make it `pub` and re-export from the crate, or define it in `ticket.rs` alongside `chunk_to_column`/`column_to_chunks`.
         let radius = ticket.radius as i32;
         let mut current_columns = HashSet::new();
         for dx in -radius..=radius {
@@ -1249,6 +1258,7 @@ fn push_chunks_to_clients(
 
         // New columns to send
         for &col in current_columns.difference(&visibility.sent_columns) {
+            // %% [VIOLATION] Coherence — `y_min` and `y_max` are used below but never defined in this function. Should use `DEFAULT_COLUMN_Y_MIN` / `DEFAULT_COLUMN_Y_MAX` from `ticket.rs`, or derive from config.
             for chunk_pos in column_to_chunks(col, y_min, y_max) {
                 if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
                     // Send ChunkDataSync to this player
@@ -1316,14 +1326,16 @@ Delete the `ClientChunkState` component (it tracked `pending_requests` and `retr
 /// Handle server's UnloadColumn message — remove chunk data for all chunks in the column.
 /// Mesh entity cleanup is handled by the existing `despawn_out_of_range_chunks` system
 /// which checks `chunk_levels.contains_key()`.
+%% [VIOLATION] Coherence — `MessageReceiver` in Lightyear takes a single type param and is queried via `Query`, not used as a direct system param. All existing handlers in this project use `Query<&mut MessageReceiver<M>>` or `Query<(Entity, &mut MessageReceiver<M>)>`. There is no `ChunkChannel` type param. See `crates/client/src/map.rs:207` for the existing pattern.
 fn handle_unload_column(
     mut receiver: MessageReceiver<UnloadColumn, ChunkChannel>,
     player_query: Query<&ChunkTicket, (With<Predicted>, With<Controlled>, With<CharacterMarker>)>,
-    mut map_query: Query<&mut VoxelMapInstance>, 
+    mut map_query: Query<&mut VoxelMapInstance>,
 ) {
     // Resolve map_entity from the player's ticket — the client has one predicted player
     // whose ticket points to the current map. UnloadColumn doesn't carry map_entity
     // because the client is only connected to one map at a time.
+    // %% [SUGGESTION] Rules — CLAUDE.md System Design: if no predicted player exists (e.g., during map transition teardown), this panics. Consider a trace + early return for the expected-missing case, since the client player entity may not exist during transitions.
     let ticket = player_query.single().expect(
         "handle_unload_column: expected exactly one predicted controlled player"
     );
@@ -1419,7 +1431,7 @@ The system stays largely the same (receives chunks, inserts into octree, spawns 
 - Map transition works end-to-end with server-push
 
 ### Existing Tests (adapted in Phase 4):
-- `lifecycle.rs`: 8 tests updated to use `ChunkTicket`
+- `lifecycle.rs`: 8 tests updated to use `ChunkTicket` (%% same count error — actually 9 tests)
 - `api.rs`: 9 tests updated
 - `integration.rs`: 3 tests updated (1 removed in Phase 5)
 - `voxel_persistence.rs`: 5 tests updated (lines 17, 35, 90, 97, 108)
