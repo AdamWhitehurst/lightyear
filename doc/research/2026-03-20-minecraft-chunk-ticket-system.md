@@ -9,7 +9,7 @@ tags: [research, minecraft, chunk-loading, ticket-system, voxel-map-engine, life
 status: complete
 last_updated: 2026-03-21
 last_updated_by: claude
-last_updated_note: "Added code-level ticket system details, optimization strategies, multi-stage generation, and resolved open questions"
+last_updated_note: "Resolved all planning blockers: 0-based absolute levels, 2D column propagation, implementation phases, dependency graph, Lightyear integration, testing strategy"
 ---
 
 # Research: Minecraft's Chunk Loading Ticket System
@@ -31,6 +31,8 @@ Minecraft's ticket system (Java 1.14+) is the sole mechanism that causes chunks 
 The current `voxel_map_engine` has a simpler model: `ChunkTarget` components with a flat `distance` field produce a binary loaded/unloaded set. There is no concept of load levels, ticket types, expiration, or propagation — all desired chunks are equally "loaded." Mapping Minecraft's system onto the engine would mean replacing `ChunkTarget` entirely with a ticket-based system, replacing the flat `HashSet<IVec3>` desired set with a per-chunk level computed from multiple ticket sources, and gating chunk processing (generation, meshing, entity ticking) by level thresholds.
 
 ---
+
+%% Research the both minecraft's and this project's system architectures and provide a high-level diagram to provide an overview to readers about the interacting pieces
 
 ## Minecraft's Ticket System
 
@@ -390,11 +392,34 @@ Both generation and remesh use `AsyncComputeTaskPool::get().spawn(async move { .
 | Lowest-level-wins overlap resolution | Union of all desired positions |
 | Priority scheduling (closer chunks first) | Arbitrary HashSet iteration order |
 | Multi-stage generation pipeline | Single-step: generate → mesh |
-| Server-push chunk protocol | Client-request protocol |
-| Time-based tick budget | Hard count per frame |
-| Per-chunk generation reference counting | No contention protection |
-| Incremental level propagation | Full recompute each change |
-%% [SUGGESTION] Elegance — This comparison table is useful but conflates "ticket system features" with "optimization features" and "networking protocol changes." These are three separate concerns. A planner would benefit from them being separated: (1) core ticket system (tickets, levels, propagation, load states), (2) scheduling/throttling optimizations (priority queue, caps, batching), (3) networking protocol change (server-push). This separation would make phased implementation clearer.
+#### Core Ticket System
+
+| Minecraft Feature | Current Engine |
+|---|---|
+| Multiple ticket types with different levels | Single `ChunkTarget` with flat distance |
+| Load levels (entity ticking, block ticking, border) | Binary loaded/unloaded |
+| Level propagation (+1 per chunk, Chebyshev) | Flat radius, all chunks equal |
+| Ticket expiration/lifetime | No expiration |
+| Lowest-level-wins overlap resolution | Union of all desired positions |
+| Incremental level propagation (bucket-queue BFS) | Full recompute on chunk boundary crossing |
+
+#### Scheduling and Throttling
+
+| Minecraft Feature | Current Engine |
+|---|---|
+| Priority scheduling (level + distance) | Arbitrary HashSet iteration order |
+| Time-based tick budget | Hard count per frame (MAX_TASKS_PER_FRAME=32) |
+| Per-chunk generation reference counting | pending_positions dedup only |
+| Batched generation tasks | 1 task per chunk |
+| Remesh throttling | Unlimited drain per frame |
+
+#### Networking Protocol
+
+| Minecraft Feature | Current Engine |
+|---|---|
+| Server-push chunk protocol | Client-request protocol (ChunkRequest/ChunkDataSync) |
+| Server computes all chunk decisions | Client independently computes desired set |
+| Multi-stage generation pipeline | Single-step: generate → mesh |
 
 ---
 
@@ -402,9 +427,7 @@ Both generation and remesh use `AsyncComputeTaskPool::get().spawn(async move { .
 
 ### Concept Mapping
 
-`ChunkTarget` should be replaced entirely with a ticket-based system closer to Minecraft's implementation.
-%% [SUGGESTION] Elegance — This section proposes replacing ChunkTarget "entirely" but doesn't describe a migration strategy. A planner needs to know: can this be done incrementally (ticket system wrapping ChunkTarget initially, then replacing it), or must it be a big-bang rewrite? What's the minimum viable ticket system that provides value before all features are implemented?
-%% Just rewrite, not incremental transition unless needed by plan phasing
+`ChunkTarget` should be replaced entirely with a ticket-based system. This is a direct rewrite — no incremental wrapper/migration pattern. The phased implementation (see Implementation Steps below) provides incremental *value delivery*, but each phase fully replaces the relevant code rather than wrapping it.
 
 | Minecraft Concept | Engine Equivalent |
 |---|---|
@@ -457,18 +480,17 @@ enum LoadState {
 
 ### Load States
 
-Use Minecraft's full model to support future levels of simulation differentiation:
+Use Minecraft's model with absolute thresholds. Level range is 0-based (not Minecraft's 22-44).
 
-| Level | State | What Happens |
+| Level | State | What Happens in This Project |
 |---|---|---|
-| ≤ base | EntityTicking | Server: entity AI, physics, spawning. Client: rendered, collidable, animated. |
-| base+1 | BlockTicking | Block mechanics run, entities frozen. |
-| base+2 | Border | Data in octree, meshed. Accessible to neighbors for padding. No ticking. |
-| base+3..N | Inaccessible | Generation pipeline stages in progress. Not accessible for gameplay. |
+| 0 | EntityTicking | Full simulation: entity AI, physics, spawning. Chunks with players. |
+| 1 | BlockTicking | NPC mechanics, non-player simulation. Entities frozen except NPCs. |
+| 2 | Border | Data in octree, meshed. Accessible to neighbors for padding. No simulation. |
+| 3..N | Inaccessible | Generation pipeline stages in progress. Not accessible for gameplay. |
 | N+1+ | Unloaded | Not loaded. |
 
-Where `base` is the ticket's starting level. The exact numeric range (Minecraft's 22-44 vs a simpler 0-based range) is an implementation detail.
-%% [SUGGESTION] Coherence — This says load states map relative to `base`, but the Minecraft system uses absolute levels (31 = entity ticking, 32 = block ticking, etc.) not relative. The concept mapping table above also uses absolute thresholds. This paragraph contradicts that by implying relative levels. A planner needs a clear decision: are load state thresholds absolute or relative to the ticket's starting level? Recommend resolving in this doc.
+Thresholds are **absolute** — a chunk at effective level 0 is always EntityTicking, regardless of which ticket produced that level. A Player ticket at level 0 and a Spawn ticket at level 0 both produce EntityTicking at their source chunk. The propagation formula `ticket.level + chebyshev_distance` produces the absolute effective level.
 
 ### Level Computation
 
@@ -479,8 +501,7 @@ Use Minecraft's bucket-queue BFS with incremental updates:
 4. Map effective level to `LoadState` via thresholds.
 5. Diff against previous frame's levels to determine transitions.
 
-Use Chebyshev distance (`max(|dx|, |dy|, |dz|)`) for 3D propagation, extending Minecraft's 2D model.
-%% We need to simplify to using only 2d and loading chunks as columns like minecraft does
+Use 2D Chebyshev distance (`max(|dx|, |dz|)`) for level propagation, loading chunks as vertical columns like Minecraft. The Y axis is not part of the level computation — all chunks in a column share the same effective level. This simplifies propagation from O(n³) to O(n²) and matches the game's predominantly horizontal gameplay.
 
 ### Multi-Stage Generation Pipeline
 
@@ -510,7 +531,8 @@ Following Minecraft's model: the server controls all chunk loading decisions. Th
 5. Client renders based on received chunks — passive receiver
 
 This replaces the current `ChunkRequest`/`ChunkDataSync` protocol with a server-push model.
-%% [SUGGESTION] Coherence — The server-push model is a major networking change that interacts with Lightyear. How does this integrate with Lightyear's replication/message system? Does Lightyear support server-push chunk streaming natively, or does this need custom channels? A planner needs to know the Lightyear integration surface.
+
+**Lightyear integration**: No custom extension needed. Lightyear's `MessageSender` can push messages at any time — the server already uses this pattern for `VoxelEditBroadcast` and `SectionBlocksUpdate` (server/src/map.rs:618-634). The existing `ChunkChannel` (`UnorderedReliable`) and `ChunkDataSync` message type can be reused; only `ChunkRequest` and the client's `request_missing_chunks` system are removed. Lightyear automatically fragments large `PalettedChunk` payloads (>1180 bytes) into multiple packets and reassembles on the receiver. The `ChannelSettings.priority` field (default 1.0) can be tuned to prioritize chunk data over other traffic.
 
 ### Priority Scheduling
 
@@ -522,6 +544,7 @@ Replace `HashSet` iteration with a priority queue:
 ---
 
 ## Optimization Strategies for `voxel_map_engine`
+%% Should prioritize time-based work cap like minecraft
 
 ### Current Bottlenecks
 
@@ -739,28 +762,124 @@ Skip spawning a remesh task if the chunk is still generating, and vice versa.
 
 5. **Multi-stage generation?** Yes. Stages: Empty → Terrain → Features → Light → Mesh → Full. Each stage has neighbor requirements enabling the inaccessible level range.
 
+## Implementation Steps
+
+Each step is independently valuable and fully replaces the relevant code (no wrapper/migration patterns).
+
+### 1. Ticket System + Level Propagation (replaces ChunkTarget)
+
+Minimum viable ticket system. Replace `ChunkTarget` with `ChunkTicket`, replace `loaded_chunks: HashSet<IVec3>` with `chunk_levels: HashMap<IVec2, u32>` (2D column-based), implement bucket-queue BFS level propagation with Chebyshev distance. Initially only Player ticket type needed. All existing consumers of `ChunkTarget.map_entity` switch to `MapInstanceId` + `MapRegistry` (already available on player entities). Generation/meshing gated by level thresholds instead of binary membership.
+
+### 2. Priority Scheduling + Work Caps
+
+Add `BinaryHeap`-based priority queue for generation and remesh spawning. Add per-frame caps on polling and remesh spawning. Add total in-flight task caps. This step is independent of the ticket system — it improves the existing spawning/polling pipeline.
+
+### 3. Multi-Stage Generation
+
+Replace single-step generate-and-mesh with staged pipeline (Empty → Terrain → Features → Mesh → Full). Add neighbor requirements per stage. Ticket levels now gate maximum achievable stage per chunk. This requires the first step (levels determine which stage a chunk can reach).
+
+### 4. Server-Push Networking
+
+Replace client-pull `ChunkRequest`/`ChunkDataSync` with server-push. Server computes per-player chunk visibility from ticket levels and pushes data proactively. Remove `request_missing_chunks` on client, `handle_chunk_requests` on server. Reuse existing `ChunkChannel` and `ChunkDataSync`. This requires the first step (server needs levels to determine what to send).
+
+---
+
+## Planning Information
+
+### Multi-Map Instance Integration
+
+The ticket system must respect per-map isolation. Current architecture:
+- All per-map state lives on the map entity itself (`VoxelMapInstance`, `PendingChunks`, `PendingRemeshes`)
+- `ChunkTarget.map_entity` links targets to specific maps; lifecycle systems filter targets by `map_entity` match
+- Chunk mesh entities are children of their map entity (parent-child hierarchy)
+- `MAX_TASKS_PER_FRAME` is already applied **per map** within `spawn_missing_chunks`
+- `MapRegistry` provides `MapInstanceId` → `Entity` lookup; `MapInstanceId` is replicated
+
+For the ticket system:
+- `ChunkTicket` components need a `map_entity: Entity` field (same pattern as `ChunkTarget`)
+- Level propagation runs per-map (each map has its own `chunk_levels` map)
+- The `TicketLevelPropagator` should be a component on the map entity (not a global resource)
+- An entity can only have one ticket pointing at one map at a time (same constraint as `ChunkTarget`)
+- During map transitions, the ticket is re-pointed to the new map entity; the old map's levels naturally decay as tickets are removed
+
+### Ticket Types Needed Now
+
+| Type | Level | Lifetime | Priority | Notes |
+|---|---|---|---|---|
+| **Player** | 0 | Permanent (while connected) | Must have | Full simulation around players |
+| **NPC** | 1 | Permanent (while alive) | Must have | BlockTicking for NPC-only areas |
+| **MapTransition** | 2 | Temporary (until transition completes) | Must have | Pre-load destination during transition |
+
+Future types (not needed now): Forced (admin/debug), Spawn (world spawn area), Portal, Projectile tracking.
+
+### Load State Behavior for This Project
+
+| State | Level | Server Behavior | Client Behavior |
+|---|---|---|---|
+| **EntityTicking** | 0 | Full simulation: entity AI, physics, spawning, ability processing | Rendered, collidable, animated, predicted |
+| **BlockTicking** | 1 | NPC simulation only: NPC AI, pathfinding. Player entities frozen if present. | Rendered, collidable. No player prediction. |
+| **Border** | 2 | Data loaded, no simulation. Available for neighbor padding (meshing, features). | Rendered, collidable. No simulation. |
+| **Inaccessible** | 3+ | Generation pipeline in progress. Not accessible for gameplay. | Not sent to client. |
+
+### Dependency Graph: Systems Affected by ChunkTarget Removal
+
+**`voxel_map_engine` crate** (core changes):
+- `lifecycle.rs:93-156` (`update_chunks`) — primary consumer; entire desired-set computation replaced by level propagation
+- `lifecycle.rs:161-223` (`purge_stale_targets`, `update_target_caches_for_map`) — removed, replaced by ticket tracking
+- `lifecycle.rs:226-240` (`compute_target_desired`) — removed, replaced by BFS propagation
+- `lifecycle.rs:265-289` (`remove_out_of_range_chunks`) — changes from set-membership to level-threshold eviction
+- `lifecycle.rs:291-314` (`spawn_missing_chunks`) — changes from HashSet iteration to priority queue
+- `lifecycle.rs:438` (`despawn_out_of_range_chunks`) — `.contains()` → `.contains_key()`
+- `lifecycle.rs:491` (`poll_remesh_tasks`) — `.contains()` → `.contains_key()`
+- `chunk.rs:12-29` — `ChunkTarget` definition removed, replaced by `ChunkTicket`
+- `instance.rs:31` — `loaded_chunks: HashSet<IVec3>` → `chunk_levels: HashMap<IVec2, u32>`
+
+**`server` crate**:
+- `gameplay.rs:82` — `ChunkTarget::new(overworld, 1)` → `ChunkTicket` with NPC type
+- `gameplay.rs:317` — `ChunkTarget::new(overworld, 10)` → `ChunkTicket` with Player type
+- `map.rs:806` — transition `ChunkTarget` → transition `ChunkTicket`
+- `map.rs:640-685` (`handle_chunk_requests`) — removed in step 4. (server-push)
+
+**`client` crate**:
+- `map.rs:117-132` (`attach_chunk_target_to_player`) — replaced by ticket attachment
+- `map.rs:135-201` (`request_missing_chunks`) — removed in step 4.
+- `map.rs:205-277` (`handle_chunk_data_sync`) — `loaded_chunks.insert()` → `chunk_levels.insert()`
+- `map.rs:280-413` (4 voxel operation systems) — read `chunk_target.map_entity`; switch to `MapInstanceId` + `MapRegistry` (already available on player entities)
+- `map.rs:453-480` (`handle_voxel_edit_reject`) — same map_entity resolution change
+- `map.rs:525` — transition `ChunkTarget` → transition `ChunkTicket`
+- `map.rs:607` (`check_transition_chunks_loaded`) — `.is_empty()` works on HashMap too
+
+**`protocol` crate**:
+- `map/chunk.rs` — `ChunkRequest` removed in step 4.; `ChunkDataSync` survives
+- `lib.rs:119-122` — `ChunkRequest` registration removed in step 4.
+
+**Tests**: 6 test files across 3 crates use `loaded_chunks` directly; 3 test files insert `ChunkTarget`; 1 integration test exercises `ChunkRequest`/`ChunkDataSync` roundtrip. All need updating.
+
+### Testing and Verification Strategy
+
+1. **Unit tests for `TicketLevelPropagator`**:
+   - Single ticket: verify level = `ticket.level + chebyshev_2d(source, pos)` for all positions in range
+   - Multiple overlapping tickets: verify minimum-wins semantics
+   - Ticket removal: verify levels increase (weaken) correctly
+   - Incremental update: verify only affected chunks are recomputed (count BFS steps)
+   - Edge cases: ticket at map boundary, zero-distance ticket
+
+2. **Integration tests for ticket lifecycle**:
+   - Ticket insertion → chunks transition from Unloaded → appropriate states
+   - Ticket removal → chunks transition to Unloaded (with async task cleanup)
+   - Ticket move (player crosses chunk boundary) → level map updates correctly
+   - Multiple maps: verify cross-map isolation
+
+3. **Runtime verification**:
+   - Tracy instrumentation on level propagation (span per propagation run, step count metric)
+   - Debug visualization: color-coded chunk overlay by effective level (extend existing `debug_colors`)
+   - Assert: no chunk in `Generating` state has tasks in both `PendingChunks` and `PendingRemeshes`
+
 ## Open Questions
 
-1. **Exact level range?** Should we use Minecraft's 22-44 range, or a simpler 0-based range? A 0-based range is cleaner but loses compatibility with Minecraft documentation references.
-%% 0-based
-2. **Batch size tuning?** The optimal chunk batch size (Strategy 4) depends on generation cost per chunk and task pool overhead. Needs profiling with Tracy.
-3. **Amortization budget?** How many BFS steps per frame for level propagation (Strategy 5)? Needs profiling to determine the right balance between responsiveness and frame budget.
-4. **3D propagation cost?** Minecraft propagates in 2D (4/8 neighbors). Our 3D world adds a third axis (6/26 neighbors), increasing propagation volume cubically. May need a tighter max level or cylindrical propagation (2D horizontal + limited vertical).
-%% Use 2d like minecraft
-%% [VIOLATION] Coherence — Open question #4 is a planning blocker. The choice between 6-neighbor vs 26-neighbor vs cylindrical propagation fundamentally changes the algorithm, data structures, and performance characteristics. A planner cannot write a concrete implementation plan without this resolved. Recommend: resolve with a decision and rationale (cylindrical is the most likely winner given that vertical render distance is typically much smaller than horizontal).
-%% [SUGGESTION] Coherence — Open question #1 is also a planning blocker. The level range determines every threshold constant in the system. Recommend: just use 0-based — there is no value in Minecraft compatibility for an unrelated game engine.
-%% [SUGGESTION] Coherence — The doc presents the full target state but doesn't suggest implementation phases. A planner needs to know: what's the minimum viable ticket system? Suggested phasing: (a) ticket system + level propagation replacing ChunkTarget, (b) priority scheduling, (c) multi-stage generation, (d) server-push networking. Each is independently valuable. Do not plan out full work, make a short section on it.
-
-
-## Missing Information for Planning
-
-%% [VIOLATION] Coherence — The following gaps would prevent a planner from writing an actionable implementation plan:
-
-%% 1. **Integration with Multi-map instances** — The doc does not consider how multiple map instances will be supported in this system. Needs further research, consideration and elaboration.
-%% 2. **Which ticket types does this project actually need now?** The doc maps all of Minecraft's types but doesn't prioritize. The project has players and map transitions — does it need Portal/Forced/Spawn tickets today, or just Player tickets? A planner needs a "must have vs nice to have" breakdown. Just Players, map transitions, npcs for now
-
-%% 3. **What do load states actually DO in this project?** Minecraft's EntityTicking/BlockTicking/Border map to specific Minecraft mechanics (redstone, mob AI, etc.). This project has none of those. The doc doesn't define what each load state means for THIS game's mechanics. Without that, load states are unused complexity. A planner needs concrete behavior per state. EntityTicking should be used for full simulation where there are players. BlockTicking should be for chunks with only NPCs, or other non-player mechanics. Border is the same
-
-%% 4. **Integration with existing systems**: Which systems currently depend on `loaded_chunks: HashSet<IVec3>` or `ChunkTarget`? The doc references code locations but doesn't enumerate all consumers. A planner needs the full dependency graph to understand the blast radius.
-
-%% 5. **Testing/verification strategy**: How will the planner verify that the ticket system produces correct level maps? No mention of unit tests for the propagator, integration tests for ticket lifecycle, or runtime verification approach.
+1. **Batch size tuning?** The optimal chunk batch size (Strategy 4) depends on generation cost per chunk and task pool overhead. Needs profiling with Tracy.
+%% Use a reasonable default for now. Research and include details about how to integrate tracy tracing (e.g. spans, and other tracy features) to the code to help us profile
+2. **Amortization budget?** How many BFS steps per frame for level propagation? Needs profiling to balance responsiveness vs frame budget.
+%% Use a reasonable default for now. Research and include details about how to integrate tracy tracing (e.g. spans, and other tracy features) to the code to help us profile
+3. **Column height bounds?** With 2D column-based loading, how tall is a column? Bounded maps have explicit Y bounds. Unbounded maps (overworld) need a defined vertical range — currently the octree height (tree_height=5 → ±16 chunks vertically) implicitly bounds this.
+%% Lets limit it to +/- 8 chunks vertically
