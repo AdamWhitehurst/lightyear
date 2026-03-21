@@ -9,7 +9,7 @@ tags: [research, minecraft, chunk-loading, ticket-system, voxel-map-engine, life
 status: complete
 last_updated: 2026-03-21
 last_updated_by: claude
-last_updated_note: "Resolved all planning blockers: 0-based absolute levels, 2D column propagation, implementation phases, dependency graph, Lightyear integration, testing strategy"
+last_updated_note: "Added architecture diagrams, time-based work budget strategy, Tracy integration guide, resolved batch size/amortization/column height questions"
 ---
 
 # Research: Minecraft's Chunk Loading Ticket System
@@ -32,7 +32,234 @@ The current `voxel_map_engine` has a simpler model: `ChunkTarget` components wit
 
 ---
 
-%% Research the both minecraft's and this project's system architectures and provide a high-level diagram to provide an overview to readers about the interacting pieces
+## Architecture Overview
+
+### Minecraft's Chunk System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Server Tick Loop                             │
+│  ┌──────────────────┐    ┌───────────────────┐                      │
+│  │ChunkTicketManager│    │    ChunkMap       │                      │
+│  │                  │    │ (ThreadedAnvil-   │                      │
+│  │  tickets:        │    │  ChunkStorage)    │                      │
+│  │   Long2Object<   │───▶│                   │                      │
+│  │   List<Ticket>>  │    │  ChunkHolders:    │                      │
+│  │                  │    │   Long2Object<    │                      │
+│  │  LevelPropagator │    │   ChunkHolder>    │                      │
+│  │   (bucket-queue  │    │                   │                      │
+│  │    BFS)          │    │  queueSorter:     │                      │
+│  └──────┬───────────┘    │   LevelPrioritized│                      │
+│         │                │   Queue           │                      │
+│         │ level updates  └────────┬──────────┘                      │
+│         ▼                         │                                 │
+│  ┌──────────────┐                 │ schedules tasks                 │
+│  │ ChunkHolder  │◀────────────────┘                                 │
+│  │              │                                                   │
+│  │ ticketLevel  │    ┌───────────────────────────────────┐          │
+│  │ futures[]    │───▶│   Generation Pipeline (async)     │          │
+│  │ fullChunk-   │    │                                   │          │
+│  │  Status      │    │  EMPTY → STRUCTURE_STARTS →       │          │
+│  └──────────────┘    │  BIOMES → NOISE → SURFACE →       │          │
+│                      │  CARVERS → FEATURES → LIGHT →     │          │
+│                      │  SPAWN → FULL                     │          │
+│                      │                                   │          │
+│                      │  Worker threads: max(1, cores/2)  │          │
+│                      └───────────────┬───────────────────┘          │
+│                                      │ completed chunks             │
+│                                      ▼                              │
+│                      ┌────────────────────────────┐                 │
+│                      │  Client Protocol (push)    │                 │
+│                      │                            │                 │
+│                      │  Set Center Chunk          │                 │
+│                      │  Chunk Data + Light ──────▶│ Client          │
+│                      │  Unload Chunk              │ (passive)       │
+│                      └────────────────────────────┘                 │
+└─────────────────────────────────────────────────────────────────────┘
+
+Ticket Sources:
+  Player(31) ──┐
+  Spawn(22)  ──┤   min(level + chebyshev_dist)
+  Portal(30) ──┼──▶ per-chunk effective level ──▶ LoadState
+  Forced(31) ──┤      (bucket-queue BFS)          ≤31: EntityTicking
+  Dragon(24) ──┘                                   32: BlockTicking
+                                                   33: Border
+                                                 34-44: Inaccessible
+                                                  45+: Unloaded
+```
+
+### Current `voxel_map_engine` Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    System Chain (Update, chained)                   │
+│                                                                     │
+│  ensure_pending    update_chunks     poll_chunk       despawn_out   │
+│  _chunks      ──▶              ──▶  _tasks       ──▶ _of_range      │
+│  (insert             │               │               _chunks        │
+│   PendingChunks)     │               │                              │
+│                      │               │               spawn_remesh   │
+│                      │               │           ──▶ _tasks         │
+│                      │               │               │              │
+│                      │               │               poll_remesh    │
+│                      │               │           ──▶ _tasks         │
+│                      ▼               ▼                              │
+│               ┌─────────────┐  ┌──────────────┐                     │
+│               │ ChunkTarget │  │ PendingChunks│                     │
+│               │             │  │              │                     │
+│               │ map_entity  │  │ tasks: Vec<  │                     │
+│               │ distance    │  │  Task<Gen>>  │                     │
+│               └──────┬──────┘  │ pending_pos: │                     │
+│                      │         │  HashSet     │                     │
+│     compute_target   │         └──────┬───────┘                     │
+│     _desired         │                │                             │
+│     (cubic volume)   │                │ poll_once (check_ready)     │
+│           │          │                ▼                             │
+│           ▼          │         ┌──────────────┐                     │
+│     ┌──────────┐     │         │VoxelMapInst  │                     │
+│     │ desired: │     │         │              │                     │
+│     │ HashSet  │─────┘         │ tree: Octree │                     │
+│     │ <IVec3>  │               │ loaded_chunks│                     │
+│     └──────────┘               │ dirty_chunks │                     │
+│                                │ chunks_need  │                     │
+│                                │  _remesh     │                     │
+│                                └──────────────┘                     │
+│                                                                     │
+│  Async: AsyncComputeTaskPool                                        │
+│    spawn_chunk_gen_task: disk_load || generate → mesh               │
+│    spawn_remesh_task: expand_palette → mesh                         │
+│    MAX_TASKS_PER_FRAME = 32 (gen spawn only)                        │
+│    No cap on: gen polls, remesh spawns, remesh polls                │
+│    No priority: HashSet iteration order                             │
+└─────────────────────────────────────────────────────────────────────┘
+
+Data Flow:
+  ChunkTarget ──▶ cubic desired set ──▶ spawn gen tasks (≤32/frame)
+       │                                       │
+       │         AsyncComputeTaskPool          │
+       │         ┌─────────────────┐           │
+       │         │ generate() OR   │◀──────────┘
+       │         │ load_from_disk()│
+       │         │ + mesh_greedy() │
+       │         └────────┬────────┘
+       │                  │ completed
+       │                  ▼
+       │         insert ChunkData into octree
+       │         spawn mesh Entity (child of map)
+       │
+       └──▶ remove_out_of_range: evict data + save dirty
+            despawn_out_of_range: despawn mesh entities
+```
+
+### Proposed `voxel_map_engine` Architecture (Ticket-Based)
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    System Chain (Update, chained)                        │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Phase 1: Ticket Collection + Level Propagation                  │     │
+│  │                                                                 │     │
+│  │  ECS World                    TicketLevelPropagator             │     │
+│  │  ┌──────────────┐            (Component on map entity)          │     │
+│  │  │ ChunkTicket  │                                               │     │
+│  │  │  type: Player│──┐         ┌────────────────────────┐         │     │
+│  │  │  level: 0    │  │  read   │ pending_updates_by_    │         │     │
+│  │  │  lifetime: ∞ │  ├────────▶│   level: [HashSet; N]  │         │     │
+│  │  ├──────────────┤  │         │ min_pending_level      │         │     │
+│  │  │ ChunkTicket  │  │         │                        │         │     │
+│  │  │  type: NPC   │──┘         │ apply_pending_updates  │         │     │
+│  │  │  level: 1    │            │   (≤256 BFS steps/frame│         │     │
+│  │  │  lifetime: ∞ │            │    amortized)          │         │     │
+│  │  ├──────────────┤            └───────────┬────────────┘         │     │
+│  │  │ ChunkTicket  │                        │                      │     │
+│  │  │  type: Trans │                        │ writes               │     │
+│  │  │  level: 2    │                        ▼                      │     │
+│  │  │  lifetime: T │            ┌────────────────────────┐         │     │
+│  │  └──────────────┘            │ chunk_levels:          │         │     │
+│  │                              │  HashMap<IVec2, u32>   │         │     │
+│  │  Propagation: Chebyshev 2D   │                        │         │     │
+│  │  effective_level(col) =      │ Level → LoadState:     │         │     │
+│  │    min { T.level +           │  0: EntityTicking      │         │     │
+│  │      max(|dx|,|dz|) }        │  1: BlockTicking       │         │     │
+│  │    over all tickets T        │  2: Border             │         │     │
+│  │                              │  3+: Inaccessible      │         │     │
+│  │  Column height: ±8 chunks    │  N+: Unloaded          │         │     │
+│  └──────────────────────────────┴────────────────────────┘─────────┘     │
+│         │                                                                │
+│         │ level diffs (new, upgraded, downgraded, unloaded)              │
+│         ▼                                                                │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Phase 2: Priority Work Queue                                    │     │
+│  │                                                                 │     │
+│  │  ChunkWorkBudget (time-based, ~4ms/frame)                       │     │
+│  │  ┌───────────────────────────────────────────┐                  │     │
+│  │  │ BinaryHeap<ChunkWork>                     │                  │     │
+│  │  │   sort: level ASC, distance ASC           │                  │     │
+│  │  │                                           │                  │     │
+│  │  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐          │                  │     │
+│  │  │  │ L=0 │ │ L=0 │ │ L=1 │ │ L=2 │ ...      │                  │     │
+│  │  │  │ d=1 │ │ d=3 │ │ d=2 │ │ d=5 │          │                  │     │
+│  │  │  └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘          │                  │     │
+│  │  └─────┼───────┼───────┼───────┼─────────────┘                  │     │
+│  │        │highest priority       │lowest                          │     │
+│  └────────┼───────┼───────┼───────┼────────────────────────────────┘     │
+│           ▼       ▼       ▼       ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Phase 3: Multi-Stage Generation Pipeline (async)                │     │
+│  │                                                                 │     │
+│  │  AsyncComputeTaskPool (batched, 4 chunks/task)                  │     │
+│  │                                                                 │     │
+│  │  ┌───────┐   ┌─────────┐   ┌──────────┐   ┌──────┐   ┌──────┐   │     │
+│  │  │ Empty │──▶│ Terrain │──▶│ Features │──▶│ Light│──▶│ Mesh │   │     │
+│  │  │       │   │ (noise, │   │ (trees,  │   │      │   │(greedy   │     │
+│  │  │       │   │  biomes)│   │  ores)   │   │      │   │ quads)   │     │
+│  │  └───────┘   └─────────┘   └──────────┘   └──────┘   └──┬───┘   │     │
+│  │                  │              │              │        │       │     │
+│  │              needs: self    needs: 1-ring  needs: 1-ring│       │     │
+│  │                only        at Terrain     at Features   │       │     │
+│  │                                                         │       │     │
+│  │  In-flight caps: gen=128, remesh=64                     │       │     │
+│  │  ChunkWorkTracker { generating, remeshing } (mutex-free)│       │     │
+│  └─────────────────────────────────────────────────────────┼───────┘     │
+│                                                            │             │
+│         ┌──────────────────────────────────────────────────┘             │
+│         │ completed (within budget)                                      │
+│         ▼                                                                │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Phase 4: Commit Results                                         │     │
+│  │                                                                 │     │
+│  │  poll_chunk_tasks (budget-capped)                               │     │
+│  │    → insert ChunkData into octree                               │     │
+│  │    → advance chunk stage in chunk_levels                        │     │
+│  │    → spawn mesh Entity (if Mesh stage reached)                  │     │
+│  │                                                                 │     │
+│  │  poll_remesh_tasks (budget-capped)                              │     │
+│  │    → replace/spawn/despawn mesh entities                        │     │
+│  │                                                                 │     │
+│  │  despawn_out_of_range_chunks                                    │     │
+│  │    → level-threshold eviction (not set-membership)              │     │
+│  │    → save dirty chunks to disk (ascynronous)                    │     │
+│  └─────────────────────────────────────────────────────────────────┘     │
+│         │                                                                │
+│         │ chunks at Border level or better                               │
+│         ▼                                                                │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Phase 5: Server-Push Networking                                 │     │
+│  │                                                                 │     │
+│  │  Per-player visibility from chunk_levels:                       │     │
+│  │    level ≤ 2 (Border+) → send ChunkDataSync to client           │     │
+│  │    level > 2 (was ≤2)  → send UnloadChunk to client             │     │
+│  │    player moves         → send CenterChunk update               │     │
+│  │                                                                 │     │
+│  │  Client: passive receiver, no ChunkRequest                      │     │
+│  └─────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  Tracy Instrumentation:                                                  │
+│    info_span! on each phase  │  plot! for queue depths, budget,          │
+│    info_span! per gen stage  │  in-flight counts, BFS steps              │
+└──────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Minecraft's Ticket System
 
@@ -544,7 +771,8 @@ Replace `HashSet` iteration with a priority queue:
 ---
 
 ## Optimization Strategies for `voxel_map_engine`
-%% Should prioritize time-based work cap like minecraft
+
+The primary optimization should be a **time-based work budget** (like Minecraft), not hard per-frame counts. Hard counts are a blunt instrument — 16 polls per frame may be too many on slow hardware and too few on fast hardware. A time budget adapts automatically.
 
 ### Current Bottlenecks
 
@@ -557,18 +785,65 @@ Replace `HashSet` iteration with a priority queue:
 | Total in-flight tasks | No cap | Memory grows unbounded under sustained load |
 | Level computation | N/A (flat model) | Full recompute of desired set on chunk boundary crossing |
 
-### Strategy 1: Per-Frame Work Caps
+### Strategy 1: Time-Based Work Budget (Primary)
 
-Limit main-thread work per frame across all phases:
+Like Minecraft's `BooleanSupplier shouldKeepTicking` pattern, use a **time budget** rather than hard counts. The chunk systems check elapsed time and stop processing when the budget is exhausted:
 
 ```rust
-const MAX_GEN_SPAWNS_PER_FRAME: usize = 32;    // existing, keep
-const MAX_GEN_POLLS_PER_FRAME: usize = 16;      // NEW: cap octree insertions + mesh entity spawns
-const MAX_REMESH_SPAWNS_PER_FRAME: usize = 16;  // NEW: cap remesh task spawning
-const MAX_REMESH_POLLS_PER_FRAME: usize = 16;   // NEW: cap mesh replacements
+use std::time::{Duration, Instant};
+
+/// Budget for all chunk work within a single frame.
+/// Minecraft uses the remainder of a 50ms tick. We target a fraction of frame time.
+const CHUNK_WORK_BUDGET: Duration = Duration::from_millis(4); // ~25% of 16ms frame at 60fps
+
+struct ChunkWorkBudget {
+    start: Instant,
+    budget: Duration,
+}
+
+impl ChunkWorkBudget {
+    fn new() -> Self {
+        Self { start: Instant::now(), budget: CHUNK_WORK_BUDGET }
+    }
+
+    /// Returns true if there is time remaining in the budget.
+    /// Equivalent to Minecraft's `shouldKeepTicking` BooleanSupplier.
+    fn has_time(&self) -> bool {
+        self.start.elapsed() < self.budget
+    }
+}
 ```
 
-Unprocessed work stays in the queue for next frame. This bounds worst-case frame time from chunk operations.
+Thread the budget through all chunk systems in the chain:
+```rust
+// In poll_chunk_tasks:
+while i < pending.tasks.len() && budget.has_time() { ... }
+
+// In spawn_missing_chunks:
+while let Some(work) = queue.pop() {
+    if !budget.has_time() { break; }
+    ...
+}
+
+// In spawn_remesh_tasks:
+for chunk_pos in positions {
+    if !budget.has_time() { break; }
+    ...
+}
+```
+
+Use a shared `Local<ChunkWorkBudget>` or pass it through the system chain. The budget is created at the start of `update_chunks` and consumed across all downstream systems.
+
+**Hard caps as safety fallback** — even with time budgets, add absolute maximums to prevent pathological cases (e.g., if `Instant::now()` is cheap but a single operation is unexpectedly expensive):
+
+```rust
+const MAX_GEN_SPAWNS_PER_FRAME: usize = 64;    // safety cap
+const MAX_GEN_POLLS_PER_FRAME: usize = 32;      // safety cap
+const MAX_REMESH_SPAWNS_PER_FRAME: usize = 32;  // safety cap
+const MAX_REMESH_POLLS_PER_FRAME: usize = 32;   // safety cap
+```
+
+Unprocessed work stays in the queue for next frame.
 
 ### Strategy 2: Total In-Flight Task Caps
 
@@ -875,11 +1150,106 @@ Future types (not needed now): Forced (admin/debug), Spawn (world spawn area), P
    - Debug visualization: color-coded chunk overlay by effective level (extend existing `debug_colors`)
    - Assert: no chunk in `Generating` state has tasks in both `PendingChunks` and `PendingRemeshes`
 
-## Open Questions
+## Resolved Open Questions
 
-1. **Batch size tuning?** The optimal chunk batch size (Strategy 4) depends on generation cost per chunk and task pool overhead. Needs profiling with Tracy.
-%% Use a reasonable default for now. Research and include details about how to integrate tracy tracing (e.g. spans, and other tracy features) to the code to help us profile
-2. **Amortization budget?** How many BFS steps per frame for level propagation? Needs profiling to balance responsiveness vs frame budget.
-%% Use a reasonable default for now. Research and include details about how to integrate tracy tracing (e.g. spans, and other tracy features) to the code to help us profile
-3. **Column height bounds?** With 2D column-based loading, how tall is a column? Bounded maps have explicit Y bounds. Unbounded maps (overworld) need a defined vertical range — currently the octree height (tree_height=5 → ±16 chunks vertically) implicitly bounds this.
-%% Lets limit it to +/- 8 chunks vertically
+1. **Batch size tuning?** Use **4 chunks per batch** as a reasonable default. Tune with Tracy profiling (see Tracy Integration section below).
+
+2. **Amortization budget?** Use **256 BFS steps per frame** as a reasonable default. A player ticket at level 0 with a 10-chunk radius affects ~441 chunks (21x21 in 2D). 256 steps handles most single-ticket additions in one frame. For larger changes (teleport), propagation spreads across 2-3 frames. Tune with Tracy profiling.
+
+3. **Column height bounds?** Fixed at **±8 chunks vertically** (256 voxels total height, Y range [-128, 128) in world space at CHUNK_SIZE=16). Bounded maps use their explicit Y bounds instead. This gives a reasonable vertical range without the cost of propagating through the full octree height.
+
+## Tracy Integration for Profiling
+
+The project already uses Tracy via Bevy's `trace_tracy` feature (activated at build time: `cargo run -p server --features bevy/trace_tracy`). Existing `info_span!` calls in `lifecycle.rs`, `generation.rs`, `meshing.rs`, and `terrain.rs` appear as Tracy zones.
+
+### Current Tracy Instrumentation
+
+13 existing `info_span!` calls across `voxel_map_engine`:
+- `lifecycle.rs`: `collect_desired_positions`, `remove_out_of_range_chunks`, `expand_palette`
+- `generation.rs`: `disk_load_expand`, `mesh_chunk`, `terrain_gen`, `palettize_chunk`
+- `meshing.rs`: `greedy_quads`, `assemble_vertices`
+- `terrain.rs`: `build_height_cache`, `build_moisture_cache`, `fill_voxels`
+
+### Adding Numeric Plots for Optimization Tuning
+
+`info_span!` gives timing data but not numeric metrics. For tuning batch sizes, budgets, and queue depths, use `tracy-client` directly for plots:
+
+```toml
+# crates/voxel_map_engine/Cargo.toml
+[features]
+tracy = ["tracy-client/enable"]
+
+[dependencies]
+tracy-client = { version = "0.18", default-features = false }
+```
+
+Without the `enable` feature, all `tracy-client` macros compile to no-ops (zero cost).
+
+```rust
+use tracy_client::{plot, plot_name};
+
+fn poll_chunk_tasks(/* ... */) {
+    // Emit numeric metrics visible as time-series plots in Tracy
+    plot!(plot_name!("gen_tasks_in_flight"), pending.tasks.len() as f64);
+    plot!(plot_name!("gen_tasks_polled_this_frame"), polled as f64);
+    plot!(plot_name!("chunk_work_budget_remaining_us"),
+          budget.remaining().as_micros() as f64);
+}
+
+fn spawn_missing_chunks(/* ... */) {
+    plot!(plot_name!("gen_queue_depth"), work_queue.len() as f64);
+    plot!(plot_name!("gen_spawned_this_frame"), spawned as f64);
+}
+
+fn spawn_remesh_tasks(/* ... */) {
+    plot!(plot_name!("remesh_tasks_in_flight"), pending.tasks.len() as f64);
+    plot!(plot_name!("remesh_spawned_this_frame"), spawned as f64);
+}
+
+fn apply_pending_level_updates(/* ... */) {
+    plot!(plot_name!("bfs_steps_this_frame"), steps as f64);
+    plot!(plot_name!("dirty_chunks_remaining"), propagator.dirty_count() as f64);
+}
+```
+
+### Adding Spans for New Systems
+
+```rust
+use tracing::info_span;
+
+fn propagate_ticket_levels(/* ... */) {
+    let _span = info_span!("propagate_ticket_levels").entered();
+    // ... BFS work ...
+}
+
+// For async tasks, span per sync block (not across .await):
+let task = pool.spawn(async move {
+    let _z = info_span!("chunk_gen_batch").entered();
+    batch.iter().map(|&pos| generate_chunk(pos, &*gen)).collect::<Vec<_>>()
+});
+```
+
+### Workspace Wiring
+
+```toml
+# Root Cargo.toml
+[workspace.dependencies]
+tracy-client = { version = "0.18", default-features = false }
+
+# App crate features (e.g., server/Cargo.toml)
+[features]
+tracy = ["bevy/trace_tracy", "voxel_map_engine/tracy"]
+```
+
+Run: `cargo run -p server --features tracy`
+
+### Key Metrics to Monitor During Tuning
+
+| Metric | What It Tells You | Tune |
+|---|---|---|
+| `gen_tasks_in_flight` | Backpressure health; should stay under cap | `MAX_PENDING_GEN_TASKS` |
+| `gen_tasks_polled_this_frame` | Main-thread cost of chunk insertion | `CHUNK_WORK_BUDGET` |
+| `gen_queue_depth` | How far behind generation is | `MAX_GEN_SPAWNS_PER_FRAME`, batch size |
+| `remesh_tasks_in_flight` | Remesh backpressure | `MAX_PENDING_REMESH_TASKS` |
+| `bfs_steps_this_frame` | Level propagation cost | BFS step budget (256 default) |
+| `chunk_work_budget_remaining_us` | Whether budget is exhausted or wasted | `CHUNK_WORK_BUDGET` duration |
