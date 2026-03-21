@@ -225,11 +225,11 @@ Initialize `chunk_levels: HashMap::new()` in `VoxelMapInstance::new()`.
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all` passes
-- [ ] `cargo test-all` passes (all existing tests unchanged)
+- [x] `cargo check-all` passes
+- [x] `cargo test-all` passes (all existing tests unchanged)
 
 #### Manual Verification:
-- [ ] New types are accessible from the prelude
+- [x] New types are accessible from the prelude
 
 ### Tests:
 
@@ -277,11 +277,14 @@ mod tests {
         assert_eq!(chunk_to_column(IVec3::new(1, 99, 2)), IVec2::new(1, 2));
     }
 
+    /// Create a dummy entity for tests (not PLACEHOLDER, which triggers debug_assert).
+    fn test_entity() -> Entity {
+        Entity::from_raw_u32(999).expect("valid test entity")
+    }
+
     #[test]
     fn convenience_constructors_use_default_radii() {
-        // Using PLACEHOLDER for consistency with existing tests in chunk.rs.
-        // These tests don't need distinct entities — just testing field values.
-        let e = Entity::PLACEHOLDER;
+        let e = test_entity();
         let p = ChunkTicket::player(e);
         assert_eq!(p.ticket_type, TicketType::Player);
         assert_eq!(p.radius, 10);
@@ -295,7 +298,7 @@ mod tests {
 
     #[test]
     fn new_allows_custom_radius() {
-        let e = Entity::PLACEHOLDER;
+        let e = test_entity();
         let t = ChunkTicket::new(e, TicketType::Player, 20);
         assert_eq!(t.radius, 20);
     }

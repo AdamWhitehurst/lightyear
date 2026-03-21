@@ -10,6 +10,7 @@ pub mod palette;
 pub mod persistence;
 pub mod raycast;
 pub mod terrain;
+pub mod ticket;
 pub mod types;
 
 use bevy::prelude::*;
@@ -55,5 +56,6 @@ pub mod prelude {
     pub use crate::palette::*;
     pub use crate::raycast::*;
     pub use crate::terrain::*;
+    pub use crate::ticket::*;
     pub use crate::types::*;
 }

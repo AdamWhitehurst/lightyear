@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use grid_tree::{NodeKey, OctreeI32, VisitCommand};
 use ndshape::ConstShape;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::api::voxel_to_chunk_pos;
 use crate::config::VoxelMapConfig;
@@ -29,6 +29,9 @@ pub struct Arena {
 pub struct VoxelMapInstance {
     pub tree: OctreeI32<Option<ChunkData>>,
     pub loaded_chunks: HashSet<IVec3>,
+    /// Effective level per loaded column (level ≤ LOAD_LEVEL_THRESHOLD only).
+    /// Coexists with `loaded_chunks` temporarily — Phase 3 removes `loaded_chunks`.
+    pub chunk_levels: HashMap<IVec2, u32>,
     /// Chunks with unsaved voxel modifications.
     pub dirty_chunks: HashSet<IVec3>,
     /// Chunks that need async remeshing after in-place mutation.
@@ -41,6 +44,7 @@ impl VoxelMapInstance {
         Self {
             tree: OctreeI32::new(tree_height as u8),
             loaded_chunks: HashSet::new(),
+            chunk_levels: HashMap::new(),
             dirty_chunks: HashSet::new(),
             chunks_needing_remesh: HashSet::new(),
             debug_colors: false,
