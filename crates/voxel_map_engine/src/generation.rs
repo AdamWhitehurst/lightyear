@@ -8,13 +8,13 @@ use bevy::tasks::{AsyncComputeTaskPool, Task};
 
 use crate::config::VoxelGenerator;
 use crate::meshing::mesh_chunk_greedy;
-use crate::types::WorldVoxel;
+use crate::types::{ChunkData, FillType, WorldVoxel};
 
 /// Result of an async chunk generation task.
 pub struct ChunkGenResult {
     pub position: IVec3,
     pub mesh: Option<Mesh>,
-    pub voxels: Vec<WorldVoxel>,
+    pub chunk_data: ChunkData,
     /// Whether this chunk was loaded from disk rather than generated.
     pub from_disk: bool,
 }
@@ -40,18 +40,20 @@ pub fn spawn_chunk_gen_task(
         if let Some(ref dir) = save_dir {
             match crate::persistence::load_chunk(dir, position) {
                 Ok(Some(chunk_data)) => {
-                    let voxels = {
-                        let _span = info_span!("disk_load_expand").entered();
-                        chunk_data.voxels.to_voxels()
-                    };
-                    let mesh = {
+                    let mesh = if chunk_data.fill_type == FillType::Empty {
+                        None
+                    } else {
+                        let voxels = {
+                            let _span = info_span!("disk_load_expand").entered();
+                            chunk_data.voxels.to_voxels()
+                        };
                         let _span = info_span!("mesh_chunk").entered();
                         mesh_chunk_greedy(&voxels)
                     };
                     return ChunkGenResult {
                         position,
                         mesh,
-                        voxels,
+                        chunk_data,
                         from_disk: true,
                     };
                 }
@@ -74,14 +76,20 @@ fn generate_chunk(position: IVec3, generator: &dyn Fn(IVec3) -> Vec<WorldVoxel>)
         let _span = info_span!("terrain_gen").entered();
         generator(position)
     };
-    let mesh = {
+    let chunk_data = {
+        let _span = info_span!("palettize_chunk").entered();
+        ChunkData::from_voxels(&voxels)
+    };
+    let mesh = if chunk_data.fill_type == FillType::Empty {
+        None
+    } else {
         let _span = info_span!("mesh_chunk").entered();
         mesh_chunk_greedy(&voxels)
     };
     ChunkGenResult {
         position,
         mesh,
-        voxels,
+        chunk_data,
         from_disk: false,
     }
 }

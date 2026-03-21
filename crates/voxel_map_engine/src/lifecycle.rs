@@ -2,14 +2,14 @@ use bevy::log::info_span;
 use bevy::prelude::*;
 use bevy::tasks::futures::check_ready;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::chunk::{ChunkTarget, VoxelChunk};
 use crate::config::{VoxelGenerator, VoxelMapConfig};
 use crate::generation::{PendingChunks, spawn_chunk_gen_task};
 use crate::instance::VoxelMapInstance;
 use crate::meshing::mesh_chunk_greedy;
-use crate::types::{CHUNK_SIZE, ChunkData};
+use crate::types::CHUNK_SIZE;
 
 const MAX_TASKS_PER_FRAME: usize = 32;
 
@@ -74,8 +74,22 @@ pub fn ensure_pending_chunks(
     }
 }
 
+/// Per-target cached state for desired chunk positions.
+///
+/// Opaque to external consumers; only exposed as `pub` because Bevy's system
+/// parameter inference requires the type to be visible at the function's visibility.
+pub struct TargetCache {
+    chunk_pos: IVec3,
+    map_entity: Entity,
+    distance: u32,
+    desired: HashSet<IVec3>,
+}
+
 /// Determine which chunk positions should be loaded based on all targets for a map.
 /// Spawn async generation tasks for missing chunks and mark out-of-range chunks for removal.
+///
+/// Caches each target's desired chunk set and only recomputes when the target
+/// crosses a chunk boundary, changes map, or changes distance.
 pub fn update_chunks(
     mut map_query: Query<(
         Entity,
@@ -85,69 +99,156 @@ pub fn update_chunks(
         &mut PendingChunks,
         &GlobalTransform,
     )>,
-    target_query: Query<(&ChunkTarget, &GlobalTransform)>,
+    target_query: Query<(Entity, &ChunkTarget, &GlobalTransform)>,
     mut tick: Local<u32>,
+    mut target_cache: Local<HashMap<Entity, TargetCache>>,
+    mut desired_cache: Local<HashMap<Entity, HashSet<IVec3>>>,
 ) {
     let map_count = map_query.iter().count();
     *tick += 1;
     if map_count > 0 && *tick % 300 == 0 {
         trace!("update_chunks: iterating {map_count} map(s)");
     }
+
+    let mut maps_needing_update = purge_stale_targets(&target_query, &mut target_cache);
+
     for (map_entity, mut instance, config, generator, mut pending, map_transform) in &mut map_query
     {
-        let desired = {
-            let _span = info_span!("collect_desired_positions").entered();
-            collect_desired_positions(map_entity, map_transform, config, &target_query)
-        };
-
-        if desired.is_empty() && !instance.loaded_chunks.is_empty() {
-            info!(
-                "update_chunks: map {map_entity:?} has {} loaded chunks but 0 desired — will clean up",
-                instance.loaded_chunks.len()
-            );
+        let map_inv = map_transform.affine().inverse();
+        let targets_changed = update_target_caches_for_map(
+            map_entity,
+            &map_inv,
+            config.bounds,
+            &target_query,
+            &mut target_cache,
+        );
+        if targets_changed {
+            maps_needing_update.insert(map_entity);
         }
 
-        {
-            let _span = info_span!("remove_out_of_range_chunks").entered();
-            remove_out_of_range_chunks(&mut instance, &desired, config.save_dir.as_deref());
+        if maps_needing_update.contains(&map_entity) {
+            let desired = {
+                let _span = info_span!("collect_desired_positions").entered();
+                union_desired_from_cache(&target_cache, map_entity)
+            };
+
+            if desired.is_empty() && !instance.loaded_chunks.is_empty() {
+                info!(
+                    "update_chunks: map {map_entity:?} has {} loaded chunks but 0 desired — will clean up",
+                    instance.loaded_chunks.len()
+                );
+            }
+
+            {
+                let _span = info_span!("remove_out_of_range_chunks").entered();
+                remove_out_of_range_chunks(&mut instance, &desired, config.save_dir.as_deref());
+            }
+
+            desired_cache.insert(map_entity, desired);
         }
+
         if config.generates_chunks {
-            spawn_missing_chunks(&mut instance, &mut pending, config, generator, &desired);
+            if let Some(desired) = desired_cache.get(&map_entity) {
+                spawn_missing_chunks(&mut instance, &mut pending, config, generator, desired);
+            }
         }
     }
 }
 
-fn collect_desired_positions(
-    map_entity: Entity,
-    map_transform: &GlobalTransform,
-    config: &VoxelMapConfig,
-    target_query: &Query<(&ChunkTarget, &GlobalTransform)>,
-) -> HashSet<IVec3> {
-    let mut desired = HashSet::new();
-    // invert the map transform to get the local transform of the target
-    let map_inv = map_transform.affine().inverse();
+/// Remove cache entries for despawned targets. Returns the set of map entities
+/// that had targets removed (and thus need their desired sets rebuilt).
+fn purge_stale_targets(
+    target_query: &Query<(Entity, &ChunkTarget, &GlobalTransform)>,
+    cache: &mut HashMap<Entity, TargetCache>,
+) -> HashSet<Entity> {
+    let active: HashSet<Entity> = target_query.iter().map(|(e, _, _)| e).collect();
+    let stale: Vec<Entity> = cache
+        .keys()
+        .filter(|e| !active.contains(e))
+        .copied()
+        .collect();
+    let mut affected_maps = HashSet::new();
+    for entity in stale {
+        if let Some(cached) = cache.remove(&entity) {
+            affected_maps.insert(cached.map_entity);
+        }
+    }
+    affected_maps
+}
 
-    for (target, transform) in target_query.iter() {
+/// Check each target on this map and update its cache if its chunk position changed.
+/// Returns true if any target was added or changed.
+fn update_target_caches_for_map(
+    map_entity: Entity,
+    map_inv: &bevy::math::Affine3A,
+    bounds: Option<IVec3>,
+    target_query: &Query<(Entity, &ChunkTarget, &GlobalTransform)>,
+    cache: &mut HashMap<Entity, TargetCache>,
+) -> bool {
+    let mut changed = false;
+
+    for (target_entity, target, transform) in target_query.iter() {
         if target.map_entity != map_entity {
             continue;
         }
-        let local_pos = map_inv.transform_point3(transform.translation());
-        let center = world_to_chunk_pos(local_pos);
-        let dist = target.distance as i32;
 
-        for x in -dist..=dist {
-            for y in -dist..=dist {
-                for z in -dist..=dist {
-                    let pos = center + IVec3::new(x, y, z);
-                    if is_within_bounds(pos, config.bounds) {
-                        desired.insert(pos);
-                    }
+        let local_pos = map_inv.transform_point3(transform.translation());
+        let chunk_pos = world_to_chunk_pos(local_pos);
+
+        let needs_update = match cache.get(&target_entity) {
+            Some(cached) => {
+                cached.chunk_pos != chunk_pos
+                    || cached.map_entity != map_entity
+                    || cached.distance != target.distance
+            }
+            None => true,
+        };
+
+        if needs_update {
+            let desired = compute_target_desired(chunk_pos, target.distance, bounds);
+            cache.insert(
+                target_entity,
+                TargetCache {
+                    chunk_pos,
+                    map_entity,
+                    distance: target.distance,
+                    desired,
+                },
+            );
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+/// Compute the set of chunk positions desired by a single target.
+fn compute_target_desired(center: IVec3, distance: u32, bounds: Option<IVec3>) -> HashSet<IVec3> {
+    let dist = distance as i32;
+    let mut desired = HashSet::new();
+    for x in -dist..=dist {
+        for y in -dist..=dist {
+            for z in -dist..=dist {
+                let pos = center + IVec3::new(x, y, z);
+                if is_within_bounds(pos, bounds) {
+                    desired.insert(pos);
                 }
             }
         }
     }
-
     desired
+}
+
+/// Union all cached desired sets for a given map.
+fn union_desired_from_cache(
+    cache: &HashMap<Entity, TargetCache>,
+    map_entity: Entity,
+) -> HashSet<IVec3> {
+    cache
+        .values()
+        .filter(|c| c.map_entity == map_entity)
+        .flat_map(|c| c.desired.iter().copied())
+        .collect()
 }
 
 fn world_to_chunk_pos(translation: Vec3) -> IVec3 {
@@ -274,12 +375,7 @@ fn handle_completed_chunk(
     result: crate::generation::ChunkGenResult,
 ) {
     instance.loaded_chunks.insert(result.position);
-
-    let chunk_data = {
-        let _span = info_span!("palettize_chunk").entered();
-        ChunkData::from_voxels(&result.voxels)
-    };
-    instance.insert_chunk_data(result.position, chunk_data);
+    instance.insert_chunk_data(result.position, result.chunk_data);
 
     let Some(mesh) = result.mesh else {
         return;
@@ -360,6 +456,10 @@ pub fn spawn_remesh_tasks(mut map_query: Query<(&mut VoxelMapInstance, &mut Pend
                 trace!("spawn_remesh_tasks: chunk {chunk_pos} no longer in octree, skipping");
                 continue;
             };
+            if chunk_data.fill_type == crate::types::FillType::Empty {
+                trace!("spawn_remesh_tasks: chunk {chunk_pos} is empty, skipping remesh");
+                continue;
+            }
             let voxels = {
                 let _span = info_span!("expand_palette").entered();
                 chunk_data.voxels.to_voxels()
