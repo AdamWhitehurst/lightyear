@@ -2,7 +2,7 @@
 
 ## Overview
 
-Add 90-degree orbital camera rotation around the player on Q/E press with smooth lerping. Movement and facing become camera-relative by rotating the `ActionState` move axis pair on the client before lightyear captures it — no protocol changes needed.
+Add 90-degree orbital camera rotation around the player on Q/E press with smooth visual lerping. Movement and facing become camera-relative by adding a `CameraYaw` single-axis input to `PlayerActions` — `apply_movement` and `update_facing` read it and rotate internally. Server receives the yaw via lightyear input replication and computes identically.
 
 ## Current State Analysis
 
@@ -15,7 +15,7 @@ Add 90-degree orbital camera rotation around the player on Q/E press with smooth
 - `Rotation` is predicted with rollback (`crates/protocol/src/lib.rs:190-194`)
 
 ### Key Discoveries:
-- `ActionState::set_axis_pair()` exists — lightyear's FPS example uses it for programmatic axis mutation
+- `ActionState::set_value()`/`value()` exist for `InputControlKind::Axis` — perfect for a single float
 - Leafwing updates `ActionState` in `PreUpdate`
 - Lightyear buffers inputs in `FixedPreUpdate` at `InputSystems::BufferClientInputs`
 - Existing exponential lerp pattern: `(SPEED * dt).min(1.0)` (`crates/sprite_rig/src/animation.rs:70-88`)
@@ -23,12 +23,12 @@ Add 90-degree orbital camera rotation around the player on Q/E press with smooth
 ## Desired End State
 
 - Q rotates camera 90° counter-clockwise around player, E rotates clockwise
-- Four discrete positions (0°, 90°, 180°, 270°), smooth lerp between them (~0.15s)
+- Four discrete positions (0°, 90°, 180°, 270°), smooth visual lerp between them
 - WASD movement is camera-relative (W = toward camera "forward")
 - Character faces camera-relative direction
 - Lighting follows camera rotation
-- Server receives already-rotated input — prediction works identically on both sides
-- No changes to `crates/protocol/`
+- Movement snaps to new orientation immediately on Q/E press (uses `target_angle`), camera visually catches up
+- Server receives `CameraYaw` via input replication — prediction identical on both sides
 
 ### Verification:
 - Press Q/E: camera smoothly orbits to next 90° position
@@ -42,12 +42,12 @@ Add 90-degree orbital camera rotation around the player on Q/E press with smooth
 - Free-rotation (mouse orbit) — discrete 90° only
 - Camera zoom
 - Camera tilt adjustment
-- Networking camera state
-- Modifying the protocol crate
 
 ## Implementation Approach
 
-**Input rotation strategy**: A client-only system in `FixedPreUpdate` (before `InputSystems::BufferClientInputs`) reads the camera's current yaw and calls `set_axis_pair` to rotate the move vector. Lightyear then buffers and replicates the already-rotated values. Both client and server run identical `apply_movement` / `update_facing` on the same rotated input.
+**CameraYaw as replicated input**: Add `CameraYaw` variant to `PlayerActions` with `InputControlKind::Axis`. Client writes `CameraOrbitState.target_angle` into it each frame via `set_value()`. Both `apply_movement` and `update_facing` read it via `value()` and rotate the movement/facing internally. No `ActionState` mutation of the `Move` axis — rotation is applied inside the shared protocol systems.
+
+Using `target_angle` (discrete 0/π/2/π/3π/2) rather than `current_angle` (lerped visual value) ensures deterministic, stable values with no floating-point divergence between client and server.
 
 ## Phase 1: Camera Orbit State & Lerped Follow
 
@@ -140,7 +140,7 @@ fn update_camera_orbit(time: Res<Time>, mut query: Query<&mut CameraOrbitState>)
 
 #### 5. Register `update_camera_orbit`
 **File**: `crates/render/src/lib.rs`
-**Change**: Add `update_camera_orbit` to `Update`, before `follow_player`.
+**Change**: Add `update_camera_orbit` to `Update`, before `follow_player`. Chain the update systems for correct ordering.
 
 ```rust
 app.add_systems(
@@ -155,12 +155,10 @@ app.add_systems(
 );
 ```
 
-Note: `.chain()` ensures orbit update runs before follow_player. The other systems also benefit from ordering (billboard reads camera transform set by follow_player).
-
 ### Success Criteria:
 
 #### Automated Verification:
-- [x] `cargo check-all`
+- [ ] `cargo check-all`
 
 #### Manual Verification:
 - [ ] Camera spawns at default position (unchanged from current behavior)
@@ -168,14 +166,42 @@ Note: `.chain()` ensures orbit update runs before follow_player. The other syste
 
 ---
 
-## Phase 2: Q/E Input Handling
+## Phase 2: Q/E Input & CameraYaw PlayerAction
 
 ### Overview
-Handle Q/E keypresses to cycle the camera's target angle by ±90°. Uses `ButtonInput<KeyCode>` directly since this is client-only — no need to add to `PlayerActions`.
+Handle Q/E keypresses to cycle the camera's target angle by ±90°. Add `CameraYaw` to `PlayerActions` as a single-axis input. Client writes `target_angle` into it each frame.
 
 ### Changes Required:
 
-#### 1. Q/E input system
+#### 1. Add `CameraYaw` to `PlayerActions`
+**File**: `crates/protocol/src/lib.rs`
+
+```rust
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Hash, Reflect)]
+pub enum PlayerActions {
+    Move,
+    CameraYaw,
+    Jump,
+    PlaceVoxel,
+    RemoveVoxel,
+    Ability1,
+    Ability2,
+    Ability3,
+    Ability4,
+}
+
+impl Actionlike for PlayerActions {
+    fn input_control_kind(&self) -> InputControlKind {
+        match self {
+            Self::Move => InputControlKind::DualAxis,
+            Self::CameraYaw => InputControlKind::Axis,
+            _ => InputControlKind::Button,
+        }
+    }
+}
+```
+
+#### 2. Q/E input system
 **File**: `crates/render/src/camera.rs`
 
 ```rust
@@ -197,7 +223,32 @@ fn handle_camera_rotation_input(
 }
 ```
 
-#### 2. Register the system
+#### 3. Re-export `CameraOrbitState` from render crate
+**File**: `crates/render/src/lib.rs`
+**Change**: Add `pub use camera::CameraOrbitState;`
+
+#### 4. Client system to write `CameraYaw` into `ActionState`
+**File**: `crates/client/src/gameplay.rs`
+
+```rust
+use render::CameraOrbitState;
+
+/// Writes the camera's target yaw angle into the player's ActionState for replication.
+fn sync_camera_yaw_to_input(
+    camera_query: Query<&CameraOrbitState>,
+    mut player_query: Query<&mut ActionState<PlayerActions>, With<Predicted>>,
+) {
+    let Ok(orbit) = camera_query.single() else {
+        return;
+    };
+
+    for mut action_state in &mut player_query {
+        action_state.set_value(&PlayerActions::CameraYaw, orbit.target_angle);
+    }
+}
+```
+
+#### 5. Register systems
 **File**: `crates/render/src/lib.rs`
 **Change**: Add `handle_camera_rotation_input` before `update_camera_orbit` in the chain.
 
@@ -215,10 +266,23 @@ app.add_systems(
 );
 ```
 
+**File**: `crates/client/src/gameplay.rs`
+**Change**: Register `sync_camera_yaw_to_input` in `FixedPreUpdate` before lightyear buffers.
+
+```rust
+use lightyear::prelude::InputSystems;
+
+// In ClientGameplayPlugin::build:
+app.add_systems(
+    FixedPreUpdate,
+    sync_camera_yaw_to_input.before(InputSystems::BufferClientInputs),
+);
+```
+
 ### Success Criteria:
 
 #### Automated Verification:
-- [x] `cargo check-all`
+- [ ] `cargo check-all`
 
 #### Manual Verification:
 - [ ] Q press: camera smoothly rotates 90° CCW around player
@@ -228,79 +292,60 @@ app.add_systems(
 
 ---
 
-## Phase 3: Camera-Relative Movement Input
+## Phase 3: Camera-Relative Movement & Facing
 
 ### Overview
-Client-only system that rotates the `ActionState<PlayerActions>::Move` axis pair by the camera's current yaw angle. Runs in `FixedPreUpdate` before lightyear buffers the input, so both client and server receive the rotated values.
+Modify `apply_movement` and `update_facing` in the protocol crate to read `CameraYaw` from `ActionState` and rotate the movement direction and facing internally. Both client and server execute the same code with the same yaw value.
 
 ### Changes Required:
 
-#### 1. Make `CameraOrbitState` public
-**File**: `crates/render/src/camera.rs`
-**Change**: `CameraOrbitState` is already `pub`. Ensure `crates/render/src/lib.rs` re-exports it.
-
-**File**: `crates/render/src/lib.rs`
-**Change**: Add `pub use camera::CameraOrbitState;` at the top.
-
-#### 2. Input rotation system
-**File**: `crates/client/src/gameplay.rs`
+#### 1. Modify `apply_movement`
+**File**: `crates/protocol/src/character/movement.rs`
+**Change**: Read `CameraYaw` and rotate the movement direction.
 
 ```rust
-use render::CameraOrbitState;
-
-/// Rotates the move input axis pair by camera yaw so movement is camera-relative.
-/// Runs before lightyear buffers inputs, so the server receives already-rotated values.
-fn rotate_movement_input(
-    camera_query: Query<&CameraOrbitState>,
-    mut player_query: Query<&mut ActionState<PlayerActions>, With<Predicted>>,
-) {
-    let Ok(orbit) = camera_query.single() else {
-        return;
-    };
-    if orbit.current_angle.abs() < 0.001 {
-        return;
-    }
-
-    for mut action_state in &mut player_query {
-        let move_input = action_state.axis_pair(&PlayerActions::Move);
-        if move_input == Vec2::ZERO {
-            continue;
-        }
-        let (sin, cos) = orbit.current_angle.sin_cos();
-        let rotated = Vec2::new(
-            move_input.x * cos - move_input.y * sin,
-            move_input.x * sin + move_input.y * cos,
-        );
-        action_state.set_axis_pair(&PlayerActions::Move, rotated);
-    }
-}
+// Horizontal movement
+let move_dir = action_state
+    .axis_pair(&PlayerActions::Move)
+    .clamp_length_max(1.0);
+let yaw = action_state.value(&PlayerActions::CameraYaw);
+let move_dir = Quat::from_rotation_y(yaw) * Vec3::new(-move_dir.x, 0.0, move_dir.y);
 ```
 
-#### 3. Register with correct ordering
-**File**: `crates/client/src/gameplay.rs`
+#### 2. Modify `update_facing`
+**File**: `crates/protocol/src/character/movement.rs`
+**Change**: Add yaw offset to facing rotation.
 
 ```rust
-use lightyear::prelude::InputSystems;
-
-// In ClientGameplayPlugin::build:
-app.add_systems(
-    FixedPreUpdate,
-    rotate_movement_input.before(InputSystems::BufferClientInputs),
-);
+pub fn update_facing(
+    mut query: Query<(&ActionState<PlayerActions>, &mut Rotation), With<CharacterMarker>>,
+) {
+    for (action_state, mut rotation) in &mut query {
+        let move_dir = action_state
+            .axis_pair(&PlayerActions::Move)
+            .clamp_length_max(1.0);
+        if move_dir != Vec2::ZERO {
+            let yaw = action_state.value(&PlayerActions::CameraYaw);
+            *rotation = Rotation(Quat::from_rotation_y(
+                f32::atan2(move_dir.x, -move_dir.y) + yaw,
+            ));
+        }
+    }
+}
 ```
 
 ### Success Criteria:
 
 #### Automated Verification:
-- [x] `cargo check-all`
+- [ ] `cargo check-all`
 
 #### Manual Verification:
 - [ ] Default camera (0° rotation): WASD unchanged
-- [ ] After Q press (90° CCW): W moves character to the right relative to world, but "forward" relative to camera
-- [ ] After two Q presses (180°): W moves character in +Z world direction (toward camera's new "forward")
-- [ ] Character faces movement direction correctly (update_facing uses the rotated input)
-- [ ] Multiplayer: start server + client, rotate camera, move — no excessive rollbacks
-- [ ] During lerp transition: movement smoothly transitions between orientations
+- [ ] After Q press: W moves character "forward" relative to camera
+- [ ] After two Q presses (180°): W moves toward what was previously "backward"
+- [ ] Character faces movement direction correctly relative to camera
+- [ ] Multiplayer: `cargo server` + `cargo client` — rotate camera, move — no excessive rollbacks, server matches client
+- [ ] Movement snaps to new orientation on Q/E press, camera visually catches up
 
 ---
 
@@ -362,10 +407,25 @@ fn update_light_position(
 **File**: `crates/render/src/lib.rs`
 **Change**: Add `camera::update_light_position` after `camera::follow_player` in the chain.
 
+```rust
+app.add_systems(
+    Update,
+    (
+        camera::handle_camera_rotation_input,
+        camera::update_camera_orbit,
+        camera::follow_player,
+        camera::update_light_position,
+        health_bar::billboard_face_camera,
+        health_bar::update_health_bars,
+    )
+        .chain(),
+);
+```
+
 ### Success Criteria:
 
 #### Automated Verification:
-- [x] `cargo check-all`
+- [ ] `cargo check-all`
 
 #### Manual Verification:
 - [ ] Light rotates with camera — shadows shift consistently with view angle
@@ -377,10 +437,10 @@ fn update_light_position(
 
 ### Manual Testing Steps:
 1. `cargo server` then `cargo client` — verify default camera position unchanged
-2. Press Q — camera orbits 90° CCW smoothly (~0.15s)
+2. Press Q — camera orbits 90° CCW smoothly
 3. Press E — camera orbits 90° CW smoothly
 4. Press Q four times — full 360°, returns to original position
-5. Hold W during rotation — character movement transitions smoothly from one orientation to another
+5. Hold W during Q press — movement snaps to new direction immediately, camera catches up visually
 6. After rotation, verify WASD feels correct relative to camera
 7. Verify character facing matches movement direction
 8. Start second client — verify multiplayer prediction is clean (no jittering)
@@ -388,9 +448,9 @@ fn update_light_position(
 
 ## Performance Considerations
 
-- One additional `sin_cos` call per frame per predicted player entity — negligible
-- Lerp update is a single multiply-add per frame — negligible
-- No new allocations, no new queries beyond what's needed
+- One `value()` read + `Quat::from_rotation_y` + quaternion multiply per entity per `FixedUpdate` tick — negligible
+- One `sin_cos` for lerp per frame — negligible
+- `CameraYaw` adds one f32 per tick to lightyear input replication — negligible bandwidth
 
 ## References
 
@@ -398,5 +458,5 @@ fn update_light_position(
 - Camera system: `crates/render/src/camera.rs`
 - Movement: `crates/protocol/src/character/movement.rs`
 - Client gameplay: `crates/client/src/gameplay.rs`
-- Lightyear FPS example (set_axis_pair pattern): `git/lightyear/examples/fps/src/client.rs:46-48`
+- PlayerActions: `crates/protocol/src/lib.rs:54-73`
 - Existing lerp pattern: `crates/sprite_rig/src/animation.rs:70-88`
