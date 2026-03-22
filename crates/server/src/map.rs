@@ -644,6 +644,9 @@ pub struct ClientChunkVisibility {
     sent_chunks: HashSet<IVec3>,
     /// Columns the client believes are loaded (for sending UnloadColumn).
     sent_columns: HashSet<IVec2>,
+    /// The map entity these tracking sets are scoped to. Reset when the
+    /// player's ticket switches maps (e.g. map transition).
+    tracked_map: Option<Entity>,
 }
 
 /// Server system: for each connected player, compare their ticket's loaded columns
@@ -660,6 +663,14 @@ pub fn push_chunks_to_clients(
     mut multi_sender: ServerMultiMessageSender,
 ) {
     for (ticket, controlled_by, pos, mut visibility) in &mut player_query {
+        // Reset tracking when the player's ticket switches maps (e.g. map transition).
+        // The client despawns the old map, so all previously-sent data is stale.
+        if visibility.tracked_map != Some(ticket.map_entity) {
+            visibility.sent_chunks.clear();
+            visibility.sent_columns.clear();
+            visibility.tracked_map = Some(ticket.map_entity);
+        }
+
         let Ok(instance) = map_query.get(ticket.map_entity) else {
             trace!(
                 "push_chunks_to_clients: map entity {:?} not found",

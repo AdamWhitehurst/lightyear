@@ -23,8 +23,12 @@ const RAYCAST_MAX_DISTANCE: f32 = 100.0;
 /// Buffers ChunkDataSync messages that arrive before the client player is ready.
 /// Lightyear clears MessageReceiver each frame in Last, so we must drain and
 /// hold messages ourselves until the predicted player entity has a ChunkTicket.
-#[derive(Resource, Default)]
-struct ChunkDataSyncBuffer(Vec<ChunkDataSync>);
+/// Tracks which map the buffered data is for; cleared on map transition.
+#[derive(Default)]
+struct ChunkDataSyncBuffer {
+    chunks: Vec<ChunkDataSync>,
+    map_entity: Option<Entity>,
+}
 
 /// Tracks pending predictions for block edits awaiting server acknowledgment.
 #[derive(Resource, Default)]
@@ -58,7 +62,6 @@ impl Plugin for ClientMapPlugin {
         app.add_plugins(VoxelPlugin)
             .init_resource::<MapRegistry>()
             .init_resource::<VoxelPredictionState>()
-            .init_resource::<ChunkDataSyncBuffer>()
             .add_systems(Startup, spawn_overworld)
             .add_systems(
                 Update,
@@ -152,10 +155,29 @@ fn handle_chunk_data_sync(
                 "handle_chunk_data_sync: buffering {} messages (no predicted player with ChunkTicket yet)",
                 incoming.len()
             );
-            buffer.0.extend(incoming);
+            buffer.chunks.extend(incoming);
         }
         return;
     };
+
+    // Clear stale buffer data when transitioning between maps.
+    // Only clear when we had a previous map — on first init (None → Some),
+    // the buffered chunks ARE for the correct map and must not be discarded.
+    if let Some(current_map) = buffer.map_entity {
+        if current_map != chunk_ticket.map_entity {
+            if !buffer.chunks.is_empty() {
+                trace!(
+                    "handle_chunk_data_sync: discarding {} buffered messages (map changed from {:?} to {:?})",
+                    buffer.chunks.len(),
+                    buffer.map_entity,
+                    chunk_ticket.map_entity
+                );
+                buffer.chunks.clear();
+            }
+        }
+    }
+    buffer.map_entity = Some(chunk_ticket.map_entity);
+
     let Ok((map_entity, mut instance)) = map_query.get_mut(chunk_ticket.map_entity) else {
         if !incoming.is_empty() {
             trace!(
@@ -163,12 +185,12 @@ fn handle_chunk_data_sync(
                 incoming.len(),
                 chunk_ticket.map_entity
             );
-            buffer.0.extend(incoming);
+            buffer.chunks.extend(incoming);
         }
         return;
     };
 
-    let all_syncs = buffer.0.drain(..).chain(incoming);
+    let all_syncs = buffer.chunks.drain(..).chain(incoming);
 
     for sync in all_syncs {
         let voxels = sync.data.to_voxels();
