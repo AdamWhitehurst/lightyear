@@ -206,11 +206,13 @@ Add `ChunkWorkBudget` to `ensure_pending_chunks` (same pattern as `TicketLevelPr
 
 In `update_chunks`: add `&mut ChunkWorkBudget` to the map query. Call `budget.reset()` at the top of the per-map loop body.
 
-#### 3. Thread budget through downstream systems
+#### 3. Thread budget through systems and helpers
 
-`update_chunks` adds `&mut ChunkWorkBudget` to its map query and passes it as a parameter to helper functions. Systems that are separate ECS systems (`poll_chunk_tasks`, `poll_remesh_tasks`) add `&ChunkWorkBudget` to their own map queries.
+`spawn_missing_chunks` is a helper called from `update_chunks`, not a standalone system — it receives the budget as a function parameter. The actual ECS systems (`poll_chunk_tasks`, `spawn_remesh_tasks`, `poll_remesh_tasks`) add `&ChunkWorkBudget` to their map queries directly.
 
-**`spawn_missing_chunks`**: Accepts `&ChunkWorkBudget` parameter from `update_chunks`. Check `budget.has_time()` in the loop alongside `spawned >= MAX_GEN_SPAWNS_PER_FRAME`. Remove old `MAX_TASKS_PER_FRAME` constant.
+**`update_chunks`**: Add `&mut ChunkWorkBudget` to the map query. Pass `&budget` to `spawn_missing_chunks`.
+
+**`spawn_missing_chunks`**: Accept `budget: &ChunkWorkBudget` parameter. Check `budget.has_time()` in the loop alongside `spawned >= MAX_GEN_SPAWNS_PER_FRAME`. Remove old `MAX_TASKS_PER_FRAME` constant.
 
 **`poll_chunk_tasks`**: Add budget + counter check:
 ```rust
@@ -407,19 +409,27 @@ pub fn min_distance_to_source(&self, col: IVec2) -> u32 {
 #### 4. Priority for remesh spawning
 **File**: `crates/voxel_map_engine/src/lifecycle.rs`
 
-In `spawn_remesh_tasks`, sort positions by distance to nearest source before iterating:
+Remesh uses the same `BinaryHeap` pattern as gen. Reuse `ChunkWork` (remesh doesn't have a level, so use 0 — distance is the only sort key):
+
 ```rust
-let mut positions: Vec<(IVec3, u32)> = instance.chunks_needing_remesh.iter()
-    .map(|&pos| {
-        let col = chunk_to_column(pos);
-        let dist = propagator.min_distance_to_source(col);
-        (pos, dist)
-    })
-    .collect();
-positions.sort_by_key(|(_, dist)| *dist);
+let mut heap = BinaryHeap::new();
+for &pos in instance.chunks_needing_remesh.iter() {
+    let col = chunk_to_column(pos);
+    heap.push(ChunkWork {
+        position: pos,
+        effective_level: 0,
+        distance_to_source: propagator.min_distance_to_source(col),
+    });
+}
+while let Some(work) = heap.pop() {
+    if !budget.has_time() || spawned >= MAX_REMESH_SPAWNS_PER_FRAME { break; }
+    instance.chunks_needing_remesh.remove(&work.position);
+    // ... spawn task ...
+    spawned += 1;
+}
 ```
 
-Add `&TicketLevelPropagator` to the `spawn_remesh_tasks` query.
+Add `&TicketLevelPropagator` and `&ChunkWorkBudget` to the `spawn_remesh_tasks` query.
 
 #### 5. In-flight task caps (async backpressure)
 **File**: `crates/voxel_map_engine/src/lifecycle.rs`
@@ -440,7 +450,6 @@ if pending.tasks.len() >= MAX_PENDING_GEN_TASKS {
     return;
 }
 ```
-**Note**: Phase 6 (batching) will change `pending.tasks.len()` to `pending.tasks.len() + pending.batch_tasks.len()` when `batch_tasks` is introduced.
 
 In `spawn_remesh_tasks`:
 ```rust
@@ -455,7 +464,8 @@ Also check inside the loop — the in-flight count grows as we spawn within a si
 // Inside spawn_missing_chunks loop:
 if pending.tasks.len() >= MAX_PENDING_GEN_TASKS { break; }
 ```
-**Note**: Phase 6 updates this to `pending.tasks.len() + pending.batch_tasks.len()`.
+
+> **Note**: Phase 6 (Batched Generation) changes `PendingChunks` to use `batch_tasks`. At that point, in-flight checks become `pending.batch_tasks.len() >= MAX_PENDING_GEN_TASKS`.
 
 #### 6. Tracy plots
 ```rust
@@ -490,11 +500,13 @@ Replace detached fire-and-forget save tasks with a bounded `PendingSaves` queue.
 ```rust
 use bevy::tasks::Task;
 
+use std::collections::VecDeque;
+
 /// Queued chunk saves awaiting async I/O.
 #[derive(Component, Default)]
 pub struct PendingSaves {
-    /// Chunks waiting to be saved (not yet spawned as tasks).
-    queue: Vec<PendingSave>,
+    /// Chunks waiting to be saved (not yet spawned as tasks). FIFO order.
+    queue: VecDeque<PendingSave>,
     /// In-flight async save tasks.
     tasks: Vec<Task<()>>,
 }
@@ -533,7 +545,7 @@ fn remove_column_chunks(
         if instance.dirty_chunks.remove(&chunk_pos) {
             if let Some(dir) = save_dir {
                 if let Some(chunk_data) = instance.get_chunk_data(chunk_pos) {
-                    pending_saves.queue.push(PendingSave {
+                    pending_saves.queue.push_back(PendingSave {
                         position: chunk_pos,
                         data: chunk_data.clone(),
                         save_dir: dir.to_path_buf(),
@@ -575,7 +587,7 @@ pub fn drain_pending_saves(
             && pending.tasks.len() < MAX_PENDING_SAVE_TASKS
             && spawned < MAX_SAVE_SPAWNS_PER_FRAME
         {
-            let save = pending.queue.swap_remove(0);
+            let save = pending.queue.pop_front().unwrap();
             let task = pool.spawn(async move {
                 if let Err(e) = crate::persistence::save_chunk(
                     &save.save_dir, save.position, &save.data
@@ -605,12 +617,10 @@ pub fn drain_pending_saves(
 
 Note: `drain_pending_saves` does NOT consume the `ChunkWorkBudget`. Save I/O is independent of the chunk generation pipeline — saves happen even when the generation budget is exhausted. Saves use their own separate caps.
 
-Note: `pending.queue` should be a `VecDeque` (not `Vec`) for O(1) `pop_front()` FIFO semantics. Using `Vec` with `swap_remove(0)` is O(n) and produces non-deterministic drain order after the first removal.
-
 #### 5. Add to system chain
 **File**: `crates/voxel_map_engine/src/lib.rs`
 
-Add `drain_pending_saves` to the system chain. It should run after `update_chunks` (which calls `remove_column_chunks` to enqueue saves for dirty evicted chunks) and can run alongside remesh systems:
+Add `drain_pending_saves` to the system chain. Save enqueuing happens in `remove_column_chunks`, called from `update_chunks` during level diff processing. `drain_pending_saves` runs later in the chain to process the accumulated queue:
 
 ```rust
 app.add_systems(
@@ -680,17 +690,17 @@ fn process_pending_updates(&mut self, max_steps: usize) -> usize {
             level_idx += 1;
             continue;
         }
-        let columns: Vec<IVec2> = self.pending_by_level[level_idx].drain().collect();
+        let mut columns: Vec<IVec2> = self.pending_by_level[level_idx].drain().collect();
         let mut processed = 0;
-        for col in &columns {
-            self.recompute_column(*col);
+        for &col in &columns {
+            if steps >= max_steps { break; }
+            self.recompute_column(col);
             steps += 1;
             processed += 1;
-            if steps >= max_steps { break; }
         }
-        // Re-insert unprocessed columns to avoid data loss
+        // Re-insert unprocessed columns back into the bucket
         if processed < columns.len() {
-            self.pending_by_level[level_idx].extend(&columns[processed..]);
+            self.pending_by_level[level_idx].extend(columns.drain(processed..));
         }
         level_idx = self.find_min_pending_from(0);
     }
@@ -736,28 +746,26 @@ Existing tests call `propagate()` and expect full completion. For tests, either:
 - Call `propagate()` in a loop until `!is_dirty()`:
 
 ```rust
+/// Runs propagation to completion across multiple amortized calls.
+/// Returns the final loaded set (not accumulated partial diffs, which
+/// can contain duplicates — e.g., a column "loaded" in diff 1 then
+/// "changed" in diff 2).
 fn propagate_fully(prop: &mut TicketLevelPropagator) -> LevelDiff {
-    let mut combined = LevelDiff::default();
     while prop.is_dirty() {
-        let diff = prop.propagate();
-        combined.loaded.extend(diff.loaded);
-        combined.changed.extend(diff.changed);
-        combined.unloaded.extend(diff.unloaded);
+        prop.propagate();
     }
-    // Deduplicate: a column that appeared in `loaded` in one frame and `changed`
-    // in a later frame should only appear in `loaded` (its final state).
-    // For correctness, remove from `loaded` anything that later appeared in `changed`,
-    // and remove from both anything that later appeared in `unloaded`.
-    let unloaded_set: HashSet<_> = combined.unloaded.iter().copied().collect();
-    combined.loaded.retain(|(col, _)| !unloaded_set.contains(col));
-    combined.changed.retain(|(col, _)| !unloaded_set.contains(col));
-    let changed_cols: HashSet<_> = combined.changed.iter().map(|(col, _)| *col).collect();
-    combined.loaded.retain(|(col, _)| !changed_cols.contains(col));
-    combined
+    // Build diff from final state vs empty (everything is "loaded")
+    let mut diff = LevelDiff::default();
+    for (&col, &level) in prop.levels() {
+        if level <= LOAD_LEVEL_THRESHOLD {
+            diff.loaded.push((col, level));
+        }
+    }
+    diff
 }
 ```
 
-Prefer the test helper approach — it validates the amortization logic actually produces correct cumulative results.
+Prefer the test helper approach — it validates the amortization logic produces correct final state. Tests that need intermediate diff semantics should call `propagate()` directly.
 
 ### Success Criteria:
 
@@ -834,16 +842,20 @@ pub fn spawn_chunk_gen_batch(
 }
 ```
 
-#### 3. Update PendingChunks for batches
+#### 3. Replace PendingChunks task storage
 **File**: `crates/voxel_map_engine/src/generation.rs`
+
+Replace the single-chunk `tasks` field with batch-only storage. A "batch" of 1 is just a batch — no need for dual-path polling.
 
 ```rust
 #[derive(Component, Default)]
 pub struct PendingChunks {
-    pub tasks: Vec<Task<Vec<ChunkGenResult>>>,  // always batched (batch_size=1 for single chunks)
+    pub tasks: Vec<Task<Vec<ChunkGenResult>>>,
     pub pending_positions: HashSet<IVec3>,
 }
 ```
+
+Remove `spawn_chunk_gen_task` — all spawning goes through `spawn_chunk_gen_batch`. Callers that previously spawned single chunks now pass a `vec![position]`.
 
 #### 4. Update `spawn_missing_chunks` to batch
 
@@ -852,7 +864,7 @@ Collect up to `GEN_BATCH_SIZE` positions from the heap before spawning:
 let mut batch = Vec::with_capacity(GEN_BATCH_SIZE);
 while let Some(work) = heap.pop() {
     if !budget.has_time() || spawned >= MAX_GEN_SPAWNS_PER_FRAME { break; }
-    if pending.tasks.len() + pending.batch_tasks.len() >= MAX_PENDING_GEN_TASKS { break; }
+    if pending.tasks.len() >= MAX_PENDING_GEN_TASKS { break; }
     batch.push(work.position);
     spawned += 1;
     if batch.len() >= GEN_BATCH_SIZE {
@@ -864,27 +876,26 @@ if !batch.is_empty() {
 }
 ```
 
-#### 5. Update `poll_chunk_tasks` to handle batches
+#### 5. Update `poll_chunk_tasks` for batch tasks
 
-Poll `batch_tasks`, flattening results:
+Since `tasks` is now `Vec<Task<Vec<ChunkGenResult>>>`, polling yields a `Vec` of results per task:
 ```rust
-// Poll batch tasks
-let mut bi = 0;
-while bi < pending.batch_tasks.len() && budget.has_time() && polled < MAX_GEN_POLLS_PER_FRAME {
-    if let Some(results) = check_ready(&mut pending.batch_tasks[bi]) {
-        let _ = pending.batch_tasks.swap_remove(bi);
+let mut i = 0;
+while i < pending.tasks.len() && budget.has_time() && polled < MAX_GEN_POLLS_PER_FRAME {
+    if let Some(results) = check_ready(&mut pending.tasks[i]) {
+        let _ = pending.tasks.swap_remove(i);
         for result in results {
             pending.pending_positions.remove(&result.position);
             handle_completed_chunk(/* ... */, result);
             polled += 1;
         }
     } else {
-        bi += 1;
+        i += 1;
     }
 }
 ```
 
-Note: `polled` increments per-result (not per-task), so `MAX_GEN_POLLS_PER_FRAME` limits the number of individual chunk results processed. A batch of 4 counts as 4 polls. The `has_time()` budget check provides the secondary time-based cap.
+Note: `polled` counts individual chunk results, not batch tasks. A single batch completion may yield up to `GEN_BATCH_SIZE` results, each incrementing `polled`. Both `polled < MAX_GEN_POLLS_PER_FRAME` and `budget.has_time()` are checked per outer iteration, so a batch that pushes past the hard cap won't start processing the next batch.
 
 ### Success Criteria:
 
@@ -955,7 +966,7 @@ tracker.remeshing.remove(&remesh.chunk_pos);
 
 `PendingChunks.pending_positions` is now redundant — it duplicates `tracker.generating`. Replace all `pending.pending_positions` usage with `tracker.generating`. Remove `pending_positions` from `PendingChunks`.
 
-**Cross-phase note**: Phase 6's `spawn_chunk_gen_batch` uses `pending.pending_positions.insert(pos)`. This phase retroactively updates that code to use `tracker.generating.insert(pos)` instead. Implementers should apply Phase 7's changes to Phase 6's code at this point.
+> **Cross-phase dependency**: Phase 6's `spawn_chunk_gen_batch` uses `pending.pending_positions.insert(pos)`. This phase replaces those calls with `tracker.generating.insert(pos)`. Phase 6's code must be updated retroactively when this phase is implemented.
 
 ### Success Criteria:
 
@@ -1010,18 +1021,18 @@ fn process_pending_updates(&mut self, max_steps: usize) -> usize {
         let Some((&level, _)) = self.pending_by_level.first_key_value() else {
             break;
         };
-        let columns: Vec<IVec2> = self.pending_by_level.remove(&level).unwrap().into_iter().collect();
+        let mut columns: Vec<IVec2> = self.pending_by_level.remove(&level).unwrap().into_iter().collect();
         let mut processed = 0;
-        for col in &columns {
-            self.recompute_column(*col);
+        for &col in &columns {
+            if steps >= max_steps { break; }
+            self.recompute_column(col);
             steps += 1;
             processed += 1;
-            if steps >= max_steps { break; }
         }
-        // Re-insert unprocessed columns to avoid data loss
+        // Re-insert unprocessed columns back into the BTreeMap
         if processed < columns.len() {
             self.pending_by_level.entry(level).or_default()
-                .extend(&columns[processed..]);
+                .extend(columns.drain(processed..));
         }
     }
     // Clean up empty entries
@@ -1082,8 +1093,8 @@ pub fn new() -> Self {
 
 ## Performance Considerations
 
-- Both gen and remesh priority should use the same data structure for consistency. `BinaryHeap` is preferred for both (gen priority in `spawn_missing_chunks`, remesh priority in `spawn_remesh_tasks`) since both need priority iteration with early exit against a budget. `Vec` + `sort_by_key` works but is O(n log n) vs `BinaryHeap`'s O(n) heapify.
-- `BinaryHeap` rebuild per frame in `spawn_missing_chunks` — acceptable because it only contains chunks without data (shrinks as chunks load)
+- Both gen and remesh use `BinaryHeap` for priority ordering — consistent pattern, and both benefit from early exit without sorting the full set
+- `BinaryHeap` rebuild per frame in `spawn_missing_chunks` and `spawn_remesh_tasks` — acceptable: gen heap shrinks as chunks load, remesh heap is typically small
 - `min_distance_to_source` iterates all sources per column — fine with <100 sources (tickets). If sources grow large, add a spatial index later
 - Batch size 4 is conservative — tune with Tracy data
 - BFS amortization 256 steps handles 1 player ticket in 1-2 frames. Multiple concurrent teleports may take more frames — acceptable
