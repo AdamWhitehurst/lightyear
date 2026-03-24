@@ -937,8 +937,8 @@ Note: `polled` counts individual chunk results, not batch tasks. A single batch 
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all`
-- [ ] `cargo test -p voxel_map_engine`
+- [x] `cargo check-all`
+- [x] `cargo test -p voxel_map_engine`
 - [ ] `cargo server` && `cargo client -c 1`
 
 #### Manual Verification:

@@ -10,6 +10,9 @@ use crate::config::VoxelGenerator;
 use crate::meshing::mesh_chunk_greedy;
 use crate::types::{ChunkData, FillType, WorldVoxel};
 
+/// Number of chunks to generate per async task.
+pub const GEN_BATCH_SIZE: usize = 4;
+
 /// Result of an async chunk generation task.
 pub struct ChunkGenResult {
     pub position: IVec3,
@@ -22,53 +25,63 @@ pub struct ChunkGenResult {
 /// Pending async chunk generation tasks for a map entity.
 #[derive(Component, Default)]
 pub struct PendingChunks {
-    pub tasks: Vec<Task<ChunkGenResult>>,
+    pub tasks: Vec<Task<Vec<ChunkGenResult>>>,
     pub pending_positions: HashSet<IVec3>,
 }
 
-/// Spawn an async task that loads a chunk from disk (if available) or generates it.
-pub fn spawn_chunk_gen_task(
+/// Spawn an async task that generates a batch of chunks.
+///
+/// Each position is first checked on disk; if not found, the generator is used.
+pub fn spawn_chunk_gen_batch(
     pending: &mut PendingChunks,
-    position: IVec3,
+    positions: Vec<IVec3>,
     generator: &VoxelGenerator,
     save_dir: Option<PathBuf>,
 ) {
     let generator = Arc::clone(&generator.0);
     let pool = AsyncComputeTaskPool::get();
 
-    let task = pool.spawn(async move {
-        if let Some(ref dir) = save_dir {
-            match crate::persistence::load_chunk(dir, position) {
-                Ok(Some(chunk_data)) => {
-                    let mesh = if chunk_data.fill_type == FillType::Empty {
-                        None
-                    } else {
-                        let voxels = {
-                            let _span = info_span!("disk_load_expand").entered();
-                            chunk_data.voxels.to_voxels()
-                        };
-                        let _span = info_span!("mesh_chunk").entered();
-                        mesh_chunk_greedy(&voxels)
-                    };
-                    return ChunkGenResult {
-                        position,
-                        mesh,
-                        chunk_data,
-                        from_disk: true,
-                    };
-                }
-                Ok(None) => {} // No saved file, generate fresh
-                Err(e) => {
-                    bevy::log::warn!("Failed to load chunk at {position}: {e}, regenerating");
-                }
-            }
-        }
+    for &pos in &positions {
+        pending.pending_positions.insert(pos);
+    }
 
-        generate_chunk(position, &*generator)
+    let task = pool.spawn(async move {
+        let _span = info_span!("chunk_gen_batch", count = positions.len()).entered();
+        positions
+            .into_iter()
+            .map(|pos| {
+                if let Some(ref dir) = save_dir {
+                    match crate::persistence::load_chunk(dir, pos) {
+                        Ok(Some(chunk_data)) => {
+                            let mesh = if chunk_data.fill_type == FillType::Empty {
+                                None
+                            } else {
+                                let voxels = {
+                                    let _span = info_span!("disk_load_expand").entered();
+                                    chunk_data.voxels.to_voxels()
+                                };
+                                let _span = info_span!("mesh_chunk").entered();
+                                mesh_chunk_greedy(&voxels)
+                            };
+                            return ChunkGenResult {
+                                position: pos,
+                                mesh,
+                                chunk_data,
+                                from_disk: true,
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            bevy::log::warn!("Failed to load chunk at {pos}: {e}, regenerating");
+                        }
+                    }
+                }
+                generate_chunk(pos, &*generator)
+            })
+            .collect()
     });
 
     pending.tasks.push(task);
-    pending.pending_positions.insert(position);
 }
 
 fn generate_chunk(position: IVec3, generator: &dyn Fn(IVec3) -> Vec<WorldVoxel>) -> ChunkGenResult {

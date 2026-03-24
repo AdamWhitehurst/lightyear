@@ -10,7 +10,7 @@ use tracy_client::plot;
 
 use crate::chunk::VoxelChunk;
 use crate::config::{VoxelGenerator, VoxelMapConfig};
-use crate::generation::{PendingChunks, spawn_chunk_gen_task};
+use crate::generation::{GEN_BATCH_SIZE, PendingChunks, spawn_chunk_gen_batch};
 use crate::instance::VoxelMapInstance;
 use crate::meshing::mesh_chunk_greedy;
 use crate::propagator::TicketLevelPropagator;
@@ -600,6 +600,7 @@ fn drain_gen_queue(
 
     let mut spawned = 0;
     let mut stale = 0;
+    let mut batch = Vec::with_capacity(GEN_BATCH_SIZE);
     while let Some(work) = gen_queue.heap.pop() {
         if pending.tasks.len() >= MAX_PENDING_GEN_TASKS {
             break;
@@ -607,7 +608,6 @@ fn drain_gen_queue(
         if !budget.has_time() || spawned >= MAX_GEN_SPAWNS_PER_FRAME {
             break;
         }
-        // Lazy deletion: validate entry is still relevant
         let col = chunk_to_column(work.position);
         if !instance.chunk_levels.contains_key(&col) {
             stale += 1;
@@ -625,8 +625,23 @@ fn drain_gen_queue(
             stale += 1;
             continue;
         }
-        spawn_chunk_gen_task(pending, work.position, generator, config.save_dir.clone());
+        // Insert into pending_positions immediately so is_already_pending
+        // catches duplicates within the same unflushed batch.
+        pending.pending_positions.insert(work.position);
+        batch.push(work.position);
         spawned += 1;
+        if batch.len() >= GEN_BATCH_SIZE {
+            spawn_chunk_gen_batch(
+                pending,
+                std::mem::take(&mut batch),
+                generator,
+                config.save_dir.clone(),
+            );
+            batch = Vec::with_capacity(GEN_BATCH_SIZE);
+        }
+    }
+    if !batch.is_empty() {
+        spawn_chunk_gen_batch(pending, batch, generator, config.save_dir.clone());
     }
 
     let stop_reason = if pending.tasks.len() >= MAX_PENDING_GEN_TASKS {
@@ -670,24 +685,26 @@ pub fn poll_chunk_tasks(
         // essential progress — starving it causes a deadlock where in-flight tasks
         // block new spawns but are never reaped.
         while i < pending.tasks.len() && polled < MAX_GEN_POLLS_PER_FRAME {
-            if let Some(result) = check_ready(&mut pending.tasks[i]) {
+            if let Some(results) = check_ready(&mut pending.tasks[i]) {
                 let _ = pending.tasks.swap_remove(i);
-                debug_assert!(
-                    pending.pending_positions.contains(&result.position),
-                    "poll_chunk_tasks: completed chunk at {:?} was not in pending_positions",
-                    result.position
-                );
-                pending.pending_positions.remove(&result.position);
-                handle_completed_chunk(
-                    &mut commands,
-                    &mut instance,
-                    &mut *meshes,
-                    &mut *materials,
-                    &*default_material,
-                    map_entity,
-                    result,
-                );
-                polled += 1;
+                for result in results {
+                    debug_assert!(
+                        pending.pending_positions.contains(&result.position),
+                        "poll_chunk_tasks: completed chunk at {:?} was not in pending_positions",
+                        result.position
+                    );
+                    pending.pending_positions.remove(&result.position);
+                    handle_completed_chunk(
+                        &mut commands,
+                        &mut instance,
+                        &mut *meshes,
+                        &mut *materials,
+                        &*default_material,
+                        map_entity,
+                        result,
+                    );
+                    polled += 1;
+                }
             } else {
                 i += 1;
             }
