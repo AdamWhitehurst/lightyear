@@ -2368,6 +2368,7 @@ dependencies = [
  "protocol",
  "render",
  "test-log",
+ "tracy-client",
  "ui",
  "voxel_map_engine",
 ]
@@ -6216,6 +6217,7 @@ dependencies = [
  "ron 0.12.0",
  "serde",
  "serde_json",
+ "tracy-client",
  "voxel_map_engine",
 ]
 

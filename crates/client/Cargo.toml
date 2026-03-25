@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["file_watcher"]
 file_watcher = ["bevy/file_watcher"]
+tracy = ["bevy/trace_tracy", "tracy-client/enable"]
 
 [dependencies]
 avian3d = { workspace = true, features = [ "debug-plugin" ]}
@@ -17,6 +18,7 @@ protocol = { workspace = true }
 render = { path = "../render" }
 ui = { path = "../ui" }
 anyhow = "1.0"
+tracy-client = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }

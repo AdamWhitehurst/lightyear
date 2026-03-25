@@ -1,6 +1,7 @@
 [alias]
 client = "run -p client"
 client-log = "make client-log"
+client-tracy = "run -p client --features tracy"
 server = "run -p server"
 server-log = "make server-log"
 server-tracy = "run -p server --features tracy"
@@ -25,4 +26,3 @@ rustflags = [
   "-C",
   "target-feature=+reference-types",
 ]
-

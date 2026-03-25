@@ -18,6 +18,7 @@ dot_vox = { workspace = true }
 ndshape = { path = "../../git/ndshape-rs" }
 block-mesh = { path = "../../git/block-mesh-rs" }
 serde = { version = "1.0", features = ["derive"] }
+tracy-client = { workspace = true }
 
 [dev-dependencies]
 bevy = { workspace = true, features = ["bevy_color", "bevy_state", "bevy_mesh", "bevy_asset"] }
