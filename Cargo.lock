@@ -6933,6 +6933,7 @@ dependencies = [
  "serde",
  "tempfile",
  "test-log",
+ "tracy-client",
  "ui",
  "voxel_map_engine",
  "zstd",

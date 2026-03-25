@@ -11,7 +11,7 @@ name = "server"
 path = "src/main.rs"
 
 [features]
-tracy = ["bevy/trace_tracy", "voxel_map_engine/tracy"]
+tracy = ["bevy/trace_tracy", "voxel_map_engine/tracy", "tracy-client/enable"]
 
 [dependencies]
 bevy = { workspace = true, default-features = true, features = ["file_watcher"] }
@@ -26,6 +26,7 @@ avian3d = { workspace = true }
 bincode = "1.3"
 ron = { workspace = true }
 serde = { workspace = true }
+tracy-client = { workspace = true }
 zstd = "0.13"
 
 [dev-dependencies]

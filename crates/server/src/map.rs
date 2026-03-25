@@ -17,6 +17,8 @@ use protocol::{
     SectionBlocksUpdate, UnloadColumn, VoxelChannel, VoxelEditAck, VoxelEditBroadcast,
     VoxelEditReject, VoxelEditRequest, VoxelType,
 };
+#[allow(unused_imports)]
+use tracy_client::plot;
 use voxel_map_engine::lifecycle::{self, PendingSaves};
 use voxel_map_engine::prelude::{
     build_generator, seed_from_id, ChunkTicket, VoxelGenerator, VoxelMapConfig, VoxelMapInstance,
@@ -669,8 +671,12 @@ pub struct ClientChunkVisibility {
     tracked_map: Option<Entity>,
 }
 
+/// Maximum chunk data messages sent to a single client per tick.
+const MAX_CHUNK_SENDS_PER_TICK: usize = 16;
+
 /// Server system: for each connected player, compare their ticket's loaded columns
-/// against what we've already sent. Push new chunks, send unload for removed.
+/// against what we've already sent. Push new chunks (throttled, closest first),
+/// send unload for removed.
 pub fn push_chunks_to_clients(
     mut player_query: Query<(
         &ChunkTicket,
@@ -683,8 +689,6 @@ pub fn push_chunks_to_clients(
     mut multi_sender: ServerMultiMessageSender,
 ) {
     for (ticket, controlled_by, pos, mut visibility) in &mut player_query {
-        // Reset tracking when the player's ticket switches maps (e.g. map transition).
-        // The client despawns the old map, so all previously-sent data is stale.
         if visibility.tracked_map != Some(ticket.map_entity) {
             visibility.sent_chunks.clear();
             visibility.sent_columns.clear();
@@ -700,79 +704,142 @@ pub fn push_chunks_to_clients(
         };
 
         let player_col = voxel_map_engine::lifecycle::world_to_column_pos(pos.0);
-        let radius = ticket.radius as i32;
-        let mut current_columns = HashSet::new();
-        for dx in -radius..=radius {
-            for dz in -radius..=radius {
-                let col = player_col + IVec2::new(dx, dz);
-                let distance = dx.abs().max(dz.abs()) as u32;
-                let level = ticket.ticket_type.base_level() + distance;
-                if level > voxel_map_engine::prelude::LOAD_LEVEL_THRESHOLD {
-                    continue;
-                }
-                if instance.chunk_levels.contains_key(&col) {
-                    current_columns.insert(col);
-                }
-            }
-        }
-
+        let current_columns = compute_loaded_columns(ticket, instance, player_col);
         let client_entity = controlled_by.owner;
 
-        // Send individual chunks that have data and haven't been sent yet.
-        // Chunks generate asynchronously, so we re-check each frame for
-        // newly available data within the player's loaded columns.
-        for &col in &current_columns {
+        let sent = send_unsent_chunks(
+            &current_columns,
+            &mut visibility,
+            instance,
+            map_id,
+            player_col,
+            client_entity,
+            &mut senders,
+        );
+        plot!("chunks_sent_this_tick", sent as f64);
+
+        unload_stale_columns(
+            &mut visibility,
+            &current_columns,
+            map_id,
+            client_entity,
+            &mut multi_sender,
+        );
+
+        visibility.sent_columns = current_columns;
+    }
+}
+
+/// Computes which columns are currently in the player's loaded range.
+fn compute_loaded_columns(
+    ticket: &ChunkTicket,
+    instance: &VoxelMapInstance,
+    player_col: IVec2,
+) -> HashSet<IVec2> {
+    let radius = ticket.radius as i32;
+    let mut columns = HashSet::new();
+    for dx in -radius..=radius {
+        for dz in -radius..=radius {
+            let col = player_col + IVec2::new(dx, dz);
+            let distance = dx.abs().max(dz.abs()) as u32;
+            let level = ticket.ticket_type.base_level() + distance;
+            if level > voxel_map_engine::prelude::LOAD_LEVEL_THRESHOLD {
+                continue;
+            }
+            if instance.chunk_levels.contains_key(&col) {
+                columns.insert(col);
+            }
+        }
+    }
+    columns
+}
+
+/// Sends up to `MAX_CHUNK_SENDS_PER_TICK` unsent chunks, closest to player first.
+/// Returns the number of chunks sent.
+fn send_unsent_chunks(
+    current_columns: &HashSet<IVec2>,
+    visibility: &mut ClientChunkVisibility,
+    instance: &VoxelMapInstance,
+    map_id: &MapInstanceId,
+    player_col: IVec2,
+    client_entity: Entity,
+    senders: &mut Query<&mut MessageSender<ChunkDataSync>>,
+) -> usize {
+    let mut candidates: Vec<(IVec3, u32)> = Vec::new();
+    for &col in current_columns {
+        let dist = (col.x - player_col.x)
+            .abs()
+            .max((col.y - player_col.y).abs()) as u32;
+        for chunk_pos in voxel_map_engine::prelude::column_to_chunks(
+            col,
+            voxel_map_engine::prelude::DEFAULT_COLUMN_Y_MIN,
+            voxel_map_engine::prelude::DEFAULT_COLUMN_Y_MAX,
+        ) {
+            if visibility.sent_chunks.contains(&chunk_pos) {
+                continue;
+            }
+            if instance.get_chunk_data(chunk_pos).is_none() {
+                continue;
+            }
+            candidates.push((chunk_pos, dist));
+        }
+    }
+    candidates.sort_unstable_by_key(|&(_, dist)| dist);
+
+    let mut sent = 0;
+    for (chunk_pos, _) in candidates {
+        if sent >= MAX_CHUNK_SENDS_PER_TICK {
+            break;
+        }
+        let Some(chunk_data) = instance.get_chunk_data(chunk_pos) else {
+            continue;
+        };
+        if let Ok(mut sender) = senders.get_mut(client_entity) {
+            sender.send::<ChunkChannel>(ChunkDataSync {
+                map_id: map_id.clone(),
+                chunk_pos,
+                data: chunk_data.voxels.clone(),
+            });
+        }
+        visibility.sent_chunks.insert(chunk_pos);
+        sent += 1;
+    }
+    sent
+}
+
+/// Sends `UnloadColumn` messages for columns that left the player's loaded range.
+fn unload_stale_columns(
+    visibility: &mut ClientChunkVisibility,
+    current_columns: &HashSet<IVec2>,
+    map_id: &MapInstanceId,
+    client_entity: Entity,
+    multi_sender: &mut ServerMultiMessageSender,
+) {
+    let unloaded_cols: Vec<IVec2> = visibility
+        .sent_columns
+        .difference(current_columns)
+        .copied()
+        .collect();
+    if !unloaded_cols.is_empty() {
+        let targets: bevy::ecs::entity::EntityHashSet = [client_entity].into_iter().collect();
+        for &col in &unloaded_cols {
+            multi_sender
+                .send_to_entities::<_, ChunkChannel>(
+                    &UnloadColumn {
+                        map_id: map_id.clone(),
+                        column: col,
+                    },
+                    &targets,
+                )
+                .ok();
             for chunk_pos in voxel_map_engine::prelude::column_to_chunks(
                 col,
                 voxel_map_engine::prelude::DEFAULT_COLUMN_Y_MIN,
                 voxel_map_engine::prelude::DEFAULT_COLUMN_Y_MAX,
             ) {
-                if visibility.sent_chunks.contains(&chunk_pos) {
-                    continue;
-                }
-                let Some(chunk_data) = instance.get_chunk_data(chunk_pos) else {
-                    continue;
-                };
-                if let Ok(mut sender) = senders.get_mut(client_entity) {
-                    sender.send::<ChunkChannel>(ChunkDataSync {
-                        map_id: map_id.clone(),
-                        chunk_pos,
-                        data: chunk_data.voxels.clone(),
-                    });
-                }
-                visibility.sent_chunks.insert(chunk_pos);
+                visibility.sent_chunks.remove(&chunk_pos);
             }
         }
-
-        // Unload columns that left the loaded range
-        let unloaded_cols: Vec<IVec2> = visibility
-            .sent_columns
-            .difference(&current_columns)
-            .copied()
-            .collect();
-        if !unloaded_cols.is_empty() {
-            let targets: bevy::ecs::entity::EntityHashSet = [client_entity].into_iter().collect();
-            for &col in &unloaded_cols {
-                multi_sender
-                    .send_to_entities::<_, ChunkChannel>(
-                        &UnloadColumn {
-                            map_id: map_id.clone(),
-                            column: col,
-                        },
-                        &targets,
-                    )
-                    .ok();
-                for chunk_pos in voxel_map_engine::prelude::column_to_chunks(
-                    col,
-                    voxel_map_engine::prelude::DEFAULT_COLUMN_Y_MIN,
-                    voxel_map_engine::prelude::DEFAULT_COLUMN_Y_MAX,
-                ) {
-                    visibility.sent_chunks.remove(&chunk_pos);
-                }
-            }
-        }
-
-        visibility.sent_columns = current_columns;
     }
 }
 
