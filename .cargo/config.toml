@@ -1,6 +1,9 @@
 [alias]
 client = "run -p client"
+client-log = "make client-log"
 server = "run -p server"
+server-log = "make server-log"
+server-tracy = "run -p server --features tracy"
 web = "make web"
 setup = "make setup"
 
@@ -17,6 +20,9 @@ incremental = true
 
 [target.wasm32-unknown-unknown]
 rustflags = [
-    "--cfg", "web_sys_unstable_apis",
-    "-C", "target-feature=+reference-types",
+  "--cfg",
+  "web_sys_unstable_apis",
+  "-C",
+  "target-feature=+reference-types",
 ]
+
