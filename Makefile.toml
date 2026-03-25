@@ -95,6 +95,24 @@ else
 fi
 '''
 
+[tasks.client-log]
+description = "Run client with clean (no ANSI) log output to client.log"
+workspace = false
+script = '''
+#!/bin/bash
+set -e
+NO_COLOR=1 cargo run -p client 2>&1 | tee client.log
+'''
+
+[tasks.server-log]
+description = "Run server with clean (no ANSI) log output to server.log"
+workspace = false
+script = '''
+#!/bin/bash
+set -e
+NO_COLOR=1 cargo run -p server 2>&1 | tee server.log
+'''
+
 [tasks.test-native]
 description = "Run all native tests (excludes WASM)"
 workspace = false
