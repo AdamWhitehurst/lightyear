@@ -121,7 +121,7 @@ fn attach_chunk_ticket_to_player(
     >,
 ) {
     for (entity, map_id) in &players {
-        info!("Attaching ChunkTicket to player {entity:?} on map {map_id:?}");
+        trace!("Attaching ChunkTicket to player {entity:?} on map {map_id:?}");
         let map_entity = registry.get(map_id);
         commands
             .entity(entity)
@@ -251,9 +251,10 @@ fn handle_voxel_broadcasts(
                 continue;
             }
 
-            debug!(
+            trace!(
                 "handle_voxel_broadcasts: applying broadcast at {:?} voxel={:?}",
-                broadcast.position, broadcast.voxel
+                broadcast.position,
+                broadcast.voxel
             );
             voxel_world.set_voxel(
                 chunk_ticket.map_entity,
@@ -325,7 +326,7 @@ fn handle_voxel_input(
     let Some(hit) = voxel_world.raycast(chunk_ticket.map_entity, ray, RAYCAST_MAX_DISTANCE, |v| {
         matches!(v, WorldVoxel::Solid(_))
     }) else {
-        debug!("handle_voxel_input: raycast hit nothing");
+        trace!("handle_voxel_input: raycast hit nothing");
         return;
     };
 
@@ -334,7 +335,7 @@ fn handle_voxel_input(
     } else if let Some(normal) = hit.normal {
         (hit.position + normal.as_ivec3(), VoxelType::Solid(0))
     } else {
-        debug!("handle_voxel_input: place hit has no normal");
+        trace!("handle_voxel_input: place hit has no normal");
         return;
     };
 
@@ -353,7 +354,7 @@ fn handle_voxel_input(
     });
 
     for mut sender in message_sender.iter_mut() {
-        debug!("Sending voxel edit request to server: {:?}", position);
+        trace!("Sending voxel edit request to server: {:?}", position);
         sender.send::<VoxelChannel>(VoxelEditRequest {
             position,
             voxel,
@@ -387,7 +388,7 @@ fn handle_voxel_edit_ack(
 ) {
     for mut receiver in &mut receivers {
         for ack in receiver.receive() {
-            debug!(
+            trace!(
                 "handle_voxel_edit_ack: ack seq={}, clearing {} pending",
                 ack.sequence,
                 prediction_state.pending.len()
@@ -437,7 +438,7 @@ pub fn handle_map_transition_start(
 ) {
     for mut receiver in &mut receivers {
         for transition in receiver.receive() {
-            info!("Received MapTransitionStart for {:?}", transition.target);
+            trace!("Received MapTransitionStart for {:?}", transition.target);
 
             let player = player_query
                 .single()
@@ -495,7 +496,7 @@ fn despawn_all_maps_except(
         .map(|(id, &entity)| (id.clone(), entity))
         .collect();
     for (map_id, map_entity) in to_remove {
-        info!("Despawning map {map_id:?} entity {map_entity:?}");
+        trace!("Despawning map {map_id:?} entity {map_entity:?}");
         registry.0.remove(&map_id);
         commands.entity(map_entity).despawn();
     }
@@ -534,7 +535,7 @@ fn spawn_map_instance(
         ))
         .id();
 
-    info!("Spawned client map instance for {map_id:?}: {entity:?}");
+    trace!("Spawned client map instance for {map_id:?}: {entity:?}");
     entity
 }
 
@@ -568,7 +569,7 @@ pub fn check_transition_chunks_loaded(
         return;
     }
 
-    info!(
+    trace!(
         "Transition chunks loaded for {:?} ({} columns), sending ready to server",
         pending.0,
         instance.chunk_levels.len()
@@ -591,7 +592,7 @@ pub fn handle_map_transition_end(
 ) {
     for mut receiver in &mut receivers {
         for _end in receiver.receive() {
-            info!("Received MapTransitionEnd, resuming play");
+            trace!("Received MapTransitionEnd, resuming play");
 
             // Unfreeze all predicted characters — lightyear may recreate the
             // predicted entity during transition, so there can be 0-2 matches.

@@ -45,7 +45,7 @@ impl RoomRegistry {
     pub fn get_or_create(&mut self, id: &MapInstanceId, commands: &mut Commands) -> Entity {
         *self.0.entry(id.clone()).or_insert_with(|| {
             let room = commands.spawn(Room::default()).id();
-            info!("Created room for map {id:?}: {room:?}");
+            trace!("Created room for map {id:?}: {room:?}");
             room
         })
     }
@@ -145,7 +145,7 @@ fn apply_terrain_defs(
             apply_object_components(&mut commands, entity, components, type_registry.0.clone());
         }
         commands.entity(entity).insert(TerrainDefApplied);
-        info!("Applied terrain def '{def_name}' to map entity {entity:?}");
+        trace!("Applied terrain def '{def_name}' to map entity {entity:?}");
     }
 }
 
@@ -190,7 +190,7 @@ fn build_terrain_generators(world: &mut World) {
         let entity_ref = world.entity(entity);
         let generator = build_generator(entity_ref, seed);
         world.entity_mut(entity).insert(generator);
-        info!("Built terrain generator for map entity {entity:?}");
+        trace!("Built terrain generator for map entity {entity:?}");
     }
 }
 
@@ -927,7 +927,7 @@ fn execute_server_transition(
     senders: &mut Query<&mut MessageSender<MapTransitionStart>>,
     save_path: &WorldSavePath,
 ) {
-    info!("Transitioning player {player_entity:?} from {current_map_id:?} to {target_map_id:?}");
+    trace!("Transitioning player {player_entity:?} from {current_map_id:?} to {target_map_id:?}");
 
     commands.entity(player_entity).insert((
         DisableRollback,
@@ -1051,10 +1051,10 @@ fn spawn_homebase(
 
     let entity_count = load_map_entities(commands, save_path, map_id);
     if entity_count > 0 {
-        info!("Loaded {entity_count} entities for homebase-{owner}");
+        trace!("Loaded {entity_count} entities for homebase-{owner}");
     }
 
-    info!("Spawned server homebase for owner {owner}: {entity:?}");
+    trace!("Spawned server homebase for owner {owner}: {entity:?}");
     (entity, params)
 }
 
@@ -1062,7 +1062,7 @@ fn spawn_homebase(
 fn load_homebase_seed(map_dir: &Path, owner: u64) -> u64 {
     match load_map_meta(map_dir) {
         Ok(Some(meta)) => {
-            info!(
+            trace!(
                 "Loading homebase-{owner} from saved metadata (seed={})",
                 meta.seed
             );
@@ -1070,7 +1070,7 @@ fn load_homebase_seed(map_dir: &Path, owner: u64) -> u64 {
         }
         _ => {
             let seed = seed_from_id(owner);
-            info!("Creating new homebase-{owner} (seed={seed})");
+            trace!("Creating new homebase-{owner} (seed={seed})");
             seed
         }
     }
@@ -1095,7 +1095,7 @@ pub fn handle_map_transition_ready(
                 continue;
             };
 
-            info!("Client confirmed transition ready for player {player_entity:?}, unfreezing");
+            trace!("Client confirmed transition ready for player {player_entity:?}, unfreezing");
 
             commands.entity(player_entity).remove::<(
                 RigidBodyDisabled,

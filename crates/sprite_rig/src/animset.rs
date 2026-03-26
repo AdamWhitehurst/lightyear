@@ -133,5 +133,5 @@ pub fn add_events_to_clip(clip: &mut AnimationClip, events: &[AnimEventKeyframe]
 pub fn on_animation_event_fired(trigger: On<AnimationEventFired>) {
     let player_entity = trigger.trigger().target;
     let event = trigger.event();
-    info!(character = ?player_entity, event = %event.event_name, "animation event fired");
+    trace!(character = ?player_entity, event = %event.event_name, "animation event fired");
 }

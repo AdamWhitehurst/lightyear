@@ -275,33 +275,33 @@ pub fn ensure_pending_chunks(
     >,
 ) {
     for entity in &chunks_query {
-        info!("ensure_pending_chunks: adding PendingChunks to {entity:?}");
+        trace!("ensure_pending_chunks: adding PendingChunks to {entity:?}");
         commands.entity(entity).insert(PendingChunks::default());
     }
     for entity in &remesh_query {
-        info!("ensure_pending_chunks: adding PendingRemeshes to {entity:?}");
+        trace!("ensure_pending_chunks: adding PendingRemeshes to {entity:?}");
         commands.entity(entity).insert(PendingRemeshes::default());
     }
     for entity in &propagator_query {
-        info!("ensure_pending_chunks: adding TicketLevelPropagator to {entity:?}");
+        trace!("ensure_pending_chunks: adding TicketLevelPropagator to {entity:?}");
         commands
             .entity(entity)
             .insert(TicketLevelPropagator::default());
     }
     for entity in &budget_query {
-        info!("ensure_pending_chunks: adding ChunkWorkBudget to {entity:?}");
+        trace!("ensure_pending_chunks: adding ChunkWorkBudget to {entity:?}");
         commands.entity(entity).insert(ChunkWorkBudget::default());
     }
     for entity in &gen_queue_query {
-        info!("ensure_pending_chunks: adding GenQueue to {entity:?}");
+        trace!("ensure_pending_chunks: adding GenQueue to {entity:?}");
         commands.entity(entity).insert(GenQueue::default());
     }
     for entity in &pending_saves_query {
-        info!("ensure_pending_chunks: adding PendingSaves to {entity:?}");
+        trace!("ensure_pending_chunks: adding PendingSaves to {entity:?}");
         commands.entity(entity).insert(PendingSaves::default());
     }
     for entity in &tracker_query {
-        info!("ensure_pending_chunks: adding ChunkWorkTracker to {entity:?}");
+        trace!("ensure_pending_chunks: adding ChunkWorkTracker to {entity:?}");
         commands.entity(entity).insert(ChunkWorkTracker::default());
     }
 }
@@ -861,7 +861,7 @@ pub fn despawn_out_of_range_chunks(
             .chunk_levels
             .contains_key(&chunk_to_column(chunk.position))
         {
-            info!(
+            trace!(
                 "despawn_out_of_range_chunks: despawning chunk {:?} at {:?} (parent map {:?})",
                 entity, chunk.position, child_of.0
             );

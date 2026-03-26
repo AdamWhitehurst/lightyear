@@ -279,6 +279,6 @@ pub(super) fn sync_default_ability_slots(
         warn!("default.ability_slots.ron event fired but asset not available");
         return;
     };
-    info!("Synced default ability slots");
+    trace!("Synced default ability slots");
     commands.insert_resource(DefaultAbilitySlots(slots.clone()));
 }

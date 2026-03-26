@@ -40,7 +40,7 @@ fn handle_new_character(
 ) {
     for (entity, is_controlled) in &confirmed_query {
         if is_controlled {
-            info!("Adding InputMap to controlled and predicted entity {entity:?}");
+            trace!("Adding InputMap to controlled and predicted entity {entity:?}");
             commands.entity(entity).insert(
                 InputMap::new([(PlayerActions::Jump, KeyCode::Space)])
                     .with(PlayerActions::Jump, GamepadButton::South)
@@ -54,12 +54,12 @@ fn handle_new_character(
                     .with(PlayerActions::Ability4, KeyCode::Digit4),
             );
         } else {
-            info!("Remote character predicted for us: {entity:?}");
+            trace!("Remote character predicted for us: {entity:?}");
         }
     }
 
     for entity in &character_query {
-        info!(?entity, "Adding physics to predicted character");
+        trace!(?entity, "Adding physics to predicted character");
         commands
             .entity(entity)
             .insert((CharacterPhysicsBundle::default(), MapInstanceId::Overworld));

@@ -87,7 +87,7 @@ impl Plugin for UiPlugin {
                 .run_if(in_state(ClientState::InGame)),
         );
 
-        info!("UiPlugin initialized");
+        trace!("UiPlugin initialized");
     }
 }
 
@@ -96,7 +96,7 @@ fn on_entering_connecting_state(
     client_query: Query<Entity, With<Client>>,
     config: Res<UiClientConfig>,
 ) {
-    info!("Entering Connecting state, triggering connection...");
+    trace!("Entering Connecting state, triggering connection...");
     let client_entity = client_query.single().expect("Client entity should exist");
 
     // Create fresh authentication with new token
@@ -138,7 +138,7 @@ fn on_client_connected(
 }
 
 fn setup_main_menu(mut commands: Commands) {
-    info!("Setting up main menu UI");
+    trace!("Setting up main menu UI");
 
     commands
         .spawn((
@@ -230,7 +230,7 @@ fn main_menu_button_interaction(
     // Handle Connect button
     for interaction in connect_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Connect button pressed");
+            trace!("Connect button pressed");
             next_state.set(ClientState::Connecting);
         }
     }
@@ -238,14 +238,14 @@ fn main_menu_button_interaction(
     // Handle Quit button
     for interaction in quit_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Quit button pressed");
+            trace!("Quit button pressed");
             exit_writer.write(AppExit::Success);
         }
     }
 }
 
 fn setup_connecting_screen(mut commands: Commands) {
-    info!("Setting up connecting screen UI");
+    trace!("Setting up connecting screen UI");
 
     commands
         .spawn((
@@ -309,7 +309,7 @@ fn connecting_screen_interaction(
 ) {
     for interaction in cancel_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Cancel button pressed, disconnecting...");
+            trace!("Cancel button pressed, disconnecting...");
 
             let client_entity = client_query.single().expect("Client entity should exist");
             // Trigger disconnection
@@ -324,7 +324,7 @@ fn connecting_screen_interaction(
 }
 
 fn setup_ingame_hud(mut commands: Commands) {
-    info!("Setting up in-game HUD");
+    trace!("Setting up in-game HUD");
 
     // Top-right corner HUD
     commands
@@ -443,7 +443,7 @@ fn ingame_button_interaction(
     // Handle Main Menu button
     for interaction in main_menu_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Main Menu button pressed, disconnecting...");
+            trace!("Main Menu button pressed, disconnecting...");
 
             let client_entity = client_query.single().expect("Client entity should exist");
             // Trigger disconnection
@@ -459,7 +459,7 @@ fn ingame_button_interaction(
     // Handle Quit button
     for interaction in quit_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Quit button pressed");
+            trace!("Quit button pressed");
             exit_writer.write(AppExit::Success);
         }
     }
@@ -499,7 +499,7 @@ fn map_switch_button_interaction(
             MapInstanceId::Homebase { .. } => MapSwitchTarget::Overworld,
         };
 
-        info!("Map switch button pressed, requesting {target:?}");
+        trace!("Map switch button pressed, requesting {target:?}");
         for mut sender in &mut senders {
             sender.send::<MapChannel>(PlayerMapSwitchRequest {
                 target: target.clone(),

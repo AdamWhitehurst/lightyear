@@ -125,7 +125,7 @@ fn validate_respawn_points(
     for (map_id, _entity) in map_registry.0.iter() {
         let has_respawn = existing.iter().any(|(_, mid)| mid == map_id);
         if !has_respawn {
-            info!("Map {map_id:?} has no respawn points — spawning default");
+            trace!("Map {map_id:?} has no respawn points — spawning default");
             commands.spawn((RespawnPoint, Position(DEFAULT_SPAWN_POS), map_id.clone()));
         }
     }
@@ -186,9 +186,10 @@ fn process_respawn_timers(
         } else {
             position.0
         };
-        info!(
+        trace!(
             "Entity {:?} respawn timer expired, respawning at {:?}",
-            entity, respawn_pos
+            entity,
+            respawn_pos
         );
         position.0 = respawn_pos;
         if let Some(mut velocity) = velocity {
@@ -255,7 +256,7 @@ fn spawn_test_tree(
         &*vox_assets,
         &*meshes,
     );
-    info!("Spawned test tree (entity {entity:?})");
+    trace!("Spawned test tree (entity {entity:?})");
 }
 
 fn handle_connected(

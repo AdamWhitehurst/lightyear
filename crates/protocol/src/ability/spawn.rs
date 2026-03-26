@@ -150,7 +150,7 @@ pub(crate) fn spawn_aoe_hitbox(
     spawn_tick: Tick,
     duration_ticks: u16,
 ) {
-    info!("Spawning AoE hitbox with {duration_ticks:?} lifetime");
+    trace!("Spawning AoE hitbox with {duration_ticks:?} lifetime");
     let Ok((caster_pos, caster_rot, caster_map_id)) = caster_query.get(active.caster) else {
         warn!(
             "AoE hitbox spawn: caster {:?} missing Position/Rotation",
@@ -255,7 +255,7 @@ pub fn handle_ability_projectile_spawn(
     >,
 ) {
     for (spawn_entity, spawn_info, on_hit_effects, spawn_map_id) in &spawn_query {
-        info!("Spawning ability bullet from {:?}", spawn_info.ability_id);
+        trace!("Spawning ability bullet from {:?}", spawn_info.ability_id);
         let mut bullet_cmd = commands.spawn((
             Position(spawn_info.position),
             Rotation::default(),
