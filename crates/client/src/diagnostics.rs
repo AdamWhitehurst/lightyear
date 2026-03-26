@@ -2,7 +2,10 @@
 
 use avian3d::prelude::Collider;
 use bevy::prelude::*;
+use leafwing_input_manager::prelude::ActionState;
 use lightyear::prelude::{InputTimeline, IsSynced, PredictionMetrics};
+use protocol::diagnostics::plot_action_state;
+use protocol::PlayerActions;
 use tracy_client::plot;
 use voxel_map_engine::prelude::VoxelChunk;
 
@@ -12,6 +15,7 @@ pub struct ClientDiagnosticsPlugin;
 impl Plugin for ClientDiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PrevRollbackMetrics>()
+            .add_systems(FixedUpdate, plot_client_input_state)
             .add_systems(Last, (plot_rollback_diagnostics, plot_input_sync_status));
     }
 }
@@ -21,6 +25,13 @@ impl Plugin for ClientDiagnosticsPlugin {
 struct PrevRollbackMetrics {
     rollbacks: u32,
     rollback_ticks: u32,
+}
+
+/// Plots per-tick input state for the client's character.
+fn plot_client_input_state(query: Query<&ActionState<PlayerActions>>) {
+    for action_state in &query {
+        plot_action_state(action_state);
+    }
 }
 
 /// Plots per-frame rollback deltas and chunk collider insertions.

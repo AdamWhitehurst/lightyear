@@ -1,8 +1,10 @@
-//! Server-specific tracy diagnostics (input buffer status).
+//! Server-specific tracy diagnostics (input buffer status, input state).
 
 use bevy::prelude::*;
+use leafwing_input_manager::prelude::ActionState;
 use lightyear::prelude::input::leafwing::LeafwingBuffer;
 use lightyear::prelude::*;
+use protocol::diagnostics::plot_action_state;
 use protocol::{CharacterMarker, PlayerActions};
 use tracy_client::plot;
 
@@ -11,7 +13,15 @@ pub struct ServerDiagnosticsPlugin;
 
 impl Plugin for ServerDiagnosticsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Last, plot_input_buffer_status);
+        app.add_systems(FixedUpdate, plot_server_input_state)
+            .add_systems(Last, plot_input_buffer_status);
+    }
+}
+
+/// Plots input state for server character entities (one per player).
+fn plot_server_input_state(query: Query<&ActionState<PlayerActions>, With<CharacterMarker>>) {
+    for action_state in &query {
+        plot_action_state(action_state);
     }
 }
 

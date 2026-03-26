@@ -15,7 +15,7 @@ pub struct SharedDiagnosticsPlugin;
 impl Plugin for SharedDiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FixedStepCounter>()
-            .add_systems(FixedUpdate, (count_fixed_steps, plot_input_state))
+            .add_systems(FixedUpdate, count_fixed_steps)
             .add_systems(Last, plot_frame_diagnostics);
     }
 }
@@ -40,24 +40,26 @@ fn plot_frame_diagnostics(time: Res<Time<Real>>, mut counter: ResMut<FixedStepCo
     counter.steps = 0;
 }
 
-/// Plots per-tick input state for all ability buttons and movement axis.
-fn plot_input_state(query: Query<&ActionState<PlayerActions>>) {
-    for action_state in &query {
-        plot!(
-            "move_input_magnitude",
-            action_state.axis_pair(&PlayerActions::Move).length() as f64
-        );
-        plot!(
-            "any_ability_pressed",
-            if action_state.pressed(&PlayerActions::Ability1)
-                || action_state.pressed(&PlayerActions::Ability2)
-                || action_state.pressed(&PlayerActions::Ability3)
-                || action_state.pressed(&PlayerActions::Ability4)
-            {
-                1.0
-            } else {
-                0.0
-            }
-        );
-    }
+/// Plots per-tick input state from an `ActionState`.
+///
+/// Called by client and server diagnostics plugins with appropriate entity
+/// filters — the client must filter to `With<Predicted>` to avoid reading
+/// the Confirmed entity's stale replicated ActionState.
+pub fn plot_action_state(action_state: &ActionState<PlayerActions>) {
+    plot!(
+        "move_input_magnitude",
+        action_state.axis_pair(&PlayerActions::Move).length() as f64
+    );
+    plot!(
+        "any_ability_pressed",
+        if action_state.pressed(&PlayerActions::Ability1)
+            || action_state.pressed(&PlayerActions::Ability2)
+            || action_state.pressed(&PlayerActions::Ability3)
+            || action_state.pressed(&PlayerActions::Ability4)
+        {
+            1.0
+        } else {
+            0.0
+        }
+    );
 }
