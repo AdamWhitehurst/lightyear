@@ -9,7 +9,7 @@ tags: [research, voxel-map-engine, multi-stage-generation, feature-placement, ch
 status: complete
 last_updated: 2026-03-26
 last_updated_by: claude
-last_updated_note: "Resolved all open questions, elaborated NeighborAccess structure, future stage expansion, confirmed Option C hybrid approach"
+last_updated_note: "Addressed review annotations: fixed Arc claim, removed redundant completed_stage, consolidated trait definition, clarified NeighborAccess API, dropped Light stage, chose Option B with upgrade path to C"
 ---
 
 # Research: Multi-Stage Generation Pipeline for Feature Placement
@@ -102,6 +102,8 @@ Already implemented (`ticket.rs`, `propagator.rs`):
 
 Player ticket radius is 200 (production), meaning levels 0–200 are propagated. Levels 3–20 are "Inaccessible" but still loaded. This is the natural range for multi-stage generation gating.
 
+> **Code fix needed**: `ChunkTicket::player()` doc comment at `ticket.rs:60` says "default radius (10)" but `default_radius()` returns 200. Fix the stale doc comment before or during implementation.
+
 ---
 
 ## Minecraft's Multi-Stage Pipeline
@@ -150,10 +152,9 @@ The existing research (`doc/research/2026-03-20-minecraft-chunk-ticket-system.md
 |---|---|---|---|
 | 0 | Empty | Initial allocation | None |
 | 1 | Terrain | Base terrain shape (noise, biomes) | None |
-| 2 | Features | Trees, ores, structures | 1-ring at Terrain |
-| 3 | Light | Lighting calculation | 1-ring at Features |
-| 4 | Mesh | Greedy meshing | 1-ring at Light (for padding) |
-| 5 | Full | Promoted to gameplay-ready | None |
+| 2 | Features | Trees, ores, entity placement | 1-ring at Terrain |
+| 3 | Mesh | Greedy meshing | 1-ring at Features (for padding) |
+| 4 | Full | Promoted to gameplay-ready | None |
 
 This is simpler than Minecraft's 12 stages because:
 - No structures spanning 8+ chunks (no STRUCTURE_REFERENCES with margin 8)
@@ -185,9 +186,8 @@ pub enum ChunkStatus {
     Empty = 0,
     Terrain = 1,
     Features = 2,
-    Light = 3,
-    Mesh = 4,
-    Full = 5,
+    Mesh = 3,
+    Full = 4,
 }
 ```
 
@@ -212,27 +212,18 @@ Partially-generated chunks (e.g., at Terrain stage) are stored in the octree wit
 pub struct ChunkGenResult {
     pub position: IVec3,
     pub mesh: Option<Mesh>,       // only Some if Mesh stage completed
-    pub chunk_data: ChunkData,    // includes updated status
+    pub chunk_data: ChunkData,    // includes status: ChunkStatus
     pub from_disk: bool,
-    pub completed_stage: ChunkStatus,
 }
 ```
+
+The completed stage is read from `chunk_data.status`.
 
 ### VoxelGenerator Becomes a Trait
 
 Current: `VoxelGenerator(Arc<dyn Fn(IVec3) -> Vec<WorldVoxel> + Send + Sync>)` — single closure.
 
-Proposed (from research doc, line 770-776):
-
-```rust
-pub trait VoxelGenerator: Send + Sync {
-    /// Stage 1: Base terrain shape. Receives only this chunk's position.
-    fn generate_terrain(&self, pos: IVec3) -> Vec<WorldVoxel>;
-
-    /// Stage 2: Feature placement. Receives this chunk + 1-ring neighbor terrain data.
-    fn generate_features(&self, pos: IVec3, neighbors: &NeighborAccess) -> Vec<WorldVoxel>;
-}
-```
+See final trait definition in the "Interaction with Feature Placement" section below.
 
 **`NeighborAccess`** provides read-only access to surrounding chunks' voxel data. This is the critical new capability: features like trees can check and modify across chunk boundaries.
 
@@ -256,9 +247,13 @@ impl NeighborAccess {
     /// Sample a voxel at a world-relative position that may fall in any
     /// neighbor chunk. Returns `WorldVoxel::Unset` if the neighbor is
     /// not available (not yet generated to required stage).
-    pub fn get(&self, local_pos: IVec3, offset: IVec3) -> WorldVoxel {
-        // Compute which neighbor chunk the position falls in
-        // Decompress from PalettedChunk on demand via palette.get(index)
+    /// Sample a voxel at a position relative to the center chunk's origin.
+    /// Coordinates extend beyond [0,18) to reach into neighbor chunks.
+    /// Internally maps to the correct neighbor and local index.
+    pub fn get_voxel(&self, center_relative_pos: IVec3) -> WorldVoxel {
+        // Determine which chunk (center or neighbor) based on whether
+        // coords fall outside [0, PADDED_CHUNK_SIZE). Compute chunk offset
+        // and local index, then decompress from PalettedChunk::get(index).
     }
 
     /// Iterate all voxels in a neighbor at a given offset.
@@ -284,7 +279,7 @@ fn build_neighbor_access(
                 if dx == 0 && dy == 0 && dz == 0 { continue; }
                 let neighbor_pos = center_pos + IVec3::new(dx, dy, dz);
                 if let Some(chunk_data) = instance.get_chunk_data(neighbor_pos) {
-                    // Clone the PalettedChunk (cheap for SingleValue, shared Arc for Indirect)
+                    // Clone the PalettedChunk (cheap for SingleValue, deep-copies palette+data vecs for Indirect)
                     let idx = ((dx + 1) * 9 + (dy + 1) * 3 + (dz + 1)) as usize;
                     neighbors[idx] = Some(chunk_data.voxels.clone());
                 }
@@ -295,7 +290,7 @@ fn build_neighbor_access(
 }
 ```
 
-**Memory cost**: Each `PalettedChunk::SingleValue` is 2 bytes. `PalettedChunk::Indirect` clones the palette `Vec` and bit-packed `Vec<u64>` — typically 200–800 bytes for a compressed chunk. Worst case 27 fully-mixed chunks ≈ 20KB per feature task, far below the 300KB of fully expanded arrays. Decompression via `PalettedChunk::get(index)` is O(1) bit extraction.
+**Memory cost**: Each `PalettedChunk::SingleValue` is 2 bytes. `PalettedChunk::Indirect` deep-copies the palette `Vec<WorldVoxel>` and bit-packed `Vec<u64>` — typically 200–800 bytes for a compressed chunk. Worst case 27 fully-mixed chunks ≈ 20KB per feature task, far below the 300KB of fully expanded arrays. Decompression via `PalettedChunk::get(index)` is O(1) bit extraction.
 
 **Lifetime**: `NeighborAccess` is owned by the async task. It is built from `&VoxelMapInstance` on the main thread, moved into the `spawn(async move { ... })` block, and dropped when the task completes. No shared references or locks.
 
@@ -307,9 +302,8 @@ The existing `LOAD_LEVEL_THRESHOLD = 20` means columns at levels 0–20 are load
 |---|---|---|
 | 0–2 | Full | Gameplay-ready, EntityTicking/BlockTicking/Border |
 | 3 | Mesh | Has mesh, visible, but not promoted to gameplay |
-| 4 | Light | Lighting computed |
-| 5 | Features | Features placed |
-| 6–20 | Terrain | Terrain only, serves as neighbor data |
+| 4 | Features | Features placed |
+| 5–20 | Terrain | Terrain only, serves as neighbor data |
 | 21+ | Empty/Unloaded | Not tracked |
 
 Formula: `max_status = ChunkStatus::from_level_distance(level)` where `level_distance = effective_level - Border_level(2)`.
@@ -317,9 +311,8 @@ Formula: `max_status = ChunkStatus::from_level_distance(level)` where `level_dis
 This creates concentric rings:
 - **Ring 0–2** (EntityTicking through Border): fully generated, meshed, gameplay-ready
 - **Ring 3** (just beyond Border): meshed but no simulation
-- **Ring 4**: lit
-- **Ring 5**: features placed
-- **Ring 6–20**: terrain only — exists solely to provide neighbor data for feature/light/mesh stages of closer chunks
+- **Ring 4**: features placed
+- **Ring 5–20**: terrain only — exists solely to provide neighbor data for feature/mesh stages of closer chunks
 
 ### Scheduler Changes
 
@@ -349,26 +342,25 @@ Each async task advances a chunk by one stage:
 ```
 fn terrain_task(pos, generator) -> ChunkGenResult:
     voxels = generator.generate_terrain(pos)
-    chunk_data = ChunkData::from_voxels(voxels, ChunkStatus::Terrain)
-    // No mesh yet
-    ChunkGenResult { pos, mesh: None, chunk_data, completed_stage: Terrain }
+    chunk_data = ChunkData { voxels, status: Terrain, ... }
+    ChunkGenResult { pos, mesh: None, chunk_data, from_disk: false }
 ```
 
 **Features stage** (needs 1-ring neighbor terrain data):
 ```
 fn features_task(pos, generator, self_voxels, neighbor_voxels) -> ChunkGenResult:
     neighbors = NeighborAccess::new(neighbor_voxels)
-    voxels = generator.generate_features(pos, &neighbors)
-    chunk_data = ChunkData::from_voxels(voxels, ChunkStatus::Features)
-    ChunkGenResult { pos, mesh: None, chunk_data, completed_stage: Features }
+    output = generator.generate_features(pos, self_voxels, &neighbors)
+    chunk_data = ChunkData { voxels: output.voxels, status: Features, ... }
+    ChunkGenResult { pos, mesh: None, chunk_data, from_disk: false }
 ```
 
 **Mesh stage** (needs 1-ring neighbor feature data for padding):
 ```
-fn mesh_task(pos, padded_voxels) -> ChunkGenResult:
+fn mesh_task(pos, padded_voxels, chunk_data) -> ChunkGenResult:
     mesh = mesh_chunk_greedy(&padded_voxels)
-    chunk_data = /* voxels unchanged, status updated */
-    ChunkGenResult { pos, mesh, chunk_data, completed_stage: Mesh }
+    chunk_data.status = Mesh
+    ChunkGenResult { pos, mesh, chunk_data, from_disk: false }
 ```
 
 The async task for a stage that requires neighbors must receive the neighbor data **before** being spawned (read from octree on the main thread, cloned into the task). The task itself runs off-thread with no ECS access.
@@ -388,7 +380,7 @@ Currently, padding is baked into the generator output (18³ includes 1-voxel pad
 **`handle_completed_chunk`** (`lifecycle.rs:768-812`): Currently inserts ChunkData into octree and spawns mesh entity. Must be updated to:
 - Insert ChunkData at whatever stage completed
 - Only spawn mesh entity when Mesh stage completes
-- Re-enqueue chunk for next stage if target status not yet reached
+- Chunk will be re-enqueued by `update_chunks` next frame if target status not yet reached
 
 **`despawn_out_of_range_chunks`**: No change — still removes data and entities for unloaded columns.
 
@@ -435,21 +427,41 @@ However, if the project later adds trees that modify voxels (e.g., tree trunks/c
 - No neighbor voxel data needed (self-contained placement per chunk)
 - Simpler, matches the "generate once, save forever" model
 
-**Option C: Hybrid** (chosen)
-- Trait has both `generate_features` for voxel modifications AND returns entity spawns
-- Voxel modifications (caves, ore veins) happen in Features stage with neighbor access
-- Entity placement (trees as .vox models, NPCs) also happens in Features stage
+**Option B: Entity-only features** (implement first)
+- Features are entities placed on top of terrain, not voxel modifications
+- `PlacementRules` runs during Features stage, returns `Vec<WorldObjectSpawn>`
+- No neighbor voxel data needed (self-contained placement per chunk)
+- Matches the world object placement research conclusion: "no neighbor terrain dependency needed"
 - `ChunkGenResult` gains `entity_spawns: Vec<WorldObjectSpawn>` field
 
+**Upgrade path to Option C** (when voxel-modifying features are needed):
+- Add `fn generate_features()` to the trait with a default no-op impl
+- Existing generators continue working unchanged
+- Only generators that need voxel modification override the method
+
 ```rust
-pub struct FeatureOutput {
-    pub voxels: Vec<WorldVoxel>,           // modified voxel array
-    pub entity_spawns: Vec<WorldObjectSpawn>, // entities to spawn
+/// Initial trait — entity-only feature placement.
+pub trait VoxelGenerator: Send + Sync {
+    /// Stage 1: Base terrain shape.
+    fn generate_terrain(&self, pos: IVec3) -> Vec<WorldVoxel>;
+
+    /// Stage 2: Entity placement on terrain surface.
+    fn place_features(&self, pos: IVec3, terrain: &[WorldVoxel]) -> Vec<WorldObjectSpawn> {
+        Vec::new() // default: no features
+    }
+
+    /// Stage 2 (future): Voxel-modifying features. Override when caves/ores needed.
+    fn generate_features(&self, pos: IVec3, terrain: &[WorldVoxel], neighbors: &NeighborAccess) -> FeatureOutput {
+        FeatureOutput {
+            voxels: terrain.to_vec(),
+            entity_spawns: self.place_features(pos, terrain),
+        }
+    }
 }
 
-pub trait VoxelGenerator: Send + Sync {
-    fn generate_terrain(&self, pos: IVec3) -> Vec<WorldVoxel>;
-    fn generate_features(&self, pos: IVec3, terrain: &[WorldVoxel], neighbors: &NeighborAccess) -> FeatureOutput;
+pub struct FeatureOutput {
+    pub voxels: Vec<WorldVoxel>,
+    pub entity_spawns: Vec<WorldObjectSpawn>,
 }
 ```
 
@@ -475,7 +487,7 @@ pub trait VoxelGenerator: Send + Sync {
 ## Code References
 
 - `crates/voxel_map_engine/src/config.rs:12-13` — `VoxelGenerator` closure type (to become trait)
-- `crates/voxel_map_engine/src/generation.rs:16-22` — `ChunkGenResult` (needs `completed_stage`)
+- `crates/voxel_map_engine/src/generation.rs:16-22` — `ChunkGenResult`
 - `crates/voxel_map_engine/src/generation.rs:33-102` — `spawn_chunk_gen_batch` and `generate_chunk` (single-pass)
 - `crates/voxel_map_engine/src/types.rs:36-63` — `ChunkData` (needs `status: ChunkStatus`)
 - `crates/voxel_map_engine/src/lifecycle.rs:27-64` — `ChunkWorkBudget`
@@ -506,7 +518,7 @@ pub trait VoxelGenerator: Send + Sync {
 
 ## Resolved Questions
 
-1. **Light stage**: **Yes — include the Light stage in `ChunkStatus` for future support.** The enum will be Empty → Terrain → Features → Light → Mesh → Full. The Light stage implementation will be a no-op pass-through initially (just advances status without modifying voxels). This reserves the stage slot so adding real light propagation later doesn't require changing the status enum or breaking save compatibility.
+1. **Light stage**: **Omit for now.** A no-op stage adds a mandatory scheduling round-trip per chunk (enqueue → spawn task → poll → complete → re-enqueue) for zero work. Adding the enum variant between Features and Mesh later is trivial via `generation_version` bump. Pipeline: **Empty → Terrain → Features → Mesh → Full**.
 
 2. **NeighborAccess granularity**: **Decompress on demand.** Pass `PalettedChunk` references (cloned into the async task). `NeighborAccess` provides `get(index) -> WorldVoxel` that does O(1) bit extraction from the palette. Memory cost ~20KB worst case vs ~300KB for full expansion. See the NeighborAccess section above for implementation details.
 
