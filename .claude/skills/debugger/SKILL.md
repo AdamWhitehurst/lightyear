@@ -257,3 +257,6 @@ After fix is verified:
 - **Assuming outdated architecture**: When debugging a dependency, verify the actual version in use. Architecture can change between major versions (e.g., lightyear 0.25 merged Predicted/Confirmed into one entity). Check `Cargo.toml`, `git log`, and release notes before building theories on entity layout.
 
 ## Lessons Index
+
+- `lessons/lightyear.md` — Lightyear entity architecture, stuck inputs, tracy instrumentation
+- `lessons/voxel_engine.md` — ChunkWorkBudget starvation when `ChunkGenerationEnabled` is absent (clients)

@@ -200,6 +200,17 @@ pub fn world_to_column_pos(translation: Vec3) -> IVec2 {
     IVec2::new(chunk.x, chunk.z)
 }
 
+/// Reset chunk work budgets when `update_chunks` is not running.
+///
+/// `update_chunks` (gated on `ChunkGenerationEnabled`) resets the budget after
+/// propagation. Without generation enabled (i.e. clients), nothing resets it,
+/// starving the remesh pipeline.
+pub fn reset_chunk_budgets(mut budgets: Query<&mut ChunkWorkBudget>) {
+    for mut budget in &mut budgets {
+        budget.reset();
+    }
+}
+
 /// Auto-insert `PendingChunks`, `PendingRemeshes`, and `TicketLevelPropagator`
 /// on map entities that lack them.
 ///
@@ -340,9 +351,7 @@ pub(crate) fn update_chunks(
             propagator.propagate()
         };
 
-        // Reset budget AFTER propagation so BFS doesn't eat the spawn/poll budget.
-        // TODO(Phase 4): Once propagation is amortized (max_steps per frame), move
-        // this reset back before propagation so BFS counts against the budget too.
+        // Reset budget AFTER propagation so amortized BFS counts against it.
         budget.reset();
 
         for &col in &diff.unloaded {
@@ -724,9 +733,9 @@ pub fn poll_chunk_tasks(
                     handle_completed_chunk(
                         &mut commands,
                         &mut instance,
-                        &mut *meshes,
-                        &mut *materials,
-                        &*default_material,
+                        &mut meshes,
+                        &mut materials,
+                        &default_material,
                         map_entity,
                         result,
                     );
