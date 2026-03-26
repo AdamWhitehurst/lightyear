@@ -1,42 +1,52 @@
 [workspace]
 members = [
-    "crates/protocol",
-    "crates/client",
-    "crates/server",
-    "crates/web",
-    "crates/render",
-    "crates/ui",
-    "crates/voxel_map_engine",
-    "crates/sprite_rig",
+  "crates/protocol",
+  "crates/client",
+  "crates/server",
+  "crates/web",
+  "crates/render",
+  "crates/ui",
+  "crates/voxel_map_engine",
+  "crates/sprite_rig",
 ]
 exclude = [
-    "git/avian",
-    "git/bevy",
-    "git/bevy_fsl_box_frame",
-    "git/bevy_metrics_dashboard", 
-    "git/bevy_triplanar_splatting",
-    "git/block-mesh-rs",
-    "git/fast-surface-nets-rs",
-    "git/grid-tree-rs",
-    "git/height-mesh-rs",
-    "git/lightyear",
-    "git/ndcopy-rs",
-    "git/ndshape-rs",
-    "git/qef",
-    "git/rkyv_impl",
-    "git/smooth-bevy-cameras",
-    "git/vector_expr",
+  "git/avian",
+  "git/bevy",
+  "git/bevy_fsl_box_frame",
+  "git/bevy_metrics_dashboard",
+  "git/bevy_triplanar_splatting",
+  "git/block-mesh-rs",
+  "git/fast-surface-nets-rs",
+  "git/grid-tree-rs",
+  "git/height-mesh-rs",
+  "git/lightyear",
+  "git/ndcopy-rs",
+  "git/ndshape-rs",
+  "git/qef",
+  "git/rkyv_impl",
+  "git/smooth-bevy-cameras",
+  "git/vector_expr",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-avian3d = { version = "0.5.0", default-features = false, features = ["3d", "f32", "parry-f32", "default-collider", "collider-from-mesh", "serialize"] }
+avian3d = { version = "0.5.0", default-features = false, features = [
+  "3d",
+  "f32",
+  "parry-f32",
+  "default-collider",
+  "collider-from-mesh",
+  "serialize",
+] }
 bevy = { version = "0.18", default-features = false }
 leafwing-input-manager = "0.20"
 voxel_map_engine = { path = "crates/voxel_map_engine" }
-lightyear = { git = "https://github.com/AdamWhitehurst/lightyear", branch = "main", features = ["leafwing", "raw_connection"]}
-lightyear_crossbeam = { git = "https://github.com/AdamWhitehurst/lightyear", branch = "main" }
-lightyear_replication = { git = "https://github.com/AdamWhitehurst/lightyear", branch = "main" }
+lightyear = { path = "git/lightyear/lightyear", features = [
+  "leafwing",
+  "raw_connection",
+] }
+lightyear_crossbeam = { path = "git/lightyear/lightyear_crossbeam" }
+lightyear_replication = { path = "git/lightyear/lightyear_replication" }
 protocol = { path = "crates/protocol" }
 ron = "0.12"
 bevy_common_assets = { version = "0.15", features = ["ron"] }
@@ -52,7 +62,10 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # Test dependencies
 approx = "0.5.1"
 mock_instant = "0.6"
-test-log = { version = "0.2.17", default-features = false, features = ["trace", "color"] }
+test-log = { version = "0.2.17", default-features = false, features = [
+  "trace",
+  "color",
+] }
 
 [patch.crates-io]
 ndshape = { path = "git/ndshape-rs" }
@@ -66,9 +79,9 @@ lto = false
 # WASM-specific test profile: optimize for size and reduce memory usage
 [profile.wasm-test]
 inherits = "test"
-debug = false                # No debug info to save memory
-strip = true                 # Strip symbols
-lto = "thin"                 # Thin LTO for smaller binary
+debug = false     # No debug info to save memory
+strip = true      # Strip symbols
+lto = "thin"      # Thin LTO for smaller binary
 
 [profile.dev.package."*"]
 opt-level = 3
