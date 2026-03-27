@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod ability;
 pub mod app_state;
+pub mod billboard;
 pub mod character;
 pub mod diagnostics;
 pub mod hit_detection;

@@ -14,7 +14,7 @@ pub use animation::{
     LocomotionState,
 };
 pub use animset::AnimationEventFired;
-pub use spawn::{AnimSetRef, BoneEntities, Facing, RigBillboard, SpriteRig};
+pub use spawn::{AnimSetRef, BoneEntities, Facing, JointRoot, SpriteRig};
 
 pub struct SpriteRigPlugin;
 
@@ -45,7 +45,7 @@ impl Plugin for SpriteRigPlugin {
                 animation::update_locomotion_blend_weights,
                 animset::trigger_ability_animations,
                 animset::return_to_locomotion,
-                spawn::billboard_rigs_face_camera,
+                spawn::billboard_joint_roots,
                 spawn::update_facing_from_velocity,
                 spawn::apply_facing_to_rig,
             )

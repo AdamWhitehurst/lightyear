@@ -7,6 +7,7 @@ use avian3d::prelude::Position;
 use bevy::prelude::*;
 use lightyear::frame_interpolation::{FrameInterpolate, FrameInterpolationPlugin};
 use lightyear::prelude::*;
+use protocol::billboard::billboard_material::BillboardMaterial;
 use protocol::*;
 
 pub struct RenderPlugin;
@@ -26,6 +27,8 @@ impl Plugin for RenderPlugin {
             app.init_resource::<InterpolationRegistry>();
         }
 
+        app.add_plugins(bevy::pbr::MaterialPlugin::<BillboardMaterial>::default());
+
         app.add_systems(Startup, (camera::setup_camera, camera::setup_lighting));
         app.add_systems(
             Update,
@@ -34,7 +37,6 @@ impl Plugin for RenderPlugin {
                 camera::update_camera_orbit,
                 camera::follow_player,
                 camera::update_light_position,
-                health_bar::billboard_face_camera,
                 health_bar::update_health_bars,
             )
                 .chain(),
@@ -80,7 +82,7 @@ fn add_health_bars(
     trigger: On<Add, Health>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<BillboardMaterial>>,
 ) {
     health_bar::spawn_health_bar(&mut commands, trigger.entity, &mut *meshes, &mut *materials);
 }

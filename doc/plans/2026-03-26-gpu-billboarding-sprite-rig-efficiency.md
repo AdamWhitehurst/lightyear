@@ -270,7 +270,7 @@ In `update_health_bars` -- no material access, only `Transform` mutation. No cha
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] `cargo check-all`
+- [x] `cargo check-all`
 - [ ] `cargo server` builds and runs
 - [ ] `cargo client` builds and runs
 

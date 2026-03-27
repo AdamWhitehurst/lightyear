@@ -27,9 +27,9 @@ pub enum Facing {
     Right,
 }
 
-/// Marker for the billboard child entity that parents all root bone entities.
+/// Marker for the joint root child entity that parents all root bone entities.
 #[derive(Component)]
-pub struct RigBillboard;
+pub struct JointRoot;
 
 /// Preserves a bone's z-depth so animation curves (which overwrite all 3 translation axes) don't
 /// flatten the draw order. A post-animation system restores `Transform::translation.z` from this.
@@ -63,7 +63,7 @@ pub fn resolve_character_rig(
     }
 }
 
-/// Spawns bone hierarchy under a `RigBillboard` when `SpriteRig` is added.
+/// Spawns bone hierarchy under a `JointRoot` when `SpriteRig` is added.
 pub fn spawn_sprite_rigs(
     mut commands: Commands,
     query: Query<(Entity, &SpriteRig), Added<SpriteRig>>,
@@ -80,11 +80,7 @@ pub fn spawn_sprite_rigs(
         let sorted_bones = topological_sort_bones(&rig.bones);
 
         let billboard_id = commands
-            .spawn((
-                RigBillboard,
-                Name::new("RigBillboard"),
-                Transform::default(),
-            ))
+            .spawn((JointRoot, Name::new("JointRoot"), Transform::default()))
             .id();
         commands.entity(entity).add_child(billboard_id);
 
@@ -244,36 +240,6 @@ fn topological_sort_bones(bones: &[crate::asset::BoneDef]) -> Vec<&crate::asset:
     sorted
 }
 
-/// Rotates `RigBillboard` entities to face the camera (Y-axis locked).
-///
-/// Uses atan2-based Y rotation to avoid the degenerate case of `from_rotation_arc`
-/// when the camera direction is anti-parallel to +Z (common with rear-facing cameras).
-pub fn billboard_rigs_face_camera(
-    camera_query: Query<&GlobalTransform, With<Camera3d>>,
-    mut billboard_query: Query<(&GlobalTransform, &mut Transform, &ChildOf), With<RigBillboard>>,
-    parent_query: Query<&GlobalTransform, Without<RigBillboard>>,
-) {
-    let Ok(camera_gt) = camera_query.single() else {
-        // Camera not yet spawned during early frames
-        return;
-    };
-    let camera_pos = camera_gt.translation();
-
-    for (global_transform, mut transform, child_of) in &mut billboard_query {
-        let billboard_pos = global_transform.translation();
-        let direction = (camera_pos - billboard_pos).with_y(0.0);
-        if direction.length_squared() < 0.001 {
-            continue; // degenerate direction when camera is directly above
-        }
-        let world_rotation = Quat::from_rotation_y(direction.x.atan2(direction.z));
-        let parent_rotation = parent_query
-            .get(child_of.parent())
-            .map(|gt| gt.to_scale_rotation_translation().1)
-            .unwrap_or(Quat::IDENTITY);
-        transform.rotation = parent_rotation.inverse() * world_rotation;
-    }
-}
-
 /// Updates `Facing` based on horizontal velocity projected onto camera's right axis.
 pub fn update_facing_from_velocity(
     camera_query: Query<&Transform, With<Camera3d>>,
@@ -295,11 +261,42 @@ pub fn update_facing_from_velocity(
     }
 }
 
-/// Mirrors the rig billboard horizontally when `Facing` changes.
+/// Rotates `JointRoot` entities to face the camera (Y-axis locked).
+///
+/// This keeps the 2D bone hierarchy layout in the camera-facing plane so bone
+/// offsets (arm to the side, head above, etc.) project correctly on screen.
+/// The GPU billboard shader handles per-quad screen-plane orientation on top.
+pub fn billboard_joint_roots(
+    camera_query: Query<&GlobalTransform, With<Camera3d>>,
+    mut joint_query: Query<(&GlobalTransform, &mut Transform, &ChildOf), With<JointRoot>>,
+    parent_query: Query<&GlobalTransform, Without<JointRoot>>,
+) {
+    let Ok(camera_gt) = camera_query.single() else {
+        trace!("Camera not yet spawned during early frames");
+        return;
+    };
+    let camera_pos = camera_gt.translation();
+
+    for (global_transform, mut transform, child_of) in &mut joint_query {
+        let pos = global_transform.translation();
+        let direction = (camera_pos - pos).with_y(0.0);
+        if direction.length_squared() < 0.001 {
+            continue;
+        }
+        let world_rotation = Quat::from_rotation_y(direction.x.atan2(direction.z));
+        let parent_rotation = parent_query
+            .get(child_of.parent())
+            .map(|gt| gt.to_scale_rotation_translation().1)
+            .unwrap_or(Quat::IDENTITY);
+        transform.rotation = parent_rotation.inverse() * world_rotation;
+    }
+}
+
+/// Mirrors the joint root horizontally when `Facing` changes.
 pub fn apply_facing_to_rig(
     changed_query: Query<(Entity, &Facing), Changed<Facing>>,
     children_query: Query<&Children>,
-    mut billboard_query: Query<&mut Transform, With<RigBillboard>>,
+    mut billboard_query: Query<&mut Transform, With<JointRoot>>,
 ) {
     for (entity, facing) in &changed_query {
         let Ok(children) = children_query.get(entity) else {
