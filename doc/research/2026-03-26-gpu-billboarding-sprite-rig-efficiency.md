@@ -5,10 +5,11 @@ git_commit: ac0c8c45c6dcece0d80674c707487cf1d8bbbf3a
 branch: master
 repository: bevy-lightyear-template
 topic: "GPU billboarding for sprite rigs and health bars"
-tags: [research, optimization, billboarding, gpu, shader, sprite-rig, health-bar, vertex-shader, instancing]
+tags: [research, optimization, billboarding, gpu, shader, sprite-rig, health-bar, vertex-shader, instancing, skinned-mesh, gpu-skinning]
 status: complete
 last_updated: 2026-03-26
 last_updated_by: Claude
+last_updated_note: "Resolved all 8 open questions with verified findings from Bevy 0.18 source; updated WGSL to Bevy 0.18 naming conventions; elaborated single skinned mesh approach"
 ---
 
 # Research: GPU Billboarding for Sprite Rigs and Health Bars
@@ -38,7 +39,7 @@ For rendering sprite rig pieces more efficiently, the biggest wins come from **s
 Entity hierarchy per character:
 ```
 CharacterEntity (SpriteRig, Facing, BoneEntities, AnimationPlayer)
-  └─ RigBillboard (Transform, marker)
+  └─ JointRoot (Transform, marker) [currently named `RigBillboard` in code -- rename in Phase 1]
        ├─ root bone (Mesh3d<Plane3d>, MeshMaterial3d<StandardMaterial>, BoneZOrder)
        │    ├─ child bone ...
        │    └─ child bone ...
@@ -51,7 +52,7 @@ CharacterEntity (SpriteRig, Facing, BoneEntities, AnimationPlayer)
 3. Calculates world rotation via `atan2(direction.x, direction.z)`
 4. Converts to local space by removing parent's world rotation: `transform.rotation = parent_rotation.inverse() * world_rotation`
 
-`apply_facing_to_rig` (`spawn.rs:299-317`) mirrors the entire bone hierarchy by setting `RigBillboard`'s `transform.scale.x` to `1.0` or `-1.0` when `Facing` changes.
+`apply_facing_to_rig` (`spawn.rs:299-317`) mirrors the entire bone hierarchy by setting `JointRoot`'s `transform.scale.x` to `1.0` or `-1.0` when `Facing` changes.
 
 ### Health Bar Billboard (`render/health_bar.rs:67-89`)
 
@@ -92,25 +93,25 @@ Strip the model's rotation in the vertex shader and reconstruct a camera-facing 
 
 **Technique A -- Strip rotation from ModelView matrix:**
 ```wgsl
-var model_view = view.view * mesh_functions::get_world_from_local(in.instance_index);
+var model_view = view.view_from_world * mesh_functions::get_world_from_local(in.instance_index);
 // Replace rotation columns with identity (cylindrical: preserve column 1 for Y-lock)
 model_view[0] = vec4<f32>(1.0, 0.0, 0.0, model_view[0][3]);
 model_view[1] = vec4<f32>(0.0, 1.0, 0.0, model_view[1][3]);
 model_view[2] = vec4<f32>(0.0, 0.0, 1.0, model_view[2][3]);
-let clip_pos = view.projection * model_view * vec4<f32>(in.position, 1.0);
+let clip_pos = view.clip_from_view * model_view * vec4<f32>(in.position, 1.0);
 ```
 
 **Technique B -- Reconstruct camera basis from view-projection:**
 ```wgsl
-let camera_right = normalize(vec3<f32>(view.view_proj.x.x, view.view_proj.y.x, view.view_proj.z.x));
-let camera_up = normalize(vec3<f32>(view.view_proj.x.y, view.view_proj.y.y, view.view_proj.z.y));
+let camera_right = normalize(vec3<f32>(view.clip_from_world.x.x, view.clip_from_world.y.x, view.clip_from_world.z.x));
+let camera_up = normalize(vec3<f32>(view.clip_from_world.x.y, view.clip_from_world.y.y, view.clip_from_world.z.y));
 let world_pos = center + camera_right * in.position.x * scale.x + camera_up * in.position.y * scale.y;
 ```
 
 **Technique C -- Cross-product basis (used by Hanabi):**
 ```wgsl
 let axis_z = normalize(camera_position - entity_position);
-let axis_x = normalize(cross(view.view[1].xyz, axis_z));
+let axis_x = normalize(cross(view.view_from_world[1].xyz, axis_z));
 let axis_y = cross(axis_z, axis_x);
 let world_pos = position + axis_x * vert.x * size.x + axis_y * vert.y * size.y;
 ```
@@ -144,7 +145,7 @@ Entities would use `MeshMaterial3d<ExtendedMaterial<StandardMaterial, BillboardE
 | Billboard rotation | System writes `Transform` every frame | Vertex shader strips rotation; `Transform` unchanged |
 | Transform re-upload | Every frame (dirty) | Only on actual position/animation changes |
 | Multi-camera | Would need per-camera system | Automatic (view uniform is per-camera) |
-| Facing flip | `scale.x = -1.0` on billboard entity | Could use negative scale on entity, or a shader uniform |
+| Facing flip | `scale.x = -1.0` on billboard entity | Unchanged -- `scale.x = -1.0` on billboard entity mirrors bone positions via transform propagation; no UV flip needed |
 | System scheduling | Must run after transform propagation | Eliminated |
 | Bone animation | Unchanged (AnimationPlayer writes bone transforms) | Unchanged |
 
@@ -154,7 +155,7 @@ The animation system writes `Transform::translation`, `rotation`, and `scale` on
 - Bone-relative transforms (parent-child hierarchy) work normally
 - The billboard entity no longer needs its rotation written per-frame
 - Z-ordering (baked into `Transform::translation.z`) is preserved
-- Facing flip via `scale.x` still works (the vertex shader sees the final model matrix including scale)
+- Facing flip via `scale.x` on the billboard entity still works: transform propagation mirrors bone world positions (the X component of each bone's world translation is negated), and the vertex shader uses those already-mirrored positions as quad centers. The shader strips rotation columns (which also strips per-quad scale), but this only affects the quad's own visual orientation -- bone *positions* are already correct. No per-quad UV flip is needed because character art is symmetric (directional art will be handled by the animation system with different poses, not mirrored textures).
 
 ### Approach 2: Compute Shader (Not Recommended)
 
@@ -191,31 +192,167 @@ When real textures replace placeholder colors, pack all bone sprites into one at
 
 Combined with the billboard vertex shader, UV offsets select the correct sub-sprite. This is exactly what Bevy's 2D sprite renderer does internally.
 
-### Optimization 3: Single Skinned Mesh (Not Recommended Yet)
+### Optimization 3: Single Skinned Mesh
 
-Build one mesh containing all bone quads with per-vertex bone indices. Upload bone transforms as a joint matrix buffer. Vertex shader applies skinning + billboarding. **One draw call per character.**
+Collapse the entire multi-entity bone hierarchy into a single mesh with GPU skinning. One draw call per character instead of N.
 
-This is standard GPU skeletal animation applied to 2D sprite planes. Bevy already has `SkinnedMesh` + `joint_matrices` infrastructure in `mesh.wgsl`.
+#### How It Works
 
-**Trade-offs**:
+The technique applies standard GPU skeletal animation to 2D sprite planes:
+
+1. **Build a single mesh** containing all bone quads (6 visible bones = 6 quads = 24 vertices, 36 indices)
+2. **Each vertex stores** joint indices + joint weights (`ATTRIBUTE_JOINT_INDEX`, `ATTRIBUTE_JOINT_WEIGHT`) binding it to its bone
+3. **Joint entities** (invisible transform-only entities) form the skeleton hierarchy, driven by `AnimationPlayer`
+4. **GPU vertex shader** reads per-joint matrices from a storage buffer, transforms each quad's vertices by its bone's matrix
+5. **Billboard vertex shader** then strips the camera-facing rotation (composing with skinning)
+
+#### Bevy's Skinning Infrastructure
+
+Bevy has built-in GPU skinning (`SkinnedMesh` component + `skinning.wgsl`):
+
+```rust
+pub struct SkinnedMesh {
+    pub inverse_bindposes: Handle<SkinnedMeshInverseBindposes>,  // Vec<Mat4>
+    pub joints: Vec<Entity>,  // joint entities with GlobalTransform
+}
+```
+
+**Pipeline**: `extract_skins` reads each joint entity's `GlobalTransform`, multiplies by inverse bind pose, uploads all joint matrices to a single GPU storage buffer. The vertex shader indexes into this buffer via `mesh[instance_index].current_skin_index + joint_index`.
+
+**Vertex attributes** (locations 6 and 7):
+```rust
+mesh.with_inserted_attribute(
+    Mesh::ATTRIBUTE_JOINT_INDEX,
+    vec![[bone_idx as u16, 0, 0, 0]; 4]  // per vertex, [u16; 4]
+)
+.with_inserted_attribute(
+    Mesh::ATTRIBUTE_JOINT_WEIGHT,
+    vec![[1.0f32, 0.0, 0.0, 0.0]; 4]     // per vertex, [f32; 4]
+)
+```
+
+For sprite rig bones (rigid quads, no deformation), each vertex has weight 1.0 on exactly one joint. No blending between joints needed.
+
+**Programmatic construction**: Bevy's `custom_skinned_mesh` example demonstrates building a `SkinnedMesh` entirely from code -- no GLTF required. Joint entities are spawned with `Transform`, mesh is built with `Mesh::new()` + vertex attributes.
+
+**Max joints**: 256 per mesh (configurable via `GlobalSkinnedMeshSettings` in newer Bevy). The humanoid rig has 7 bones -- well within limits.
+
+#### Concrete Mesh Construction for the Humanoid Rig
+
+Current humanoid: 7 bones, 6 visible (root has no slot). Each visible bone becomes a quad in the mesh:
+
+```
+Mesh vertices (24 total = 6 quads * 4 vertices):
+  Quad 0 (torso):  4 vertices, joint_index=1, UVs -> atlas region for torso
+  Quad 1 (arm_l):  4 vertices, joint_index=3, UVs -> atlas region for arm_l
+  Quad 2 (leg_l):  4 vertices, joint_index=5, UVs -> atlas region for leg_l
+  Quad 3 (leg_r):  4 vertices, joint_index=6, UVs -> atlas region for leg_r
+  Quad 4 (arm_r):  4 vertices, joint_index=4, UVs -> atlas region for arm_r
+  Quad 5 (head):   4 vertices, joint_index=2, UVs -> atlas region for head
+
+Index buffer (36 total = 6 quads * 6 indices):
+  Ordered back-to-front by z_order for correct overlap (painter's algorithm)
+```
+
+**Z-ordering**: quads are ordered in the index buffer by z_order (back-to-front). With `AlphaMode::Blend` and depth-write off, later triangles paint over earlier ones. This matches the current z_order values: arm_l (-0.001) behind torso (0.0) behind arm_r (0.001), etc.
+
+Alternatively, per-vertex z-offsets can be baked into positions (matching the current approach where `Transform::translation.z = z_order`), with depth testing enabled. The current rig already uses this pattern.
+
+#### Joint Entity Hierarchy
+
+Joint entities replace the current bone entities but are invisible (no mesh):
+
+```
+CharacterEntity (AnimationPlayer, SkinnedMesh)
+  └─ JointRoot (scale.x for facing)
+       └─ joint_root (Transform)
+            ├─ joint_torso (Transform)
+            │   ├─ joint_head (Transform)
+            │   ├─ joint_arm_l (Transform)
+            │   └─ joint_arm_r (Transform)
+            ├─ joint_leg_l (Transform)
+            └─ joint_leg_r (Transform)
+```
+
+The `AnimationPlayer` drives joint `Transform` exactly as it drives bone `Transform` today. `AnimationTargetId::from_names` works the same way. The animation clip building code (`build_clip_from`) needs no changes to its curve generation -- it already targets `Transform` fields by bone name.
+
+#### Skinning + Billboard Vertex Shader Composition
+
+**Critical detail**: `MaterialExtension::vertex_shader()` **replaces** the base material's vertex shader entirely -- it does not compose. This means the custom billboard vertex shader must also handle skinning.
+
+The shader must:
+1. Import `bevy_pbr::skinning` and call `skin_model(joint_indices, joint_weights, instance_index)` to get the skinned world-from-local matrix
+2. Strip rotation columns from the resulting model-view matrix for billboarding
+3. Apply the final position
+
+```wgsl
+#import bevy_pbr::skinning
+
+// In vertex main:
+#ifdef SKINNED
+    var world_from_local = skinning::skin_model(in.joint_indices, in.joint_weights, in.instance_index);
+#else
+    var world_from_local = mesh_functions::get_world_from_local(in.instance_index);
+#endif
+
+// Billboard: strip rotation from model-view, keeping translation + scale
+var model_view = view.view_from_world * world_from_local;
+model_view[0] = vec4<f32>(1.0, 0.0, 0.0, model_view[0][3]);
+model_view[1] = vec4<f32>(0.0, 1.0, 0.0, model_view[1][3]);
+model_view[2] = vec4<f32>(0.0, 0.0, 1.0, model_view[2][3]);
+out.clip_position = view.clip_from_view * model_view * vec4<f32>(in.position, 1.0);
+```
+
+The `SKINNED` shader def is automatically set by Bevy when the entity has a `SkinnedMesh` component.
+
+#### Per-Bone Texture Selection
+
+Two approaches for selecting different textures per quad within a single mesh:
+
+**Option A -- Texture atlas with per-vertex UVs (simpler)**:
+Pack all bone sprites into one atlas image. Each quad's 4 vertices have UVs pointing at the correct atlas region. Use `StandardMaterial` with the atlas as `base_color_texture`. No custom fragment shader.
+
+**Option B -- Array texture with per-vertex layer index (cleaner)**:
+Use a `texture_2d_array` with one layer per body part. Add a custom vertex attribute for the layer index. Requires an `ExtendedMaterial` fragment shader that samples `texture_sample(tex_array, sampler, uv, layer)`. Bevy has an official [array texture example](https://bevy.org/examples/shaders/array-texture/).
+
+For placeholder colors (current state), neither is needed -- vertex colors or a uniform color per quad suffice. Option A is the natural choice when real art arrives.
+
+#### Instanced Skinned Meshes (Multiple Characters)
+
+Bevy does not instance skinned meshes in the traditional sense (one draw call for N characters). Each character gets its own joint matrix set in the storage buffer and its own draw call. However, since Bevy 0.16 ([PR #16599](https://github.com/bevyengine/bevy/pull/16599)), skinned meshes are **batchable** on storage-buffer platforms -- joint matrices for all characters are packed into one buffer, reducing CPU overhead of bind calls.
+
+Characters sharing the same `Handle<Mesh>` + `Handle<Material>` + `Handle<SkinnedMeshInverseBindposes>` get the best batching. The `many_foxes` example (1000 foxes) showed frame time improvement from 15.5ms to 11.9ms with this optimization.
+
+#### Trade-offs
 
 | Aspect | Per-entity bones (current) | Single skinned mesh |
 |--------|---------------------------|-------------------|
-| Draw calls per character | N | 1 |
-| Transform overhead | N ECS entities in hierarchy | 1 buffer upload |
-| Implementation complexity | Simple ECS | Custom mesh builder + skinning setup |
-| Flexibility | Easy add/remove bones | Fixed topology, rebuild mesh |
-| Bevy integration | Native | Requires manual mesh construction or GLTF tooling |
+| Draw calls per character | N (6 for humanoid) | 1 |
+| Entities per character | 1 + 1 + N (8 for humanoid) | 1 mesh + 1 billboard + N joints (8, but joints are lighter -- no Mesh3d/MeshMaterial3d) |
+| Transform propagation | N visible entities with mesh data | N joint entities (transform-only, cheaper) |
+| GPU upload per frame | N dirty transforms | 1 joint matrix buffer slice (N matrices) |
+| Mesh/material sharing | Requires explicit flyweight cache | Natural -- one mesh handle per rig type, one material handle per atlas |
+| Animation system | Unchanged | Unchanged (AnimationPlayer targets joint Transform) |
+| Adding/removing bones | Insert/remove entity | Rebuild mesh (but infrequent -- rig changes are asset-time, not runtime) |
+| Per-bone gameplay queries | Natural (each bone is an entity) | Possible via joint entities (they still exist, just invisible) |
 
-At the expected character counts (<50 on screen), the per-entity approach with shared handles + batching is sufficient. The skinned mesh approach would matter at 100+ characters.
+#### Industry Precedent
 
-### Optimization 4: Distance-Based LOD for Rigs
+This is the standard approach used by Spine, DragonBones, and Unity 2D Animation:
 
-Replace multi-bone rigs with a single billboard sprite at distance:
-- Near: 1+1+N entities, full animation
-- Far: 1 entity, single textured quad, billboard shader
+- **Spine**: iterates slots in draw order, appends quad vertices into one mesh per skeleton, submits as one draw call per atlas page. Z-ordering via triangle submission order (painter's algorithm).
+- **Unity SpriteSkin**: uses CPU or GPU deformation on individual sprites, with dynamic batching combining them. GPU path uses per-object draws.
+- **No existing Bevy plugin** implements this for 2D sprite rigs. Would be built from scratch using Bevy's `custom_skinned_mesh` infrastructure.
 
-Use Bevy's built-in `VisibilityRange` component for distance-based switching.
+#### Sources
+
+- [Bevy `custom_skinned_mesh` example](https://github.com/bevyengine/bevy/blob/main/examples/animation/custom_skinned_mesh.rs)
+- [Bevy skinning.wgsl source](https://github.com/bevyengine/bevy/blob/main/crates/bevy_pbr/src/render/skinning.wgsl)
+- [Bevy array texture example](https://bevy.org/examples/shaders/array-texture/)
+- [PR #16599 -- Batch skinned meshes with storage buffers](https://github.com/bevyengine/bevy/pull/16599)
+- [MaterialExtension docs](https://docs.rs/bevy/latest/bevy/pbr/trait.MaterialExtension.html)
+- [Spine Runtime Skeletons](http://en.esotericsoftware.com/spine-runtime-skeletons)
+- [Spine-Unity Rendering](http://en.esotericsoftware.com/spine-unity-rendering)
 
 ---
 
@@ -255,11 +392,12 @@ Use Bevy's built-in `VisibilityRange` component for distance-based switching.
 
 1. Create `crates/render/src/billboard_material.rs`
 2. Implement `BillboardExt` as `MaterialExtension` with a vertex shader that strips rotation and reconstructs camera-facing orientation (Technique A or B above)
-3. Register `MaterialPlugin::<ExtendedMaterial<StandardMaterial, BillboardExt>>`
-4. Health bars use this material instead of plain `StandardMaterial`
-5. Sprite rig bones use this material instead of plain `StandardMaterial`
-6. Remove `billboard_rigs_face_camera` and `billboard_face_camera` systems
-7. Keep `Facing` flip via `scale.x` (the vertex shader respects the model matrix scale)
+3. The vertex shader must handle both `SKINNED` and non-skinned paths (ifdef), calling `skinning::skin_model()` when `SKINNED` is defined -- this prepares for Phase 3
+4. Register `MaterialPlugin::<ExtendedMaterial<StandardMaterial, BillboardExt>>`
+5. Health bars use this material instead of plain `StandardMaterial`
+6. Sprite rig bones use this material instead of plain `StandardMaterial`
+7. Remove `billboard_rigs_face_camera` and `billboard_face_camera` systems
+8. Rename `RigBillboard` component to `JointRoot` (it no longer handles billboarding -- only joint hierarchy parenting and `scale.x` facing flip)
 
 ### Phase 2: Shared Handles (Flyweight)
 
@@ -268,18 +406,18 @@ Use Bevy's built-in `VisibilityRange` component for distance-based switching.
 3. Sprite rig spawning looks up caches instead of creating new assets per bone
 4. This enables Bevy's automatic batching across all characters
 
-### Phase 3: Texture Atlas (When Real Art Arrives)
+### Phase 3: Single Skinned Mesh
 
-1. Pack bone sprites into atlas images per character type
-2. All bones share one material (same atlas texture)
-3. Per-bone UV coordinates select sub-sprite
-4. One draw call per character type for all bone quads
+Replace the per-bone entity hierarchy with a single skinned mesh per character.
 
-### Phase 4: Distance LOD (Optional)
-
-1. At distance, replace multi-entity rig with single billboard quad
-2. Use `VisibilityRange` for smooth crossfade
-3. Dramatic entity count reduction for distant characters
+1. **Build rig mesh at startup**: for each `SpriteRigAsset`, build a single `Mesh` containing all visible bone quads (24 vertices, 36 indices for humanoid). Each vertex gets `ATTRIBUTE_JOINT_INDEX` and `ATTRIBUTE_JOINT_WEIGHT` binding it to its bone. Quads ordered in index buffer by z_order (back-to-front). Cache as `Handle<Mesh>` per rig type.
+2. **Compute inverse bind poses**: for each joint, the inverse bind pose is the inverse of that joint's **global** rest-pose transform (accumulated through the parent chain). For the humanoid, e.g. head's global rest pose = root * torso * head = translate(0, 2.8, 0.003), so its inverse bind pose = translate(0, -2.8, -0.003). Store as `Handle<SkinnedMeshInverseBindposes>` per rig type.
+3. **Spawn joint entities**: replace visible bone entities (with Mesh3d/MeshMaterial3d) with invisible joint entities (Transform only). Same parent-child hierarchy under `JointRoot`. Keep `AnimationTargetId` + `AnimatedBy` on joints.
+4. **Spawn skinned mesh entity**: single entity with `Mesh3d`, `MeshMaterial3d` (billboard material from Phase 1), `SkinnedMesh { inverse_bindposes, joints }`, `DynamicSkinnedMeshBounds`. Child of character entity (or billboard entity).
+5. **Animation system**: unchanged -- `AnimationPlayer` targets joint `Transform` by name, same `build_clip_from` curves.
+6. **Billboard shader**: already handles `SKINNED` path from Phase 1. The skinned world transform is computed first, then rotation is stripped for billboarding.
+7. **Remove per-bone mesh/material creation** from `spawn_sprite_rigs`. Remove `BoneMeshCache`/`BoneMaterialCache` from Phase 2 (no longer needed -- one mesh per rig type).
+8. **Health bars**: remain as separate non-skinned billboard entities (small, simple, not worth merging into the rig mesh).
 
 ---
 
@@ -287,17 +425,19 @@ Use Bevy's built-in `VisibilityRange` component for distance-based switching.
 
 ### Animation System
 
-No change needed. `AnimationPlayer` continues writing `Transform` on bone entities. The vertex shader overrides rendering orientation without touching ECS data. Bone hierarchy (parent-child transforms) works the same.
+No change needed across all phases. `AnimationPlayer` continues writing `Transform` on joint entities (formerly bone entities). The vertex shader overrides rendering orientation without touching ECS data. In Phase 3, joint entities replace visible bone entities but retain the same hierarchy, names, and `AnimationTargetId` assignments. `build_clip_from` curve generation is unchanged.
 
 ### Facing System
 
-`apply_facing_to_rig` sets `scale.x = -1.0` on the `RigBillboard` entity. The billboard vertex shader receives the final model matrix (after transform propagation), which includes this scale flip. The shader's rotation-stripping preserves scale. **No change needed.**
+`apply_facing_to_rig` sets `scale.x = -1.0` on the `JointRoot` entity. This mirrors all descendant bone positions via transform propagation -- a bone at local X=+2 gets world X=-2. The vertex shader receives each bone's world position (already mirrored) and uses it as the quad center. The shader strips rotation columns from the model-view matrix (which also strips per-quad scale), but positional mirroring is already baked into the translation component. **No change needed to the facing system.**
 
-However, with GPU billboarding, the `RigBillboard` intermediate entity becomes optional for rotation purposes. It could be kept purely for the `Facing` scale flip, or the flip could be moved to a shader uniform / `MeshTag` per-instance data.
+The `JointRoot` entity remains necessary as a hierarchy node for positional mirroring. Its rotation is no longer written per-frame (the shader handles that), but `scale.x` still flips on `Facing` change. No per-quad UV flip or `MeshTag` is needed -- character art is symmetric, and directional art will be handled by the animation system (different poses, not mirrored textures).
 
 ### Z-Ordering
 
-Bone z-order is baked into `Transform::translation.z` by the animation system. The billboard vertex shader operates on the model-view matrix, which includes this z offset. **Z-ordering is preserved.**
+**Phases 1-2**: Bone z-order is baked into `Transform::translation.z` by the animation system. The billboard vertex shader operates on the model-view matrix, which includes this z offset. Z-ordering is preserved.
+
+**Phase 3**: Z-ordering moves from per-entity `Transform::translation.z` to index buffer ordering within the single mesh. Quads are appended back-to-front by z_order value. With depth-write off and `AlphaMode::Blend`, later triangles paint over earlier ones (painter's algorithm). Alternatively, z-offsets can be baked into vertex positions as they are today, with depth testing enabled. Either approach works; the index-buffer approach is simpler and matches industry standard (Spine).
 
 ### Health Bar Color Updates
 
@@ -317,7 +457,7 @@ Bone z-order is baked into `Transform::translation.z` by the animation system. T
 
 ### Bone Rendering
 - `crates/sprite_rig/src/spawn.rs:126-134` -- per-entity Plane3d + StandardMaterial
-- `crates/sprite_rig/src/spawn.rs:82-89` -- RigBillboard entity
+- `crates/sprite_rig/src/spawn.rs:82-89` -- JointRoot entity
 - `crates/sprite_rig/src/animation.rs:316-345` -- translation curves with baked z-order
 - `crates/sprite_rig/src/animation.rs:489-518` -- AnimationTargetId attachment
 
@@ -337,11 +477,195 @@ Bone z-order is baked into `Transform::translation.z` by the animation system. T
 - [Bevy Material trait docs](https://docs.rs/bevy/latest/bevy/pbr/trait.Material.html)
 - [Bevy VisibilityRange example](https://bevy.org/examples/3d-rendering/visibility-range/)
 - [Toji: Compute Vertex Data in WebGPU](https://toji.dev/webgpu-best-practices/compute-vertex-data.html)
+- [Bevy `custom_skinned_mesh` example](https://github.com/bevyengine/bevy/blob/main/examples/animation/custom_skinned_mesh.rs)
+- [Bevy `skinning.wgsl` source](https://github.com/bevyengine/bevy/blob/main/crates/bevy_pbr/src/render/skinning.wgsl)
+- [Bevy array texture example](https://bevy.org/examples/shaders/array-texture/)
+- [PR #16599 -- Batch skinned meshes with storage buffers](https://github.com/bevyengine/bevy/pull/16599)
+- [PR #21256 -- Configurable MAX_JOINTS](https://github.com/bevyengine/bevy/pull/21256)
+- [MaterialExtension trait docs](https://docs.rs/bevy/latest/bevy/pbr/trait.MaterialExtension.html)
+- [Spine Runtime Skeletons](http://en.esotericsoftware.com/spine-runtime-skeletons)
+- [Spine-Unity Rendering](http://en.esotericsoftware.com/spine-unity-rendering)
+- [Spine In Depth](https://en.esotericsoftware.com/spine-in-depth)
+- [Unity SpriteSkin docs](https://docs.unity3d.com/Packages/com.unity.2d.animation@10.1/manual/SpriteSkin.html)
 
-## Open Questions
+## Resolved Questions
 
-1. **Facing flip mechanism**: Keep the `RigBillboard` entity with `scale.x` flip, or move facing to a shader uniform/`MeshTag`? The `RigBillboard` entity is still useful as a hierarchy node even if its rotation is no longer written.
-2. **Cylindrical vs spherical**: Current implementation zeros Y for cylindrical billboard. The vertex shader should do the same (preserve column 1 of model-view matrix). Need to confirm the WGSL snippet handles this correctly for the isometric camera angle.
-3. **bevy 0.18 ExtendedMaterial API**: The `MaterialExtension` trait and `ExtendedMaterial` wrapper should be stable, but verify the vertex shader entry point name and available imports (`mesh_functions::get_world_from_local`, `view.view_proj`) against 0.18's `bevy_pbr` shader source.
-4. **Health bar material mutation**: With `ExtendedMaterial<StandardMaterial, BillboardExt>`, can `base_color` still be mutated at runtime for health percentage? Should work via `Assets<ExtendedMaterial<...>>::get_mut()`, but needs verification.
-5. **WebGPU/WebGL compatibility**: Vertex shader billboarding works on all backends. The `ExtendedMaterial` approach should work on WebGPU. WebGL 2 compatibility of `MaterialExtension` vertex shaders needs testing.
+### 1. Cylindrical vs Spherical Billboard
+
+**Resolved: use spherical (replace all 3 columns).**
+
+Two options in the vertex shader:
+- **Spherical** (replace all 3 rotation columns with identity): quad always faces screen plane exactly, no foreshortening. From an isometric camera at ~45 degrees, sprites render fully face-on.
+- **Cylindrical** (replace columns 0 and 2, keep column 1): quad preserves camera pitch rotation. From 45-degree camera, sprites tilt toward camera and appear vertically foreshortened.
+
+The current CPU implementation zeros Y in the direction vector, which is cylindrical. However, for 2.5D sprite characters that should always appear at full height regardless of camera angle, **spherical is the correct choice**. This is standard for 2D sprite rendering in 3D space.
+
+The WGSL snippet from the research (replacing all 3 columns) already implements spherical:
+```wgsl
+model_view[0] = vec4<f32>(1.0, 0.0, 0.0, model_view[0][3]);
+model_view[1] = vec4<f32>(0.0, 1.0, 0.0, model_view[1][3]);
+model_view[2] = vec4<f32>(0.0, 0.0, 1.0, model_view[2][3]);
+```
+
+Note: this is a visual behavior change from the current CPU cylindrical approach. Sprites will no longer foreshorten when the camera looks down. This is likely desirable but should be verified visually.
+
+Source: [Geeks3D Billboard Tutorial](https://www.geeks3d.com/20140807/billboarding-vertex-shader-glsl/)
+
+### 2. Bevy 0.18 ExtendedMaterial API
+
+**Resolved: verified against local Bevy 0.18 source.**
+
+- **Entry point**: `@vertex fn vertex(vertex_no_morph: Vertex) -> VertexOutput` (mesh.wgsl:37)
+- **View uniform naming** (Bevy 0.18 uses `destination_from_source` convention):
+  - `view.view_from_world_from_world` (view matrix, was `view.view_from_world`)
+  - `view.clip_from_view` (projection matrix, was `view.clip_from_view`)
+  - `view.clip_from_world` (view-projection matrix, was `view.clip_from_world`)
+  - `view.world_position` (camera position)
+- **Required imports**:
+  ```wgsl
+  #import bevy_pbr::{
+      mesh_bindings::mesh,
+      mesh_functions,
+      skinning,
+      forward_io::{Vertex, VertexOutput},
+      view_transformations::position_world_to_clip,
+  }
+  ```
+- **Skinning**: `skinning::skin_model(vertex.joint_indices, vertex.joint_weights, vertex_no_morph.instance_index)` returns `mat4x4<f32>`
+- **Non-skinned**: `mesh_functions::get_world_from_local(vertex_no_morph.instance_index)` returns `mat4x4<f32>`
+- **Vertex struct locations**: position @0, normal @1, uv @2, uv_b @3, tangent @4, color @5, joint_indices @6 (`vec4<u32>`), joint_weights @7 (`vec4<f32>`)
+
+The corrected billboard shader snippet for Bevy 0.18:
+```wgsl
+#ifdef SKINNED
+    var world_from_local = skinning::skin_model(vertex.joint_indices, vertex.joint_weights, vertex_no_morph.instance_index);
+#else
+    var world_from_local = mesh_functions::get_world_from_local(vertex_no_morph.instance_index);
+#endif
+
+var model_view = view.view_from_world_from_world * world_from_local;
+model_view[0] = vec4<f32>(1.0, 0.0, 0.0, model_view[0][3]);
+model_view[1] = vec4<f32>(0.0, 1.0, 0.0, model_view[1][3]);
+model_view[2] = vec4<f32>(0.0, 0.0, 1.0, model_view[2][3]);
+out.clip_position = view.clip_from_view * model_view * vec4<f32>(vertex.position, 1.0);
+```
+
+Source files: `git/bevy/crates/bevy_pbr/src/render/mesh.wgsl`, `skinning.wgsl`, `mesh_functions.wgsl`, `forward_io.wgsl`, `git/bevy/crates/bevy_render/src/view/view.wgsl`
+
+### 3. Health Bar Material Mutation
+
+**Resolved: yes, it works.**
+
+`Assets::<ExtendedMaterial<StandardMaterial, BillboardExt>>::get_mut(&handle)` correctly triggers Bevy's asset change detection. The modified material is re-extracted to the render world and its bind group is recreated via `as_bind_group()`. Modifying `material.base.base_color` propagates to the GPU.
+
+```rust
+fn update_health_bars(
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, BillboardExt>>>,
+    // ...
+) {
+    let mat = materials.get_mut(&handle).expect("material exists");
+    mat.base.base_color = new_color;
+}
+```
+
+Source: [Bevy Discussion #6907](https://github.com/bevyengine/bevy/discussions/6907)
+
+### 4. WebGPU/WebGL Compatibility
+
+**Resolved: works on both, with WebGL 2 constraints.**
+
+- **WebGPU**: full support, no issues
+- **WebGL 2**: `ExtendedMaterial` works but with constraints:
+  - Uniform struct alignment must be 16 bytes ([PR #18812](https://github.com/bevyengine/bevy/pull/18812) fixed this for Bevy's own examples)
+  - No vertex storage buffers (`DownlevelFlags::VERTEX_STORAGE` unavailable)
+  - Uniform buffer limit: 16 KiB per binding
+  - Skinning uses uniform buffers on WebGL 2: max 256 joints (16384 bytes / 64 bytes per mat4)
+  - **Skinned mesh batching is NOT available on WebGL 2** -- each skinned mesh is a separate draw call (storage buffer batching from [PR #16599](https://github.com/bevyengine/bevy/pull/16599) requires storage buffers)
+
+For this project: the humanoid rig has 7 joints, well within the 256 limit. The BillboardExt struct has no custom uniforms (camera data comes from Bevy's view uniform at group 0), so the 16-byte alignment constraint is moot. WebGL 2 will work but each character is a separate draw call (no batching of skinned meshes).
+
+### 5. Skinned Mesh + Billboard Composition
+
+**Resolved: composition works correctly.**
+
+`skinning::skin_model()` returns a `mat4x4<f32>` that is the blended `world_from_model` transform: `joint_global_transform * inverse_bind_pose`. This is a world-space transform. Multiplying by `view.view_from_world_from_world` gives a model-view matrix whose rotation columns can be stripped for billboarding.
+
+The extraction pipeline (in `skin.rs:498`) computes per-joint:
+```rust
+joint_matrix = joint_transform.affine() * inverse_bindpose
+```
+
+The vertex shader blends 4 of these by weight (in our case weight is 1.0 on one joint, 0.0 on others -- rigid binding). The result is the joint's world-from-model matrix. Stripping rotation from the model-view matrix then makes the quad face the camera while preserving the world-space position.
+
+The `SKINNED` shader def is automatically set by Bevy when the entity has a `SkinnedMesh` component. Non-skinned entities (health bars) take the `#else` path using `get_world_from_local`.
+
+### 6. Inverse Bind Pose Computation
+
+**Resolved: must be the inverse of each joint's GLOBAL rest-pose transform, not local.**
+
+The extraction code multiplies `joint_global_transform * inverse_bind_pose` to produce `world_from_model`. This only works if the inverse bind pose encodes the full global rest transform. Using `Mat4::from_translation(-local_position)` would be **incorrect** for child joints.
+
+For the humanoid rig, the computation at startup:
+
+```rust
+// Accumulate global rest-pose transforms through the hierarchy
+fn compute_global_rest_pose(bone_defs: &[BoneDef]) -> Vec<Mat4> {
+    let mut global_transforms = vec![Mat4::IDENTITY; bone_defs.len()];
+    for (i, bone) in bone_defs.iter().enumerate() {
+        let local = Mat4::from_translation(Vec3::new(
+            bone.default_transform.translation.x,
+            bone.default_transform.translation.y,
+            z_order,  // from slot lookup
+        ));
+        global_transforms[i] = match bone.parent {
+            Some(parent_idx) => global_transforms[parent_idx] * local,
+            None => local,
+        };
+    }
+    // Inverse bind poses = inverse of each global rest-pose
+    global_transforms.iter().map(|g| g.inverse()).collect()
+}
+```
+
+Example for the humanoid:
+- `root`: global = translate(0, 0, 0), inverse = translate(0, 0, 0)
+- `torso`: global = translate(0, 1, 0), inverse = translate(0, -1, 0)
+- `head`: global = translate(0, 1, 0) * translate(0, 1.8, 0.003) = translate(0, 2.8, 0.003), inverse = translate(0, -2.8, -0.003)
+- `arm_l`: global = translate(0, 1, 0) * translate(-1.2, 0, -0.001) = translate(-1.2, 1, -0.001), inverse = translate(1.2, -1, 0.001)
+
+This is confirmed by the glTF spec and Bevy's glTF loader, which reads `inverseBindMatrices` as global rest-pose inverses.
+
+### 7. Skinned Mesh Entity Parenting
+
+**Resolved: parent the skinned mesh entity to the character root, NOT the billboard.**
+
+In the `SKINNED` vertex shader path, `skin_model()` replaces `get_world_from_local()`. The mesh entity's own `GlobalTransform` (and thus its parent's transform) is **not used for vertex positioning** -- the skinned path bypasses it entirely. Joint entities provide the world-space transforms directly.
+
+This means:
+- The `JointRoot` entity's `scale.x = -1` does NOT affect the skinned mesh entity's vertex positions (the skinned path ignores the mesh's model matrix)
+- The `scale.x = -1` DOES affect the joint entities (which are children of the billboard), and their `GlobalTransform` feeds into the joint matrix computation
+- So facing flip works correctly: joint world positions are mirrored by the billboard's scale, which propagates into the joint matrices, which the vertex shader uses
+
+The skinned mesh entity can be a child of the character root or even a sibling -- its parenting doesn't affect rendering. Parenting to the character root is simplest.
+
+However, `DynamicSkinnedMeshBounds` converts the computed world-space AABB back to entity-space using the mesh entity's `GlobalTransform` inverse (skinning.rs:234-243). If the mesh entity has an unexpected transform, this conversion could produce wrong bounds. Keeping the mesh entity at `Transform::default()` as a child of the character root avoids this.
+
+### 8. DynamicSkinnedMeshBounds
+
+**Resolved: works correctly for flat 2D meshes, should be included.**
+
+`DynamicSkinnedMeshBounds` is a marker component (no data). When present, `update_skinned_mesh_bounds` recomputes the entity's `Aabb` every frame from joint positions. The algorithm:
+
+1. Reads per-joint AABBs from `SkinnedMeshBounds` (precomputed from vertex positions at mesh creation)
+2. For each joint: computes `world_from_model = world_from_joint * inverse_bind_pose`
+3. Transforms the model-space AABB to world space
+4. Accumulates all joint AABBs into one enclosing AABB
+5. Converts back to entity-space using the mesh entity's `GlobalTransform` inverse
+
+**For flat meshes**: per-joint AABBs will have zero thickness on the Z axis (all vertices at the same Z for a given joint). `transform_aabb` handles this correctly -- the Arvo (1990) algorithm works with zero-extent axes. Frustum culling tests halfspace intersections, which handles infinitely thin slabs. The sphere radius test uses max extent, which is nonzero as long as any axis has extent.
+
+**Without this component**: the mesh keeps a static bind-pose AABB that never updates. For animated characters whose joints move significantly, this risks incorrect frustum culling (characters disappearing when they shouldn't). **Always include `DynamicSkinnedMeshBounds` on animated skinned meshes.**
+
+One edge case: if the mesh is flat AND viewed perfectly edge-on, the AABB has near-zero projected area. In practice this won't happen with an isometric camera viewing XY-plane quads. No special handling needed.
+
+Source files: `git/bevy/crates/bevy_camera/src/visibility/mod.rs:286`, `git/bevy/crates/bevy_mesh/src/skinning.rs:188-244`
