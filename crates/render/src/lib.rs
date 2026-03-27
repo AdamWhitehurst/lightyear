@@ -8,6 +8,7 @@ use bevy::prelude::*;
 use lightyear::frame_interpolation::{FrameInterpolate, FrameInterpolationPlugin};
 use lightyear::prelude::*;
 use protocol::billboard::billboard_material::BillboardMaterial;
+use protocol::billboard::sprite_rig_material::SpriteRigMaterial;
 use protocol::*;
 
 pub struct RenderPlugin;
@@ -28,6 +29,7 @@ impl Plugin for RenderPlugin {
         }
 
         app.add_plugins(bevy::pbr::MaterialPlugin::<BillboardMaterial>::default());
+        app.add_plugins(bevy::pbr::MaterialPlugin::<SpriteRigMaterial>::default());
 
         app.add_systems(Startup, (camera::setup_camera, camera::setup_lighting));
         app.add_systems(

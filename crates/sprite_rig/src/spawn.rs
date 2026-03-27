@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 
 use avian3d::prelude::LinearVelocity;
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use lightyear::prelude::*;
+use protocol::billboard::sprite_rig_material::{SpriteRigBillboardExt, SpriteRigMaterial};
 use protocol::{CharacterMarker, CharacterType};
 
 use crate::asset::SpriteRigAsset;
@@ -16,7 +20,7 @@ pub struct SpriteRig(pub Handle<SpriteRigAsset>);
 #[derive(Component)]
 pub struct AnimSetRef(pub Handle<SpriteAnimSetAsset>);
 
-/// Maps bone names to their spawned child entities.
+/// Maps bone names to their spawned joint entities.
 #[derive(Component, Default)]
 pub struct BoneEntities(pub HashMap<String, Entity>);
 
@@ -31,10 +35,16 @@ pub enum Facing {
 #[derive(Component)]
 pub struct JointRoot;
 
-/// Preserves a bone's z-depth so animation curves (which overwrite all 3 translation axes) don't
-/// flatten the draw order. A post-animation system restores `Transform::translation.z` from this.
-#[derive(Component)]
-pub struct BoneZOrder(pub f32);
+/// Cached GPU assets for a rig type, shared across all characters using that rig.
+struct RigMeshAssets {
+    mesh: Handle<Mesh>,
+    inverse_bindposes: Handle<SkinnedMeshInverseBindposes>,
+    material: Handle<SpriteRigMaterial>,
+}
+
+/// Cache of rig mesh assets keyed by rig asset handle ID.
+#[derive(Resource, Default)]
+pub struct RigMeshCache(HashMap<AssetId<SpriteRigAsset>, RigMeshAssets>);
 
 /// Looks up `RigRegistry` when `CharacterType` is added and inserts rig components.
 pub fn resolve_character_rig(
@@ -63,13 +73,15 @@ pub fn resolve_character_rig(
     }
 }
 
-/// Spawns bone hierarchy under a `JointRoot` when `SpriteRig` is added.
+/// Spawns joint hierarchy and a single skinned mesh when `SpriteRig` is added.
 pub fn spawn_sprite_rigs(
     mut commands: Commands,
     query: Query<(Entity, &SpriteRig), Added<SpriteRig>>,
     rig_assets: Res<Assets<SpriteRigAsset>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<SpriteRigMaterial>>,
+    mut bindpose_assets: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut rig_mesh_cache: ResMut<RigMeshCache>,
 ) {
     for (entity, sprite_rig) in &query {
         let rig = rig_assets
@@ -79,58 +91,210 @@ pub fn spawn_sprite_rigs(
         let slot_lookup = build_slot_lookup(rig);
         let sorted_bones = topological_sort_bones(&rig.bones);
 
-        let billboard_id = commands
+        let cached = rig_mesh_cache
+            .0
+            .entry(sprite_rig.0.id())
+            .or_insert_with(|| {
+                build_rig_mesh_assets(
+                    &sorted_bones,
+                    &slot_lookup,
+                    &mut meshes,
+                    &mut materials,
+                    &mut bindpose_assets,
+                )
+            });
+
+        let mesh_handle = cached.mesh.clone();
+        let bindpose_handle = cached.inverse_bindposes.clone();
+        let material_handle = cached.material.clone();
+
+        let joint_root_id = commands
             .spawn((JointRoot, Name::new("JointRoot"), Transform::default()))
             .id();
-        commands.entity(entity).add_child(billboard_id);
+        commands.entity(entity).add_child(joint_root_id);
 
-        let bone_map = spawn_bone_hierarchy(
-            &mut commands,
-            billboard_id,
-            &sorted_bones,
-            &slot_lookup,
-            &mut *meshes,
-            &mut *materials,
-        );
+        let (bone_map, joint_entities) =
+            spawn_joints(&mut commands, joint_root_id, &sorted_bones, &slot_lookup);
+
+        commands.entity(entity).with_child((
+            Name::new("SkinnedMesh"),
+            Mesh3d(mesh_handle),
+            MeshMaterial3d(material_handle),
+            SkinnedMesh {
+                inverse_bindposes: bindpose_handle,
+                joints: joint_entities,
+            },
+            Transform::default(),
+        ));
 
         commands.entity(entity).insert(BoneEntities(bone_map));
     }
 }
 
-/// Spawns bone entities in parent-child hierarchy. Only bones with a slot get a visible mesh.
-fn spawn_bone_hierarchy(
-    commands: &mut Commands,
-    billboard_id: Entity,
+/// Builds and caches the mesh, inverse bind poses, and material for a rig type.
+fn build_rig_mesh_assets(
     sorted_bones: &[&crate::asset::BoneDef],
     slot_lookup: &HashMap<&str, (f32, Vec2)>,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-) -> HashMap<String, Entity> {
+    materials: &mut Assets<SpriteRigMaterial>,
+    bindpose_assets: &mut Assets<SkinnedMeshInverseBindposes>,
+) -> RigMeshAssets {
+    let bone_index_map = build_bone_index_map(sorted_bones);
+    let mesh = build_rig_mesh(sorted_bones, slot_lookup, &bone_index_map);
+    let inverse_bindposes = bindpose_assets.add(vec![Mat4::IDENTITY; sorted_bones.len()]);
+    let material = materials.add(SpriteRigMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        },
+        extension: SpriteRigBillboardExt {},
+    });
+
+    RigMeshAssets {
+        mesh: meshes.add(mesh),
+        inverse_bindposes,
+        material,
+    }
+}
+
+/// Maps bone name to its index in topological sort order.
+fn build_bone_index_map<'a>(sorted_bones: &[&'a crate::asset::BoneDef]) -> HashMap<&'a str, u16> {
+    sorted_bones
+        .iter()
+        .enumerate()
+        .map(|(i, bone)| {
+            let idx = u16::try_from(i).expect("bone count exceeds u16::MAX");
+            (bone.name.as_str(), idx)
+        })
+        .collect()
+}
+
+/// Builds a single merged mesh with one quad per visible bone, skinned to its joint.
+fn build_rig_mesh(
+    sorted_bones: &[&crate::asset::BoneDef],
+    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+    bone_index_map: &HashMap<&str, u16>,
+) -> Mesh {
+    let mut visible_bones = collect_visible_bones(sorted_bones, slot_lookup);
+    visible_bones.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut joint_indices: Vec<[u16; 4]> = Vec::new();
+    let mut joint_weights: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for (bone_def, _z_order, size) in &visible_bones {
+        let joint_idx = *bone_index_map
+            .get(bone_def.name.as_str())
+            .expect("visible bone must exist in bone_index_map");
+        let base_vertex = u32::try_from(positions.len()).expect("vertex count exceeds u32::MAX");
+
+        append_quad_vertices(
+            *size,
+            joint_idx,
+            &mut positions,
+            &mut normals,
+            &mut uvs,
+            &mut joint_indices,
+            &mut joint_weights,
+        );
+        append_quad_indices(base_vertex, &mut indices);
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_JOINT_INDEX,
+        VertexAttributeValues::Uint16x4(joint_indices),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, joint_weights)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Collects bones that have a slot entry, returning (bone_def, z_order, size).
+fn collect_visible_bones<'a>(
+    sorted_bones: &[&'a crate::asset::BoneDef],
+    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+) -> Vec<(&'a crate::asset::BoneDef, f32, Vec2)> {
+    sorted_bones
+        .iter()
+        .filter_map(|bone| {
+            slot_lookup
+                .get(bone.name.as_str())
+                .map(|&(z, size)| (*bone, z, size))
+        })
+        .collect()
+}
+
+/// Appends 4 vertices for a Z-facing quad centered at origin with the given half-extents.
+fn append_quad_vertices(
+    size: Vec2,
+    joint_idx: u16,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    joint_indices: &mut Vec<[u16; 4]>,
+    joint_weights: &mut Vec<[f32; 4]>,
+) {
+    let hx = size.x / 2.0;
+    let hy = size.y / 2.0;
+
+    // Bottom-left, bottom-right, top-right, top-left
+    positions.extend_from_slice(&[
+        [-hx, -hy, 0.0],
+        [hx, -hy, 0.0],
+        [hx, hy, 0.0],
+        [-hx, hy, 0.0],
+    ]);
+    normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
+    uvs.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+
+    let ji = [joint_idx, 0, 0, 0];
+    let jw = [1.0, 0.0, 0.0, 0.0];
+    joint_indices.extend_from_slice(&[ji; 4]);
+    joint_weights.extend_from_slice(&[jw; 4]);
+}
+
+/// Appends 6 indices (2 triangles) for a quad starting at `base_vertex`.
+fn append_quad_indices(base_vertex: u32, indices: &mut Vec<u32>) {
+    indices.extend_from_slice(&[
+        base_vertex,
+        base_vertex + 1,
+        base_vertex + 2,
+        base_vertex,
+        base_vertex + 2,
+        base_vertex + 3,
+    ]);
+}
+
+/// Spawns transform-only joint entities in topological order, returning the bone map and
+/// ordered joint entity list matching the inverse bind pose array.
+fn spawn_joints(
+    commands: &mut Commands,
+    joint_root_id: Entity,
+    sorted_bones: &[&crate::asset::BoneDef],
+    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+) -> (HashMap<String, Entity>, Vec<Entity>) {
     let mut bone_map = HashMap::<String, Entity>::new();
+    let mut joint_entities = Vec::with_capacity(sorted_bones.len());
 
     for bone_def in sorted_bones {
-        let transform = bone_transform_from_def(bone_def, slot_lookup);
+        let slot_info = slot_lookup.get(bone_def.name.as_str());
+        let transform = bone_transform_from_def(bone_def, slot_info);
 
-        let z_order = transform.translation.z;
-        let mut bone_cmds = commands.spawn((
-            Name::new(bone_def.name.clone()),
-            transform,
-            BoneZOrder(z_order),
-        ));
-
-        if let Some(&(_z_order, size)) = slot_lookup.get(bone_def.name.as_str()) {
-            let mesh = meshes.add(Plane3d::new(Vec3::Z, size / 2.0));
-            let material = materials.add(StandardMaterial {
-                base_color: placeholder_color_for_bone(&bone_def.name),
-                unlit: true,
-                double_sided: true,
-                cull_mode: None,
-                ..default()
-            });
-            bone_cmds.insert((Mesh3d(mesh), MeshMaterial3d(material)));
-        }
-
-        let bone_entity = bone_cmds.id();
+        let joint_entity = commands
+            .spawn((Name::new(bone_def.name.clone()), transform))
+            .id();
 
         let parent_entity = bone_def
             .parent
@@ -140,24 +304,22 @@ fn spawn_bone_hierarchy(
                     .get(parent_name.as_str())
                     .expect("parent bone must be spawned before child (topological sort)")
             })
-            .unwrap_or(billboard_id);
+            .unwrap_or(joint_root_id);
 
-        commands.entity(parent_entity).add_child(bone_entity);
-        bone_map.insert(bone_def.name.clone(), bone_entity);
+        commands.entity(parent_entity).add_child(joint_entity);
+        bone_map.insert(bone_def.name.clone(), joint_entity);
+        joint_entities.push(joint_entity);
     }
 
-    bone_map
+    (bone_map, joint_entities)
 }
 
-/// Builds a `Transform` from a bone definition, using z_order from slot lookup.
+/// Builds a `Transform` from a bone definition, using z_order from slot info.
 fn bone_transform_from_def(
     bone_def: &crate::asset::BoneDef,
-    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+    slot_info: Option<&(f32, Vec2)>,
 ) -> Transform {
-    let z_order = slot_lookup
-        .get(bone_def.name.as_str())
-        .map(|(z, _)| *z)
-        .unwrap_or(0.0);
+    let z_order = slot_info.map(|(z, _)| *z).unwrap_or(0.0);
 
     Transform {
         translation: Vec3::new(
@@ -191,33 +353,16 @@ fn build_slot_lookup(rig: &SpriteRigAsset) -> HashMap<&str, (f32, Vec2)> {
     lookup
 }
 
-/// Returns a placeholder color based on bone name keywords.
-fn placeholder_color_for_bone(name: &str) -> Color {
-    let lower = name.to_lowercase();
-    if lower.contains("torso") || lower.contains("chest") || lower.contains("body") {
-        Color::srgb(0.2, 0.3, 0.8)
-    } else if lower.contains("head") {
-        Color::srgb(0.9, 0.8, 0.6)
-    } else if lower.contains("arm") || lower.contains("hand") {
-        Color::srgb(0.2, 0.7, 0.3)
-    } else if lower.contains("leg") || lower.contains("foot") {
-        Color::srgb(0.5, 0.3, 0.1)
-    } else {
-        Color::srgb(0.5, 0.5, 0.5)
-    }
-}
-
 /// Topological sort: parents before children. Simple iterative approach.
 fn topological_sort_bones(bones: &[crate::asset::BoneDef]) -> Vec<&crate::asset::BoneDef> {
     let mut sorted: Vec<&crate::asset::BoneDef> = Vec::with_capacity(bones.len());
     let mut added: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-    // Iteratively add bones whose parent is already added (or have no parent).
     loop {
         let prev_len = sorted.len();
         for bone in bones {
             if added.contains(bone.name.as_str()) {
-                continue; // already sorted
+                continue;
             }
             let parent_satisfied = bone
                 .parent

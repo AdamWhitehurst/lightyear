@@ -1,1 +1,2 @@
 pub mod billboard_material;
+pub mod sprite_rig_material;
