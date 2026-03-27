@@ -2,7 +2,7 @@
 
 ## Overview
 
-Move billboard rotation from CPU `Transform` manipulation to a GPU vertex shader via Bevy's `ExtendedMaterial`/`MaterialExtension` system, then optimize sprite rig rendering by deduplicating mesh/material handles and collapsing the multi-entity bone hierarchy into a single skinned mesh per character.
+Move billboard rotation from CPU `Transform` manipulation to a GPU vertex shader via Bevy's `ExtendedMaterial`/`MaterialExtension` system, then collapse the multi-entity bone hierarchy into a single skinned mesh per character.
 
 ## Current State Analysis
 
@@ -14,7 +14,7 @@ Two CPU-side billboard systems mutate `Transform` every frame:
 Both dirty `Transform` every frame, triggering re-upload to GPU via retained render world change detection.
 
 ### Sprite Rig Rendering
-Each bone is a separate entity with unique `Handle<Mesh>` + `Handle<StandardMaterial>` (`spawn.rs:125-135`). No batching possible. Each character = 8 entities (root + billboard + 6 visible bones), 6 draw calls.
+Each bone is a separate entity with unique `Handle<Mesh>` + `Handle<StandardMaterial>` (`spawn.rs:125-135`). No batching possible. For the humanoid rig: 8 entities (root + billboard + 6 visible bones), 6 draw calls per character.
 
 ### Entity Hierarchy (current)
 ```
@@ -34,9 +34,9 @@ CharacterEntity (AnimationPlayer, BoneEntities, Facing)
 - All bone meshes are `Plane3d::new(Vec3::Z, size/2)` -- Z-facing quads
 - Z-ordering is baked into `Transform::translation.z` by animation curves (`animation.rs:328`)
 - `AnimationTargetId` uses single-name hashing (`animation.rs:232-233`), not hierarchy paths
-- `apply_facing_to_rig` sets `JointRoot.scale.x = -1.0` to mirror the bone hierarchy
-- Health bar color mutation uses `materials.get_mut(&handle).base_color = ...` (`health_bar.rs:146-164`)
-- Bevy 0.18 view uniform fields: `view_from_world`, `clip_from_view`, `clip_from_world`
+- `apply_facing_to_rig` sets `RigBillboard`'s `transform.scale.x = -1.0` to mirror the bone hierarchy
+- Health bar color mutation uses `materials.get_mut(&handle).base_color = ...` (`health_bar.rs:138-139` inside `set_fg_color`)
+- Bevy 0.18 view uniform fields: `view_from_world`, `world_from_view`, `clip_from_view`, `clip_from_world`, `world_position`
 
 ## Desired End State
 
@@ -55,14 +55,14 @@ All sprite rig bones rendered in **1 draw call per character** via a single skin
 - Array textures for per-bone sprite selection
 - Instanced skinned meshes across multiple characters (Bevy handles batching automatically on storage-buffer platforms)
 - `bevy_mod_billboard` crate (stalled at Bevy 0.14)
+- Per-bone mesh/material flyweight caching (Phase 2 of the research doc) -- no independent value when the skinned mesh replaces per-bone meshes entirely
 
 ## Implementation Approach
 
-Three sequential phases, each building on the previous:
+Two sequential phases:
 
 1. **Billboard Material Extension**: GPU vertex shader replaces CPU billboard systems
-2. **Shared Handles (Flyweight)**: Deduplicate mesh/material handles for automatic batching
-3. **Single Skinned Mesh**: Collapse bone entities into joint entities + one skinned mesh per character
+2. **Single Skinned Mesh**: Collapse bone entities into joint entities + one skinned mesh per character
 
 ---
 
@@ -108,13 +108,24 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
     // Billboard: strip rotation from model-view matrix, preserving translation + scale
     var model_view = view.view_from_world * world_from_local;
 
-    // Extract per-axis scale from rotation columns before overwriting
+    // Extract per-axis scale magnitude from rotation columns
     let scale_x = length(model_view[0].xyz);
     let scale_y = length(model_view[1].xyz);
     let scale_z = length(model_view[2].xyz);
 
+    // Detect mirroring (negative scale) via determinant of the 3x3 rotation submatrix.
+    // length() always returns positive, so without this check, scale.x = -1.0
+    // (used for facing flip) would be silently lost.
+    let det = determinant(mat3x3f(
+        model_view[0].xyz,
+        model_view[1].xyz,
+        model_view[2].xyz,
+    ));
+    let flip = select(1.0, -1.0, det < 0.0);
+
     // Replace rotation with identity, scaled (spherical billboard)
-    model_view[0] = vec4<f32>(scale_x, 0.0, 0.0, model_view[0][3]);
+    // flip is applied to X axis to preserve facing direction
+    model_view[0] = vec4<f32>(flip * scale_x, 0.0, 0.0, model_view[0][3]);
     model_view[1] = vec4<f32>(0.0, scale_y, 0.0, model_view[1][3]);
     model_view[2] = vec4<f32>(0.0, 0.0, scale_z, model_view[2][3]);
 
@@ -150,12 +161,12 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
 
 **Key design decisions:**
 - **Spherical billboard** (all 3 columns replaced): sprites always face screen plane, no foreshortening at camera pitch. This is a visual change from the current cylindrical approach -- intentional for 2.5D sprite rendering.
-- **Scale preservation**: `length()` of each column extracts the per-axis scale before overwriting with identity. This preserves `scale.x = -1.0` facing flip and any animation-driven scale.
-- **SKINNED ifdef**: handled from the start so Phase 3 works without shader changes.
-- **Normals**: set to camera-facing direction for correct lighting if materials become lit later.
+- **Scale + flip preservation**: `length()` extracts scale magnitude, then `determinant()` of the 3x3 submatrix detects negative scale (mirroring). A negative determinant means an odd number of axes are flipped. The sign is applied to the X axis to preserve `scale.x = -1.0` facing flip from `JointRoot`.
+- **SKINNED ifdef**: handled from the start so Phase 2 works without shader changes.
+- **Normals**: set to camera-facing direction (view-space +Z transformed to world) for correct lighting if materials become lit later.
 
 #### 2. Create billboard material extension
-**File**: `crates/render/src/billboard_material.rs` (new)
+**File**: `crates/protocol/src/render/billboard_material.rs` (new)
 
 ```rust
 use bevy::prelude::*;
@@ -181,6 +192,13 @@ impl MaterialExtension for BillboardExt {
 }
 ```
 
+**File location rationale**: `render` depends on `sprite_rig`, so `sprite_rig` cannot depend on `render` (cycle). `BillboardMaterial` lives in `protocol` which both crates already depend on. This requires adding `bevy_pbr` to protocol's bevy features. If protocol accumulates too many rendering dependencies over time, extract a `shared_render` leaf crate.
+
+Add `render` module to protocol:
+- `crates/protocol/src/render/mod.rs` (new): `pub mod billboard_material;`
+- `crates/protocol/src/lib.rs`: add `pub mod render;`
+- `crates/protocol/Cargo.toml`: ensure `bevy/bevy_pbr` feature is enabled (needed for `MaterialExtension`)
+
 #### 3. Register plugin
 **File**: `crates/render/src/lib.rs`
 
@@ -196,20 +214,18 @@ app.add_plugins(
 
 In `spawn_bone_hierarchy`, where `MeshMaterial3d<StandardMaterial>` is inserted (`spawn.rs:125-135`), change to `MeshMaterial3d<BillboardMaterial>`. The `StandardMaterial` config (unlit, double-sided, cull_mode: None, base_color) becomes the `.base` field of `BillboardMaterial`.
 
-The `sprite_rig` crate needs to depend on the `render` crate (or the `BillboardMaterial` type needs to live somewhere both can access -- see dependency note below).
-
-**Dependency consideration**: `render` already depends on `sprite_rig`. Adding `sprite_rig -> render` would create a cycle. Two options:
-- **Option A**: Move `BillboardMaterial`/`BillboardExt` into `protocol` crate (both depend on it). Protocol is the shared foundation.
-- **Option B**: Pass `Handle<BillboardMaterial>` into `spawn_sprite_rigs` via a resource, so `sprite_rig` doesn't need to know the concrete type. Use a type alias or newtype in `protocol`.
-
-**Chosen: Option A** -- move `billboard_material.rs` to `crates/protocol/src/render/billboard_material.rs`. Protocol already has bevy as a dependency. The `render` crate imports from `protocol`. The `sprite_rig` crate already depends on `protocol`.
-
-**Revised file location**: `crates/protocol/src/render/billboard_material.rs`
-
-Add `render` module to protocol:
-- `crates/protocol/src/render/mod.rs` (new): `pub mod billboard_material;`
-- `crates/protocol/src/lib.rs`: add `pub mod render;`
-- `crates/protocol/Cargo.toml`: ensure `bevy/bevy_pbr` feature is enabled (needed for `MaterialExtension`)
+```rust
+MeshMaterial3d(materials.add(BillboardMaterial {
+    base: StandardMaterial {
+        base_color: placeholder_color,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    },
+    extension: BillboardExt {},
+}))
+```
 
 #### 5. Update health bar spawning
 **File**: `crates/render/src/health_bar.rs`
@@ -229,11 +245,9 @@ In `update_health_bars` -- no material access, only `Transform` mutation. No cha
 #### 6. Remove CPU billboard systems
 **File**: `crates/sprite_rig/src/spawn.rs`
 - Delete `billboard_rigs_face_camera` system entirely
-- Remove from system chain in `lib.rs`
 
 **File**: `crates/render/src/health_bar.rs`
 - Delete `billboard_face_camera` system entirely
-- Remove from system chain in `lib.rs`
 
 **File**: `crates/render/src/lib.rs`
 - Remove `billboard_face_camera` from the system chain
@@ -263,7 +277,7 @@ In `update_health_bars` -- no material access, only `Transform` mutation. No cha
 #### Manual Verification:
 - [ ] Sprite rig characters face camera from all angles
 - [ ] Sprite rigs animate correctly (translation, rotation, scale curves)
-- [ ] Facing flip works (scale.x = -1.0 mirrors correctly)
+- [ ] Facing flip works (scale.x = -1.0 mirrors correctly -- determinant check preserves sign)
 - [ ] Health bars face camera
 - [ ] Health bar color changes on damage and invulnerability
 - [ ] No per-frame transform dirtying on billboard entities (check with Tracy if available)
@@ -271,93 +285,15 @@ In `update_health_bars` -- no material access, only `Transform` mutation. No cha
 
 ---
 
-## Phase 2: Shared Mesh + Material Handles (Flyweight)
+## Phase 2: Single Skinned Mesh
 
 ### Overview
 
-Deduplicate mesh and material handles so bones with identical geometry/color share the same GPU resources. This enables Bevy's automatic batching -- all "torso" bones across all characters batch into one draw call.
-
-### Changes Required
-
-#### 1. Create BoneMeshCache resource
-**File**: `crates/sprite_rig/src/spawn.rs`
-
-```rust
-/// Cache of mesh handles keyed by bone quad dimensions.
-/// Enables Bevy's automatic batching for bones with identical geometry.
-#[derive(Resource, Default)]
-pub struct BoneMeshCache(pub HashMap<(FloatOrd, FloatOrd), Handle<Mesh>>);
-```
-
-Insert as resource during `SpriteRigPlugin::build`.
-
-#### 2. Create BoneMaterialCache resource
-**File**: `crates/sprite_rig/src/spawn.rs`
-
-```rust
-/// Cache of billboard material handles keyed by placeholder color.
-/// Enables Bevy's automatic batching for bones with identical appearance.
-#[derive(Resource, Default)]
-pub struct BoneMaterialCache(pub HashMap<[FloatOrd; 4], Handle<BillboardMaterial>>);
-```
-
-#### 3. Update spawn_bone_hierarchy
-**File**: `crates/sprite_rig/src/spawn.rs`
-
-Where `meshes.add(Plane3d::new(...))` and `materials.add(StandardMaterial { ... })` are called (`spawn.rs:125-135`):
-
-```rust
-let mesh_handle = bone_mesh_cache
-    .0
-    .entry((FloatOrd(size.x), FloatOrd(size.y)))
-    .or_insert_with(|| meshes.add(Plane3d::new(Vec3::Z, size / 2.0)))
-    .clone();
-
-let color = placeholder_color_for_bone(bone_name);
-let color_key = [
-    FloatOrd(color.red), FloatOrd(color.green),
-    FloatOrd(color.blue), FloatOrd(color.alpha),
-];
-let mat_handle = bone_material_cache
-    .0
-    .entry(color_key)
-    .or_insert_with(|| {
-        materials.add(BillboardMaterial {
-            base: StandardMaterial {
-                base_color: color,
-                unlit: true,
-                double_sided: true,
-                cull_mode: None,
-                ..default()
-            },
-            extension: BillboardExt {},
-        })
-    })
-    .clone();
-```
-
-### Success Criteria
-
-#### Automated Verification:
-- [ ] `cargo check-all`
-- [ ] `cargo server` builds and runs
-- [ ] `cargo client` builds and runs
-
-#### Manual Verification:
-- [ ] Characters render identically to Phase 1
-- [ ] Multiple characters of same type visible simultaneously -- verify draw call count decreased (Tracy or Bevy diagnostics)
-
----
-
-## Phase 3: Single Skinned Mesh
-
-### Overview
-
-Replace the per-bone entity hierarchy (each bone = entity with Mesh3d + MeshMaterial3d) with a single skinned mesh per character. Bone entities become invisible joint entities (Transform only). One draw call per character instead of 6.
+Replace the per-bone entity hierarchy (each bone = entity with Mesh3d + MeshMaterial3d) with a single skinned mesh per character. Bone entities become invisible joint entities (Transform only). One draw call per character instead of 6 (humanoid rig).
 
 ### Design
 
-#### Entity Hierarchy (after Phase 3)
+#### Entity Hierarchy (after Phase 2)
 ```
 CharacterEntity (AnimationPlayer, BoneEntities, Facing)
   ├── JointRoot (Transform -- scale.x for facing flip)
@@ -375,7 +311,18 @@ CharacterEntity (AnimationPlayer, BoneEntities, Facing)
 - **Skinned mesh entity is a child of CharacterEntity**, not JointRoot. In the `SKINNED` vertex shader path, `skin_model()` returns `world_from_local` computed from joint `GlobalTransform` values -- the mesh entity's own `GlobalTransform` is not used for vertex positioning. Parenting to CharacterEntity with `Transform::default()` keeps the mesh entity at identity, which is important for `DynamicSkinnedMeshBounds` AABB entity-space conversion.
 - **Joint entities replace bone entities** but keep the same `Name`, `Transform`, hierarchy, `AnimationTargetId`, `AnimatedBy`. No `Mesh3d`/`MeshMaterial3d` -- just transform nodes.
 - **`BoneEntities` HashMap** still maps bone names to joint entity IDs. Animation attachment is unchanged.
-- **Facing flip** still works: `JointRoot.scale.x = -1.0` mirrors joint world positions via transform propagation. The vertex shader receives already-mirrored joint matrices.
+- **Facing flip** still works: `JointRoot.scale.x = -1.0` mirrors joint world positions via transform propagation. The vertex shader receives already-mirrored joint matrices. The determinant-based flip detection in the billboard shader preserves the negative scale.
+
+#### Identity Inverse Bind Poses
+
+For rigid binding (each vertex has weight 1.0 on exactly one joint), we use **identity inverse bind poses** (`Mat4::IDENTITY` for every joint). This is simpler and correct:
+
+- `skin_model()` computes: `weight * (joint_global_transform * inverse_bind_pose)` = `joint_global_transform * I` = `joint_global_transform`
+- A vertex at local position `(x, y, 0)` maps to: `joint_global_transform * (x, y, 0, 1)` = joint's world position offset by the vertex's local coordinates
+- The joint's `GlobalTransform` already includes the rest-pose translation (accumulated through parent chain + animation-driven values with baked z_order)
+- At rest pose: quad appears at the joint's world position, sized by the vertex offsets. This is correct.
+
+This eliminates the need for `compute_global_rest_poses()` and `compute_inverse_bind_poses()` functions entirely.
 
 ### Changes Required
 
@@ -388,25 +335,23 @@ Create `build_rig_mesh(rig: &SpriteRigAsset) -> Mesh` that constructs a single m
 /// Builds a single mesh containing all visible bone quads for a sprite rig.
 ///
 /// Each bone with a slot becomes a quad (4 vertices, 6 indices). Vertices
-/// are positioned in model space at the bone's rest-pose position. Each
-/// vertex is rigidly bound to its bone's joint via ATTRIBUTE_JOINT_INDEX
-/// with weight 1.0.
+/// are in bone-local space (centered at origin, extending by half-size).
+/// Each vertex is rigidly bound to its bone's joint via ATTRIBUTE_JOINT_INDEX
+/// with weight 1.0. Identity inverse bind poses are used, so the GPU skinning
+/// formula places each quad at its joint's world position.
 ///
 /// Quads are ordered in the index buffer by z_order (back-to-front) for
-/// correct overlap via depth testing with z-offsets baked into vertex positions.
+/// correct depth-tested overlap.
 fn build_rig_mesh(rig: &SpriteRigAsset) -> Mesh {
     let slot_lookup = build_slot_lookup(rig);
     let sorted_bones = topological_sort_bones(&rig.bones);
 
-    // Build bone index map (bone name -> joint index)
+    // Build bone index map (bone name -> joint index in topological order)
     let bone_index: HashMap<&str, u32> = sorted_bones
         .iter()
         .enumerate()
         .map(|(i, b)| (b.name.as_str(), i as u32))
         .collect();
-
-    // Accumulate global rest-pose transforms through hierarchy
-    let global_rest_poses = compute_global_rest_poses(&sorted_bones, &slot_lookup);
 
     // Collect visible bones (those with slots), sorted by z_order for index buffer ordering
     let mut visible_bones: Vec<_> = sorted_bones
@@ -428,11 +373,11 @@ fn build_rig_mesh(rig: &SpriteRigAsset) -> Mesh {
     let mut indices = Vec::with_capacity(quad_count * 6);
 
     for (quad_idx, bone) in visible_bones.iter().enumerate() {
-        let (z_order, size) = slot_lookup[bone.name.as_str()];
+        let (_z_order, size) = slot_lookup[bone.name.as_str()];
         let joint_idx = bone_index[bone.name.as_str()];
         let half = size / 2.0;
 
-        // Quad vertices in model space (will be transformed by joint matrix on GPU)
+        // Quad vertices in bone-local space (will be transformed by joint matrix on GPU)
         // Plane3d::new(Vec3::Z, size/2) produces a Z-facing quad in XY plane
         let quad_verts = [
             Vec3::new(-half.x, -half.y, 0.0),
@@ -472,79 +417,13 @@ fn build_rig_mesh(rig: &SpriteRigAsset) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, joint_weights);
     mesh.insert_indices(bevy::render::mesh::Indices::U32(indices));
     mesh.with_generated_skinned_mesh_bounds()
+        .expect("skinned mesh bounds generation should not fail for valid mesh")
 }
 ```
 
-**Z-ordering approach**: Vertex positions are in bone-local space (centered at origin). The joint's rest-pose transform includes the z_order in its translation.z. When the GPU applies `joint_global_transform * inverse_bind_pose`, the z_order offset is preserved in world space. Depth testing handles overlap. This matches the current approach where `Transform::translation.z = z_order`.
+**Z-ordering**: Joint entities have z_order baked into `Transform::translation.z` (set at spawn by `bone_transform_from_def`, and maintained at runtime by animation curves that bake z_order into every translation keyframe). With identity inverse bind poses, `skin_model()` returns the joint's `GlobalTransform` directly, which includes the z offset. Depth testing handles overlap.
 
-#### 2. Compute inverse bind poses
-**File**: `crates/sprite_rig/src/spawn.rs` (new function)
-
-```rust
-/// Computes the global rest-pose transform for each joint, accumulated
-/// through the parent chain. Returns one Mat4 per bone in sorted order.
-fn compute_global_rest_poses(
-    sorted_bones: &[&BoneDef],
-    slot_lookup: &HashMap<&str, (f32, Vec2)>,
-) -> Vec<Mat4> {
-    let bone_index: HashMap<&str, usize> = sorted_bones
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.name.as_str(), i))
-        .collect();
-
-    let mut global_transforms = vec![Mat4::IDENTITY; sorted_bones.len()];
-
-    for (i, bone) in sorted_bones.iter().enumerate() {
-        let z = slot_lookup
-            .get(bone.name.as_str())
-            .map(|(z, _)| *z)
-            .unwrap_or(0.0);
-        let local = Mat4::from_scale_rotation_translation(
-            Vec3::new(
-                bone.default_transform.scale.x,
-                bone.default_transform.scale.y,
-                1.0,
-            ),
-            Quat::from_rotation_z(bone.default_transform.rotation.to_radians()),
-            Vec3::new(
-                bone.default_transform.translation.x,
-                bone.default_transform.translation.y,
-                z,
-            ),
-        );
-        global_transforms[i] = match &bone.parent {
-            Some(parent_name) => {
-                let parent_idx = bone_index[parent_name.as_str()];
-                global_transforms[parent_idx] * local
-            }
-            None => local,
-        };
-    }
-
-    global_transforms
-}
-
-/// Computes inverse bind poses from global rest-pose transforms.
-fn compute_inverse_bind_poses(global_rest_poses: &[Mat4]) -> Vec<Mat4> {
-    global_rest_poses.iter().map(|g| g.inverse()).collect()
-}
-```
-
-**Why global, not local**: The extraction code computes `joint_global_transform * inverse_bind_pose` to get `world_from_model`. This only produces correct results if the inverse bind pose encodes the full accumulated global rest transform. Using just the local transform's inverse would be incorrect for child joints -- their global rest position includes parent translations.
-
-**Example for humanoid rig:**
-| Joint | Global Rest Pose | Inverse Bind Pose |
-|-------|-----------------|-------------------|
-| root | T(0, 0, 0) | T(0, 0, 0) |
-| torso | T(0, 1, 0) | T(0, -1, 0) |
-| head | T(0, 2.8, 0.003) | T(0, -2.8, -0.003) |
-| arm_l | T(-1.2, 1, -0.001) | T(1.2, -1, 0.001) |
-| arm_r | T(1.2, 1, 0.001) | T(-1.2, -1, -0.001) |
-| leg_l | T(-0.5, -1, -0.002) | T(0.5, 1, 0.002) |
-| leg_r | T(0.5, -1, 0.002) | T(-0.5, 1, -0.002) |
-
-#### 3. Cache rig meshes and bind poses per rig type
+#### 2. Cache rig mesh assets per rig type
 **File**: `crates/sprite_rig/src/spawn.rs`
 
 ```rust
@@ -560,9 +439,9 @@ pub struct RigMeshAssets {
 pub struct RigMeshCache(pub HashMap<AssetId<SpriteRigAsset>, RigMeshAssets>);
 ```
 
-This replaces `BoneMeshCache` and `BoneMaterialCache` from Phase 2. One mesh handle + one bind pose handle + one material handle per rig type. All characters of the same type share them.
+One mesh handle + one bind pose handle + one material handle per rig type. All characters of the same type share them.
 
-#### 4. Rewrite spawn_sprite_rigs
+#### 3. Rewrite spawn_sprite_rigs
 **File**: `crates/sprite_rig/src/spawn.rs`
 
 The spawning system changes from creating visible bone entities to creating invisible joint entities + one skinned mesh entity.
@@ -588,11 +467,8 @@ fn spawn_sprite_rigs(
             .entry(sprite_rig.0.id())
             .or_insert_with(|| {
                 let mesh = build_rig_mesh(rig);
-                let global_rest_poses = compute_global_rest_poses(
-                    &sorted_bones.iter().collect::<Vec<_>>(),
-                    &slot_lookup,
-                );
-                let inverse_bindposes = compute_inverse_bind_poses(&global_rest_poses);
+                // Identity inverse bind poses: skin_model() returns joint_global directly
+                let inverse_bindposes = vec![Mat4::IDENTITY; sorted_bones.len()];
                 RigMeshAssets {
                     mesh: meshes.add(mesh),
                     inverse_bindposes: bindpose_assets.add(
@@ -666,10 +542,10 @@ fn spawn_sprite_rigs(
 
 **Critical: joint_entities ordering** must match the inverse bind pose array ordering and the `ATTRIBUTE_JOINT_INDEX` values in the mesh. All three use the topologically sorted bone order.
 
-#### 5. Update bone_transform_from_def signature
+#### 4. Update bone_transform_from_def signature
 **File**: `crates/sprite_rig/src/spawn.rs`
 
-The function currently takes `slot_lookup` data inline. Adjust to accept `Option<&(f32, Vec2)>` for the slot info (z_order and size are only needed for z in the transform; size is no longer used per-entity since the mesh is pre-built):
+Adjust to accept `Option<&(f32, Vec2)>` for the slot info (z_order for transform.z; size is no longer used per-entity since the mesh is pre-built):
 
 ```rust
 fn bone_transform_from_def(
@@ -685,31 +561,32 @@ fn bone_transform_from_def(
 }
 ```
 
-#### 6. Update animation z_order handling
+#### 5. Animation z_order handling
 **File**: `crates/sprite_rig/src/animation.rs`
 
-**No changes needed.** Animation curves already bake z_order into `Transform::translation.z`. Joint entities receive the same `Transform` writes as bone entities did. The skinning system reads joint `GlobalTransform` values, which include the z_order offsets. The vertex shader preserves these via `joint_global_transform * inverse_bind_pose`.
+**No changes needed.** Animation curves already bake z_order into `Transform::translation.z` (line 328). Joint entities receive the same `Transform` writes as bone entities did. With identity inverse bind poses, `skin_model()` returns the joint's `GlobalTransform` directly, which includes the z_order offsets from both the rest pose and animation curves.
 
-#### 7. Remove per-bone mesh/material creation
+#### 6. Remove per-bone mesh/material creation
 **File**: `crates/sprite_rig/src/spawn.rs`
 
-- Remove `placeholder_color_for_bone` function (or keep for debug if desired -- but it's no longer used for individual bone entities)
-- Remove `BoneMeshCache` and `BoneMaterialCache` from Phase 2 (replaced by `RigMeshCache`)
+- Remove `placeholder_color_for_bone` function (no longer used for individual bone entities)
 - Remove per-bone `Mesh3d`/`MeshMaterial3d` insertion from spawn code
+- Remove `spawn_bone_hierarchy` (replaced by the joint entity loop in `spawn_sprite_rigs`)
 
-#### 8. Update apply_facing_to_rig
+#### 7. Update apply_facing_to_rig
 **File**: `crates/sprite_rig/src/spawn.rs`
 
-No changes needed. It already finds the `JointRoot` child and sets `scale.x`. Joint entities are children of `JointRoot`, so their `GlobalTransform` values reflect the flip. The skinning system reads these flipped `GlobalTransform` values.
+No changes needed. It already finds the `JointRoot` child (renamed from `RigBillboard` in Phase 1) and sets `scale.x`. Joint entities are children of `JointRoot`, so their `GlobalTransform` values reflect the flip. The skinning system reads these flipped `GlobalTransform` values. The billboard shader's determinant check preserves the negative scale in the rendered output.
 
-#### 9. Add bevy_mesh dependency for SkinnedMesh types
+#### 8. Verify bevy dependencies for SkinnedMesh types
 **File**: `crates/sprite_rig/Cargo.toml`
 
-Ensure `bevy` features include what's needed for `SkinnedMesh`, `SkinnedMeshInverseBindposes`, `DynamicSkinnedMeshBounds`. These are in `bevy_mesh` and `bevy_camera` respectively. With `bevy` as a workspace dependency, these should be available through re-exports:
+Ensure `bevy` features include what's needed for `SkinnedMesh`, `SkinnedMeshInverseBindposes`, `DynamicSkinnedMeshBounds`. These are in `bevy_mesh` and `bevy_camera` respectively. With `bevy` as a workspace dependency, these should be available through re-exports. Verify the exact import paths at implementation time:
 - `bevy::mesh::skinning::SkinnedMesh`
 - `bevy::mesh::skinning::SkinnedMeshInverseBindposes`
+- `bevy::prelude::DynamicSkinnedMeshBounds` (from `bevy_camera`)
 
-Verify the exact import paths at implementation time.
+Also verify that `Mesh::with_generated_skinned_mesh_bounds()` is available (confirmed in Bevy 0.18 at `bevy_mesh/src/mesh.rs:2339` -- returns `Result<Self, SkinnedMeshBoundsError>`).
 
 ### Success Criteria
 
@@ -733,9 +610,8 @@ Verify the exact import paths at implementation time.
 ## Testing Strategy
 
 ### Unit Tests
-- `compute_global_rest_poses`: verify accumulated transforms for known humanoid rig
-- `compute_inverse_bind_poses`: verify `global * inverse == identity` for each joint
-- `build_rig_mesh`: verify vertex count (6 quads * 4 = 24), index count (6 * 6 = 36), joint index correctness
+- `build_rig_mesh`: verify vertex count (6 quads * 4 = 24), index count (6 * 6 = 36), joint index correctness per quad
+- Skinning round-trip: verify that for a known rig, `joint_global_transform * Mat4::IDENTITY * vertex_local_pos` maps to expected world position (i.e. joint's world pos + vertex offset)
 
 ### Manual Testing Steps
 1. Start server + client, verify characters render and animate
@@ -749,15 +625,14 @@ Verify the exact import paths at implementation time.
 ## Performance Considerations
 
 - **Phase 1**: Eliminates 2 per-frame systems + per-entity `Transform` dirtying. Measurable benefit for retained render world.
-- **Phase 2**: Reduces draw calls from N-per-bone to N-per-unique-size. Significant for many characters.
-- **Phase 3**: 1 draw call per character. Joint entities are lighter than mesh-bearing entities (no Mesh3d/MeshMaterial3d components, no mesh/material extraction).
+- **Phase 2**: 1 draw call per character instead of N per bone. Joint entities are lighter than mesh-bearing entities (no Mesh3d/MeshMaterial3d components, no mesh/material extraction). All characters of the same rig type share mesh, material, and bind pose handles.
 - **WebGL 2**: Skinned mesh batching not available (requires storage buffers). Each character is a separate draw call. Still benefits from fewer entities and no CPU billboard.
 
 ## Migration Notes
 
 - **Visual change**: Spherical billboard replaces cylindrical. Sprites no longer foreshorten at camera pitch angles. This is intentional for 2.5D sprite rendering but should be verified visually.
-- **BoneZOrder component**: Can be removed after Phase 3 since z_order is baked into both animation curves and mesh vertex positions via inverse bind poses. Keep it through Phase 1-2 for compatibility.
-- **Placeholder colors**: Phase 3 uses a single white material. Per-bone debug coloring is lost. If needed for debugging, use vertex colors (add `ATTRIBUTE_COLOR` to the mesh with per-quad colors).
+- **BoneZOrder component**: Can be removed after Phase 2 since z_order is maintained by joint `Transform::translation.z` (set at spawn and preserved by animation curves). The component is no longer read by any system.
+- **Placeholder colors**: Phase 2 uses a single white material for all bones. Per-bone debug coloring is lost. If needed for debugging, use vertex colors (add `ATTRIBUTE_COLOR` to the mesh with per-quad colors and enable `VERTEX_COLORS` in the shader).
 
 ## References
 
