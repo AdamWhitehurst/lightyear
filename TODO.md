@@ -6,7 +6,6 @@
 - /spec:find-rules
 - client --autoconnect flag
 - stream ron assets to web clients on request
-- 90 degree camera rotation, w/ character facing, other characters facing other plane off by some degrees i.e. slightly visible instead 
 - bevi-inspector-egui
 - wave function collapse
 - Extend voxel_map_engine to support inserting pre-authored chunks
