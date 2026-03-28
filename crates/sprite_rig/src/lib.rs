@@ -14,7 +14,9 @@ pub use animation::{
     LocomotionState,
 };
 pub use animset::AnimationEventFired;
-pub use spawn::{AnimSetRef, BoneEntities, Facing, JointRoot, RigMeshCache, SpriteRig};
+pub use spawn::{
+    AnimSetRef, BoneEntities, Facing, JointRoot, RigMeshCache, SpriteImageHandles, SpriteRig,
+};
 
 pub struct SpriteRigPlugin;
 
@@ -26,6 +28,7 @@ impl Plugin for SpriteRigPlugin {
             RonAssetPlugin::<SpriteAnimSetAsset>::new(&["animset.ron"]),
         ));
         app.init_resource::<spawn::RigMeshCache>();
+        app.init_resource::<spawn::SpriteImageHandles>();
         app.init_resource::<animation::BuiltAnimations>();
         app.init_resource::<animation::LoadedAnimHandles>();
         app.init_resource::<animation::BuiltAnimGraphs>();
@@ -36,6 +39,7 @@ impl Plugin for SpriteRigPlugin {
             Update,
             (
                 spawn::resolve_character_rig,
+                spawn::load_rig_sprite_images,
                 spawn::spawn_sprite_rigs,
                 animation::load_animset_clips,
                 animation::populate_anim_bone_defaults,
