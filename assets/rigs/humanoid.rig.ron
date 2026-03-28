@@ -2,8 +2,8 @@
 (
     bones: [
         (name: "root",  parent: None,          default_transform: (translation: (0.0, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "torso", parent: Some("root"),  default_transform: (translation: (0.0, 1.0), rotation: 0.0, scale: (1.0, 1.0))),
-        (name: "head",  parent: Some("torso"), default_transform: (translation: (0.0, 1.8), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "torso", parent: Some("root"),  default_transform: (translation: (0.0, 0.5), rotation: 0.0, scale: (1.0, 1.0))),
+        (name: "head",  parent: Some("torso"), default_transform: (translation: (0.0, 1.2), rotation: 0.0, scale: (1.0, 1.0))),
         (name: "arm_l", parent: Some("torso"), default_transform: (translation: (-1.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
         (name: "arm_r", parent: Some("torso"), default_transform: (translation: (1.2, 0.0), rotation: 0.0, scale: (1.0, 1.0))),
         (name: "leg_l", parent: Some("root"),  default_transform: (translation: (-0.5, -1.0), rotation: 0.0, scale: (1.0, 1.0))),
@@ -19,10 +19,10 @@
     ],
     skins: {
         "default": {
-            "torso_default": (image: "sprites/humanoid/torso.png", anchor: Center,       size: (2.0, 2.5)),
+            "torso_default": (image: "sprites/humanoid/torso.png", anchor: Center,       size: (2.0, 2.0)),
             "head_default":  (image: "sprites/humanoid/head.png",  anchor: BottomCenter, size: (1.5, 1.5)),
-            "arm_default":   (image: "sprites/humanoid/arm.png",   anchor: TopCenter,    size: (0.8, 2.0)),
-            "leg_default":   (image: "sprites/humanoid/leg.png",   anchor: TopCenter,    size: (1.0, 2.5)),
+            "arm_default":   (image: "sprites/humanoid/arm.png",   anchor: TopCenter,    size: (0.8, 0.8)),
+            "leg_default":   (image: "sprites/humanoid/leg.png",   anchor: TopCenter,    size: (1.0, 1.0)),
         },
     },
 )

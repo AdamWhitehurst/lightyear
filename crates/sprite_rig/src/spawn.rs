@@ -2,14 +2,16 @@ use std::collections::HashMap;
 
 use avian3d::prelude::LinearVelocity;
 use bevy::asset::RenderAssetUsages;
+use bevy::image::{ImageSampler, TextureAtlasBuilder};
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use lightyear::prelude::*;
+use protocol::app_state::TrackedAssets;
 use protocol::billboard::sprite_rig_material::{SpriteRigBillboardExt, SpriteRigMaterial};
 use protocol::{CharacterMarker, CharacterType};
 
-use crate::asset::SpriteRigAsset;
+use crate::asset::{SpriteAnchorDef, SpriteRigAsset};
 use crate::{asset::SpriteAnimSetAsset, RigRegistry};
 
 /// Reference to the rig asset for this character. Triggers rig spawning.
@@ -35,6 +37,14 @@ pub enum Facing {
 #[derive(Component)]
 pub struct JointRoot;
 
+/// Per-bone slot data extracted from the rig's default skin.
+struct SlotInfo {
+    z_order: f32,
+    size: Vec2,
+    anchor: SpriteAnchorDef,
+    image_path: String,
+}
+
 /// Cached GPU assets for a rig type, shared across all characters using that rig.
 struct RigMeshAssets {
     mesh: Handle<Mesh>,
@@ -45,6 +55,10 @@ struct RigMeshAssets {
 /// Cache of rig mesh assets keyed by rig asset handle ID.
 #[derive(Resource, Default)]
 pub struct RigMeshCache(HashMap<AssetId<SpriteRigAsset>, RigMeshAssets>);
+
+/// Strong handles to sprite images loaded from rig skins, keyed by asset path.
+#[derive(Resource, Default)]
+pub struct SpriteImageHandles(pub HashMap<String, Handle<Image>>);
 
 /// Looks up `RigRegistry` when `CharacterType` is added and inserts rig components.
 pub fn resolve_character_rig(
@@ -73,15 +87,44 @@ pub fn resolve_character_rig(
     }
 }
 
+/// Loads sprite images referenced by rig skins and tracks them for `AppState::Ready`.
+pub fn load_rig_sprite_images(
+    registry: Res<RigRegistry>,
+    rig_assets: Res<Assets<SpriteRigAsset>>,
+    asset_server: Res<AssetServer>,
+    mut sprite_images: ResMut<SpriteImageHandles>,
+    mut tracked: ResMut<TrackedAssets>,
+) {
+    for entry in registry.entries.values() {
+        let Some(rig) = rig_assets.get(&entry.rig_handle) else {
+            trace!("Rig asset not yet loaded, will retry next frame");
+            continue;
+        };
+        let Some(default_skin) = rig.skins.get("default") else {
+            continue;
+        };
+        for attachment in default_skin.values() {
+            if sprite_images.0.contains_key(&attachment.image) {
+                continue;
+            }
+            let handle = asset_server.load::<Image>(&attachment.image);
+            tracked.add(handle.clone());
+            sprite_images.0.insert(attachment.image.clone(), handle);
+        }
+    }
+}
+
 /// Spawns joint hierarchy and a single skinned mesh when `SpriteRig` is added.
 pub fn spawn_sprite_rigs(
     mut commands: Commands,
     query: Query<(Entity, &SpriteRig), Added<SpriteRig>>,
     rig_assets: Res<Assets<SpriteRigAsset>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<SpriteRigMaterial>>,
     mut bindpose_assets: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut rig_mesh_cache: ResMut<RigMeshCache>,
+    sprite_images: Res<SpriteImageHandles>,
 ) {
     for (entity, sprite_rig) in &query {
         let rig = rig_assets
@@ -99,8 +142,10 @@ pub fn spawn_sprite_rigs(
                     &sorted_bones,
                     &slot_lookup,
                     &mut meshes,
+                    &mut images,
                     &mut materials,
                     &mut bindpose_assets,
+                    &sprite_images,
                 )
             });
 
@@ -134,20 +179,30 @@ pub fn spawn_sprite_rigs(
 /// Builds and caches the mesh, inverse bind poses, and material for a rig type.
 fn build_rig_mesh_assets(
     sorted_bones: &[&crate::asset::BoneDef],
-    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+    slot_lookup: &HashMap<&str, SlotInfo>,
     meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
     materials: &mut Assets<SpriteRigMaterial>,
     bindpose_assets: &mut Assets<SkinnedMeshInverseBindposes>,
+    sprite_images: &SpriteImageHandles,
 ) -> RigMeshAssets {
     let bone_index_map = build_bone_index_map(sorted_bones);
-    let mesh = build_rig_mesh(sorted_bones, slot_lookup, &bone_index_map);
+
+    let (atlas_texture, uv_rects) =
+        build_texture_atlas(sorted_bones, slot_lookup, images, sprite_images);
+
+    let mesh = build_rig_mesh(sorted_bones, slot_lookup, &bone_index_map, &uv_rects);
     let inverse_bindposes = bindpose_assets.add(vec![Mat4::IDENTITY; sorted_bones.len()]);
+
+    let atlas_handle = images.add(atlas_texture);
     let material = materials.add(SpriteRigMaterial {
         base: StandardMaterial {
             base_color: Color::WHITE,
+            base_color_texture: Some(atlas_handle),
             unlit: true,
             double_sided: true,
             cull_mode: None,
+            alpha_mode: AlphaMode::Blend,
             ..default()
         },
         extension: SpriteRigBillboardExt {},
@@ -158,6 +213,48 @@ fn build_rig_mesh_assets(
         inverse_bindposes,
         material,
     }
+}
+
+/// Packs all visible bone images into a single texture atlas.
+///
+/// Returns the atlas image (with nearest sampling) and a map of bone name to normalized UV rect.
+fn build_texture_atlas<'a>(
+    sorted_bones: &[&'a crate::asset::BoneDef],
+    slot_lookup: &HashMap<&str, SlotInfo>,
+    images: &Assets<Image>,
+    sprite_images: &SpriteImageHandles,
+) -> (Image, HashMap<&'a str, Rect>) {
+    let mut builder = TextureAtlasBuilder::default();
+    builder.padding(UVec2::new(2, 2));
+
+    let visible_bones = collect_visible_bones(sorted_bones, slot_lookup);
+    let mut bone_image_ids: Vec<(&str, AssetId<Image>)> = Vec::new();
+
+    for (bone_def, slot_info) in &visible_bones {
+        let handle = sprite_images
+            .0
+            .get(&slot_info.image_path)
+            .unwrap_or_else(|| panic!("missing sprite image handle for '{}'", slot_info.image_path));
+        let image = images
+            .get(handle)
+            .unwrap_or_else(|| panic!("sprite image not loaded for '{}'", slot_info.image_path));
+        let asset_id = handle.id();
+        builder.add_texture(Some(asset_id), image);
+        bone_image_ids.push((bone_def.name.as_str(), asset_id));
+    }
+
+    let (layout, sources, mut atlas_image) = builder.build().expect("texture atlas build failed");
+    atlas_image.sampler = ImageSampler::nearest();
+
+    let mut uv_rects = HashMap::new();
+    for (bone_name, image_id) in &bone_image_ids {
+        let uv_rect = sources
+            .uv_rect(&layout, *image_id)
+            .unwrap_or_else(|| panic!("missing UV rect for bone '{bone_name}'"));
+        uv_rects.insert(*bone_name, uv_rect);
+    }
+
+    (atlas_image, uv_rects)
 }
 
 /// Maps bone name to its index in topological sort order.
@@ -175,11 +272,16 @@ fn build_bone_index_map<'a>(sorted_bones: &[&'a crate::asset::BoneDef]) -> HashM
 /// Builds a single merged mesh with one quad per visible bone, skinned to its joint.
 fn build_rig_mesh(
     sorted_bones: &[&crate::asset::BoneDef],
-    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+    slot_lookup: &HashMap<&str, SlotInfo>,
     bone_index_map: &HashMap<&str, u16>,
+    uv_rects: &HashMap<&str, Rect>,
 ) -> Mesh {
     let mut visible_bones = collect_visible_bones(sorted_bones, slot_lookup);
-    visible_bones.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    visible_bones.sort_by(|a, b| {
+        a.1.z_order
+            .partial_cmp(&b.1.z_order)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
@@ -188,15 +290,21 @@ fn build_rig_mesh(
     let mut joint_weights: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    for (bone_def, _z_order, size) in &visible_bones {
+    for (bone_def, slot_info) in &visible_bones {
         let joint_idx = *bone_index_map
             .get(bone_def.name.as_str())
             .expect("visible bone must exist in bone_index_map");
         let base_vertex = u32::try_from(positions.len()).expect("vertex count exceeds u32::MAX");
 
+        let uv_rect = uv_rects
+            .get(bone_def.name.as_str())
+            .unwrap_or_else(|| panic!("missing UV rect for bone '{}'", bone_def.name));
+
         append_quad_vertices(
-            *size,
+            slot_info.size,
             joint_idx,
+            *uv_rect,
+            &slot_info.anchor,
             &mut positions,
             &mut normals,
             &mut uvs,
@@ -221,25 +329,27 @@ fn build_rig_mesh(
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// Collects bones that have a slot entry, returning (bone_def, z_order, size).
-fn collect_visible_bones<'a>(
+/// Collects bones that have a slot entry, returning (bone_def, slot_info) pairs.
+fn collect_visible_bones<'a, 'b>(
     sorted_bones: &[&'a crate::asset::BoneDef],
-    slot_lookup: &HashMap<&str, (f32, Vec2)>,
-) -> Vec<(&'a crate::asset::BoneDef, f32, Vec2)> {
+    slot_lookup: &'b HashMap<&str, SlotInfo>,
+) -> Vec<(&'a crate::asset::BoneDef, &'b SlotInfo)> {
     sorted_bones
         .iter()
         .filter_map(|bone| {
             slot_lookup
                 .get(bone.name.as_str())
-                .map(|&(z, size)| (*bone, z, size))
+                .map(|info| (*bone, info))
         })
         .collect()
 }
 
-/// Appends 4 vertices for a Z-facing quad centered at origin with the given half-extents.
+/// Appends 4 vertices for a Z-facing quad with per-bone UV rect and anchor offset.
 fn append_quad_vertices(
     size: Vec2,
     joint_idx: u16,
+    uv_rect: Rect,
+    anchor: &SpriteAnchorDef,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
@@ -248,21 +358,35 @@ fn append_quad_vertices(
 ) {
     let hx = size.x / 2.0;
     let hy = size.y / 2.0;
+    let y_offset = anchor_y_offset(anchor, size);
 
-    // Bottom-left, bottom-right, top-right, top-left
     positions.extend_from_slice(&[
-        [-hx, -hy, 0.0],
-        [hx, -hy, 0.0],
-        [hx, hy, 0.0],
-        [-hx, hy, 0.0],
+        [-hx, -hy + y_offset, 0.0],
+        [hx, -hy + y_offset, 0.0],
+        [hx, hy + y_offset, 0.0],
+        [-hx, hy + y_offset, 0.0],
     ]);
     normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
-    uvs.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+    uvs.extend_from_slice(&[
+        [uv_rect.min.x, uv_rect.max.y],
+        [uv_rect.max.x, uv_rect.max.y],
+        [uv_rect.max.x, uv_rect.min.y],
+        [uv_rect.min.x, uv_rect.min.y],
+    ]);
 
     let ji = [joint_idx, 0, 0, 0];
     let jw = [1.0, 0.0, 0.0, 0.0];
     joint_indices.extend_from_slice(&[ji; 4]);
     joint_weights.extend_from_slice(&[jw; 4]);
+}
+
+/// Computes the Y offset for a quad based on anchor type.
+fn anchor_y_offset(anchor: &SpriteAnchorDef, size: Vec2) -> f32 {
+    match anchor {
+        SpriteAnchorDef::Center => 0.0,
+        SpriteAnchorDef::TopCenter => -size.y / 2.0,
+        SpriteAnchorDef::BottomCenter => size.y / 2.0,
+    }
 }
 
 /// Appends 6 indices (2 triangles) for a quad starting at `base_vertex`.
@@ -283,7 +407,7 @@ fn spawn_joints(
     commands: &mut Commands,
     joint_root_id: Entity,
     sorted_bones: &[&crate::asset::BoneDef],
-    slot_lookup: &HashMap<&str, (f32, Vec2)>,
+    slot_lookup: &HashMap<&str, SlotInfo>,
 ) -> (HashMap<String, Entity>, Vec<Entity>) {
     let mut bone_map = HashMap::<String, Entity>::new();
     let mut joint_entities = Vec::with_capacity(sorted_bones.len());
@@ -317,9 +441,9 @@ fn spawn_joints(
 /// Builds a `Transform` from a bone definition, using z_order from slot info.
 fn bone_transform_from_def(
     bone_def: &crate::asset::BoneDef,
-    slot_info: Option<&(f32, Vec2)>,
+    slot_info: Option<&SlotInfo>,
 ) -> Transform {
-    let z_order = slot_info.map(|(z, _)| *z).unwrap_or(0.0);
+    let z_order = slot_info.map(|s| s.z_order).unwrap_or(0.0);
 
     Transform {
         translation: Vec3::new(
@@ -336,18 +460,26 @@ fn bone_transform_from_def(
     }
 }
 
-/// Builds a lookup from bone name to (z_order, attachment size) from the rig's slots and default skin.
-fn build_slot_lookup(rig: &SpriteRigAsset) -> HashMap<&str, (f32, Vec2)> {
+/// Builds a lookup from bone name to slot info from the rig's slots and default skin.
+fn build_slot_lookup(rig: &SpriteRigAsset) -> HashMap<&str, SlotInfo> {
     let default_skin = rig.skins.get("default");
     let mut lookup = HashMap::new();
 
     for slot in &rig.slots {
-        let size = default_skin
-            .and_then(|skin| skin.get(&slot.default_attachment))
-            .map(|att| att.size)
-            .unwrap_or(Vec2::splat(1.0));
+        let attachment = default_skin.and_then(|skin| skin.get(&slot.default_attachment));
 
-        lookup.insert(slot.bone.as_str(), (slot.z_order, size));
+        let info = SlotInfo {
+            z_order: slot.z_order,
+            size: attachment.map(|a| a.size).unwrap_or(Vec2::splat(1.0)),
+            anchor: attachment
+                .map(|a| a.anchor.clone())
+                .unwrap_or_default(),
+            image_path: attachment
+                .map(|a| a.image.clone())
+                .unwrap_or_default(),
+        };
+
+        lookup.insert(slot.bone.as_str(), info);
     }
 
     lookup
