@@ -5,9 +5,10 @@ use bevy::log::info_span;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 
-use crate::config::{VoxelGenerator, VoxelGeneratorImpl};
+use crate::config::{SurfaceHeightMap, VoxelGenerator, VoxelGeneratorImpl, WorldObjectSpawn};
 use crate::meshing::mesh_chunk_greedy;
-use crate::types::{ChunkData, ChunkStatus, FillType};
+use crate::palette::PalettedChunk;
+use crate::types::{ChunkData, ChunkStatus, FillType, WorldVoxel};
 
 /// Number of chunks to generate per async task.
 pub const GEN_BATCH_SIZE: usize = 8;
@@ -16,7 +17,9 @@ pub const GEN_BATCH_SIZE: usize = 8;
 pub struct ChunkGenResult {
     pub position: IVec3,
     pub mesh: Option<Mesh>,
-    pub chunk_data: ChunkData,
+    /// `None` for stages that update chunk status in-place (Features).
+    pub chunk_data: Option<ChunkData>,
+    pub entity_spawns: Vec<WorldObjectSpawn>,
     /// Whether this chunk was loaded from disk rather than generated.
     pub from_disk: bool,
 }
@@ -27,10 +30,16 @@ pub struct PendingChunks {
     pub tasks: Vec<Task<Vec<ChunkGenResult>>>,
 }
 
-/// Spawn an async task that generates a batch of chunks.
+/// Queued entity spawns from completed Features stages, awaiting server-side processing.
+#[derive(Component, Default)]
+pub struct PendingEntitySpawns(pub Vec<(IVec3, Vec<WorldObjectSpawn>)>);
+
+/// Spawn an async task that generates terrain for a batch of chunks.
 ///
-/// Each position is first checked on disk; if not found, the generator is used.
-pub fn spawn_chunk_gen_batch(
+/// Each position is first checked on disk; disk-loaded chunks return at their
+/// saved status with mesh if non-empty (fast path). Newly generated chunks
+/// produce `ChunkStatus::Terrain` with no mesh.
+pub fn spawn_terrain_batch(
     pending: &mut PendingChunks,
     positions: Vec<IVec3>,
     generator: &VoxelGenerator,
@@ -40,7 +49,7 @@ pub fn spawn_chunk_gen_batch(
     let pool = AsyncComputeTaskPool::get();
 
     let task = pool.spawn(async move {
-        let _span = info_span!("chunk_gen_batch", count = positions.len()).entered();
+        let _span = info_span!("terrain_batch", count = positions.len()).entered();
         positions
             .into_iter()
             .map(|pos| {
@@ -60,7 +69,8 @@ pub fn spawn_chunk_gen_batch(
                             return ChunkGenResult {
                                 position: pos,
                                 mesh,
-                                chunk_data,
+                                chunk_data: Some(chunk_data),
+                                entity_spawns: vec![],
                                 from_disk: true,
                             };
                         }
@@ -70,7 +80,7 @@ pub fn spawn_chunk_gen_batch(
                         }
                     }
                 }
-                generate_chunk(pos, &*generator)
+                generate_terrain(pos, &*generator)
             })
             .collect()
     });
@@ -78,25 +88,108 @@ pub fn spawn_chunk_gen_batch(
     pending.tasks.push(task);
 }
 
-fn generate_chunk(position: IVec3, generator: &dyn VoxelGeneratorImpl) -> ChunkGenResult {
+/// Spawn an async task that runs the Features stage for a single chunk.
+///
+/// The generator's `place_features` is called with the provided surface height
+/// map. Returns a result with `chunk_data: None` (status update is handled
+/// in-place by the caller) and any entity spawns from the generator.
+pub fn spawn_features_task(
+    pending: &mut PendingChunks,
+    position: IVec3,
+    height_map: SurfaceHeightMap,
+    generator: &VoxelGenerator,
+) {
+    let generator = Arc::clone(&generator.0);
+    let pool = AsyncComputeTaskPool::get();
+
+    let task = pool.spawn(async move {
+        let _span = info_span!("features_stage", ?position).entered();
+        let entity_spawns = generator.place_features(position, &height_map);
+        vec![ChunkGenResult {
+            position,
+            mesh: None,
+            chunk_data: None,
+            entity_spawns,
+            from_disk: false,
+        }]
+    });
+
+    pending.tasks.push(task);
+}
+
+/// Spawn an async task that meshes a chunk from its voxel data.
+///
+/// Returns a result with `ChunkData` at `ChunkStatus::Mesh`.
+pub fn spawn_mesh_task(pending: &mut PendingChunks, position: IVec3, voxels: Vec<WorldVoxel>) {
+    let pool = AsyncComputeTaskPool::get();
+
+    let task = pool.spawn(async move {
+        let _span = info_span!("mesh_stage", ?position).entered();
+        let mesh = {
+            let _span = info_span!("mesh_chunk").entered();
+            mesh_chunk_greedy(&voxels)
+        };
+        let chunk_data = {
+            let _span = info_span!("palettize_chunk").entered();
+            ChunkData::from_voxels(&voxels, ChunkStatus::Mesh)
+        };
+        vec![ChunkGenResult {
+            position,
+            mesh,
+            chunk_data: Some(chunk_data),
+            entity_spawns: vec![],
+            from_disk: false,
+        }]
+    });
+
+    pending.tasks.push(task);
+}
+
+/// Build a 16x16 surface height map from palettized chunk data.
+///
+/// Expands the palette to a full voxel array, then scans each XZ column
+/// top-down for the highest solid voxel. Called on the main thread before
+/// dispatching the Features async task.
+pub fn build_surface_height_map(chunk_pos: IVec3, palette: &PalettedChunk) -> SurfaceHeightMap {
+    use crate::types::{CHUNK_SIZE, PADDED_CHUNK_SIZE, PaddedChunkShape};
+    use ndshape::ConstShape;
+
+    let voxels = palette.to_voxels();
+    let mut heights = [None; 256];
+
+    for x in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            let px = x + 1;
+            let pz = z + 1;
+            for py in (0..PADDED_CHUNK_SIZE).rev() {
+                let idx = PaddedChunkShape::linearize([px, py, pz]) as usize;
+                if matches!(voxels[idx], WorldVoxel::Solid(_)) {
+                    let world_y = chunk_pos.y as f64 * CHUNK_SIZE as f64 + py as f64 - 1.0 + 1.0;
+                    heights[(x * 16 + z) as usize] = Some(world_y);
+                    break;
+                }
+            }
+        }
+    }
+
+    SurfaceHeightMap { chunk_pos, heights }
+}
+
+/// Generate terrain-only for a single chunk position.
+fn generate_terrain(position: IVec3, generator: &dyn VoxelGeneratorImpl) -> ChunkGenResult {
     let voxels = {
         let _span = info_span!("terrain_gen").entered();
         generator.generate_terrain(position)
     };
     let chunk_data = {
         let _span = info_span!("palettize_chunk").entered();
-        ChunkData::from_voxels(&voxels, ChunkStatus::Full)
-    };
-    let mesh = if chunk_data.fill_type == FillType::Empty {
-        None
-    } else {
-        let _span = info_span!("mesh_chunk").entered();
-        mesh_chunk_greedy(&voxels)
+        ChunkData::from_voxels(&voxels, ChunkStatus::Terrain)
     };
     ChunkGenResult {
         position,
-        mesh,
-        chunk_data,
+        mesh: None,
+        chunk_data: Some(chunk_data),
+        entity_spawns: vec![],
         from_disk: false,
     }
 }

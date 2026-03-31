@@ -54,6 +54,18 @@ impl ChunkStatus {
             Self::Full => None,
         }
     }
+
+    /// Maximum achievable status for a chunk at the given effective level.
+    /// Levels 0-2 (EntityTicking/BlockTicking/Border) → Full
+    /// Level 3 → Mesh, Level 4 → Features, Level 5+ → Terrain
+    pub fn max_for_level(effective_level: u32) -> ChunkStatus {
+        match effective_level {
+            0..=2 => ChunkStatus::Full,
+            3 => ChunkStatus::Mesh,
+            4 => ChunkStatus::Features,
+            _ => ChunkStatus::Terrain,
+        }
+    }
 }
 
 /// Voxel data for one chunk (16^3 with 1-voxel padding = 18^3)
@@ -276,5 +288,16 @@ mod tests {
 
         let full = ChunkData::from_voxels(&voxels, ChunkStatus::Full);
         assert_eq!(full.status, ChunkStatus::Full);
+    }
+
+    #[test]
+    fn chunk_status_max_for_level() {
+        assert_eq!(ChunkStatus::max_for_level(0), ChunkStatus::Full);
+        assert_eq!(ChunkStatus::max_for_level(1), ChunkStatus::Full);
+        assert_eq!(ChunkStatus::max_for_level(2), ChunkStatus::Full);
+        assert_eq!(ChunkStatus::max_for_level(3), ChunkStatus::Mesh);
+        assert_eq!(ChunkStatus::max_for_level(4), ChunkStatus::Features);
+        assert_eq!(ChunkStatus::max_for_level(5), ChunkStatus::Terrain);
+        assert_eq!(ChunkStatus::max_for_level(20), ChunkStatus::Terrain);
     }
 }
