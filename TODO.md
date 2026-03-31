@@ -9,7 +9,6 @@
 - bevi-inspector-egui
 - wave function collapse
 - Extend voxel_map_engine to support inserting pre-authored chunks
-- meaningful proc gen terrain
 - composable Character templates that are loadable Asset files. Character template asset files are composed of other ron asset files
 - monocraft ui font
 - Ability unlock system
