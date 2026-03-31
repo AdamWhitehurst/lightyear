@@ -130,7 +130,14 @@ fn set_voxel_triggers_remesh() {
     let map = spawn_map(&mut app, 1);
     spawn_ticket(&mut app, map, Vec3::ZERO, 0);
 
-    tick_until(&mut app, |app| has_loaded_chunk(app, map, IVec3::ZERO));
+    // Wait for chunk to reach Full status (all pipeline stages complete)
+    tick_until(&mut app, |app| {
+        app.world()
+            .get::<VoxelMapInstance>(map)
+            .unwrap()
+            .get_chunk_data(IVec3::ZERO)
+            .is_some_and(|c| c.status == ChunkStatus::Full)
+    });
 
     // Write a voxel inside the origin chunk
     let edit_pos = IVec3::new(8, 8, 8); // center of chunk (0,0,0)

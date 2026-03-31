@@ -10,7 +10,10 @@ use tracy_client::plot;
 
 use crate::chunk::VoxelChunk;
 use crate::config::{VoxelGenerator, VoxelMapConfig};
-use crate::generation::{GEN_BATCH_SIZE, PendingChunks, spawn_chunk_gen_batch};
+use crate::generation::{
+    GEN_BATCH_SIZE, PendingChunks, PendingEntitySpawns, build_surface_height_map,
+    spawn_features_task, spawn_mesh_task, spawn_terrain_batch,
+};
 use crate::instance::VoxelMapInstance;
 use crate::meshing::mesh_chunk_greedy;
 use crate::propagator::TicketLevelPropagator;
@@ -18,7 +21,7 @@ use crate::ticket::{
     ChunkTicket, DEFAULT_COLUMN_Y_MAX, DEFAULT_COLUMN_Y_MIN, TicketType, chunk_to_column,
     column_to_chunks,
 };
-use crate::types::CHUNK_SIZE;
+use crate::types::{CHUNK_SIZE, ChunkStatus};
 
 /// Per-frame time budget for chunk pipeline work on a single map.
 /// Reset at the start of each frame by `update_chunks`.
@@ -273,6 +276,14 @@ pub fn ensure_pending_chunks(
             Without<ChunkWorkTracker>,
         ),
     >,
+    entity_spawns_query: Query<
+        Entity,
+        (
+            With<VoxelMapInstance>,
+            With<VoxelGenerator>,
+            Without<PendingEntitySpawns>,
+        ),
+    >,
 ) {
     for entity in &chunks_query {
         trace!("ensure_pending_chunks: adding PendingChunks to {entity:?}");
@@ -303,6 +314,12 @@ pub fn ensure_pending_chunks(
     for entity in &tracker_query {
         trace!("ensure_pending_chunks: adding ChunkWorkTracker to {entity:?}");
         commands.entity(entity).insert(ChunkWorkTracker::default());
+    }
+    for entity in &entity_spawns_query {
+        trace!("ensure_pending_chunks: adding PendingEntitySpawns to {entity:?}");
+        commands
+            .entity(entity)
+            .insert(PendingEntitySpawns::default());
     }
 }
 
@@ -386,7 +403,7 @@ pub(crate) fn update_chunks(
                 y_max,
             );
             drain_gen_queue(
-                &instance,
+                &mut instance,
                 &mut pending,
                 &mut gen_queue,
                 &mut tracker,
@@ -577,6 +594,9 @@ pub fn drain_pending_saves(mut map_query: Query<&mut PendingSaves>) {
 }
 
 /// Push newly loaded/changed columns into the persistent generation queue.
+///
+/// Checks each chunk's current status against the level-gated max status,
+/// enqueuing only chunks that need further advancement.
 fn enqueue_new_chunks(
     instance: &VoxelMapInstance,
     propagator: &TicketLevelPropagator,
@@ -590,11 +610,16 @@ fn enqueue_new_chunks(
     let mut enqueued = 0;
     for &(col, level) in diff.loaded.iter().chain(diff.changed.iter()) {
         let distance = propagator.min_distance_to_source(col);
+        let max_status = ChunkStatus::max_for_level(level);
         for chunk_pos in column_to_chunks(col, y_min, y_max) {
             if !is_within_bounds(chunk_pos, bounds) {
                 continue;
             }
-            if instance.get_chunk_data(chunk_pos).is_some() {
+            let current = instance
+                .get_chunk_data(chunk_pos)
+                .map(|c| c.status)
+                .unwrap_or(ChunkStatus::Empty);
+            if current >= max_status {
                 continue;
             }
             gen_queue.heap.push(ChunkWork {
@@ -613,7 +638,7 @@ fn enqueue_new_chunks(
 /// Stale entries (chunk already generated, already pending, column unloaded,
 /// or out of bounds) are skipped via lazy deletion.
 fn drain_gen_queue(
-    instance: &VoxelMapInstance,
+    instance: &mut VoxelMapInstance,
     pending: &mut PendingChunks,
     gen_queue: &mut GenQueue,
     tracker: &mut ChunkWorkTracker,
@@ -636,7 +661,8 @@ fn drain_gen_queue(
 
     let mut spawned = 0;
     let mut stale = 0;
-    let mut batch = Vec::with_capacity(GEN_BATCH_SIZE);
+    let mut terrain_batch = Vec::with_capacity(GEN_BATCH_SIZE);
+
     while let Some(work) = gen_queue.heap.pop() {
         if pending.tasks.len() >= MAX_PENDING_GEN_TASKS {
             break;
@@ -644,12 +670,9 @@ fn drain_gen_queue(
         if !budget.has_time() || spawned >= MAX_GEN_SPAWNS_PER_FRAME {
             break;
         }
+
         let col = chunk_to_column(work.position);
         if !instance.chunk_levels.contains_key(&col) {
-            stale += 1;
-            continue;
-        }
-        if instance.get_chunk_data(work.position).is_some() {
             stale += 1;
             continue;
         }
@@ -662,21 +685,72 @@ fn drain_gen_queue(
             stale += 1;
             continue;
         }
-        tracker.generating.insert(work.position);
-        batch.push(work.position);
-        spawned += 1;
-        if batch.len() >= GEN_BATCH_SIZE {
-            spawn_chunk_gen_batch(
-                pending,
-                std::mem::take(&mut batch),
-                generator,
-                config.save_dir.clone(),
-            );
-            batch = Vec::with_capacity(GEN_BATCH_SIZE);
+
+        let current_status = instance
+            .get_chunk_data(work.position)
+            .map(|c| c.status)
+            .unwrap_or(ChunkStatus::Empty);
+        let max_status = ChunkStatus::max_for_level(work.effective_level);
+        let Some(next_stage) = current_status.next() else {
+            stale += 1;
+            continue;
+        };
+        if next_stage > max_status {
+            stale += 1;
+            continue;
+        }
+
+        // NOTE: bare continues above are intentional — the `stale` counter
+        // (plotted via Tracy) provides aggregate telemetry. Per-entry trace! would
+        // fire thousands of times per frame in the common case (lazy deletion).
+
+        match next_stage {
+            ChunkStatus::Terrain => {
+                tracker.generating.insert(work.position);
+                terrain_batch.push(work.position);
+                spawned += 1;
+                if terrain_batch.len() >= GEN_BATCH_SIZE {
+                    spawn_terrain_batch(
+                        pending,
+                        std::mem::take(&mut terrain_batch),
+                        generator,
+                        config.save_dir.clone(),
+                    );
+                    terrain_batch = Vec::with_capacity(GEN_BATCH_SIZE);
+                }
+            }
+            ChunkStatus::Features => {
+                let chunk_data = instance
+                    .get_chunk_data(work.position)
+                    .expect("chunk must exist at Terrain status");
+                let height_map = build_surface_height_map(work.position, &chunk_data.voxels);
+                tracker.generating.insert(work.position);
+                spawn_features_task(pending, work.position, height_map, generator);
+                spawned += 1;
+            }
+            ChunkStatus::Mesh => {
+                let voxels = instance
+                    .get_chunk_data(work.position)
+                    .expect("chunk must exist at Features status")
+                    .voxels
+                    .to_voxels();
+                tracker.generating.insert(work.position);
+                spawn_mesh_task(pending, work.position, voxels);
+                spawned += 1;
+            }
+            ChunkStatus::Full => {
+                // Full is a synchronous promotion — no async work needed.
+                if let Some(chunk_data) = instance.get_chunk_data_mut(work.position) {
+                    chunk_data.status = ChunkStatus::Full;
+                }
+            }
+            ChunkStatus::Empty => unreachable!("next() never returns Empty"),
         }
     }
-    if !batch.is_empty() {
-        spawn_chunk_gen_batch(pending, batch, generator, config.save_dir.clone());
+
+    // Flush remaining terrain batch
+    if !terrain_batch.is_empty() {
+        spawn_terrain_batch(pending, terrain_batch, generator, config.save_dir.clone());
     }
 
     let stop_reason = if pending.tasks.len() >= MAX_PENDING_GEN_TASKS {
@@ -693,7 +767,7 @@ fn drain_gen_queue(
     plot!("gen_stale_skipped", stale as f64);
 }
 
-/// Poll pending chunk generation tasks and spawn mesh entities for completed ones.
+/// Poll pending chunk generation tasks and process completed results.
 pub fn poll_chunk_tasks(
     mut commands: Commands,
     mut map_query: Query<(
@@ -701,6 +775,9 @@ pub fn poll_chunk_tasks(
         &mut VoxelMapInstance,
         &mut PendingChunks,
         &mut ChunkWorkTracker,
+        &mut GenQueue,
+        &TicketLevelPropagator,
+        &mut PendingEntitySpawns,
     )>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -711,7 +788,16 @@ pub fn poll_chunk_tasks(
         return;
     };
 
-    for (map_entity, mut instance, mut pending, mut tracker) in &mut map_query {
+    for (
+        map_entity,
+        mut instance,
+        mut pending,
+        mut tracker,
+        mut gen_queue,
+        propagator,
+        mut pending_entity_spawns,
+    ) in &mut map_query
+    {
         let finished_count = pending.tasks.iter().filter(|t| t.is_finished()).count();
         plot!("gen_tasks_finished", finished_count as f64);
 
@@ -738,6 +824,9 @@ pub fn poll_chunk_tasks(
                         &default_material,
                         map_entity,
                         result,
+                        &mut gen_queue,
+                        propagator,
+                        &mut pending_entity_spawns,
                     );
                     polled += 1;
                 }
@@ -773,42 +862,79 @@ fn handle_completed_chunk(
     default_material: &DefaultVoxelMaterial,
     map_entity: Entity,
     result: crate::generation::ChunkGenResult,
+    gen_queue: &mut GenQueue,
+    propagator: &TicketLevelPropagator,
+    pending_entity_spawns: &mut PendingEntitySpawns,
 ) {
-    if !result.from_disk {
-        instance.dirty_chunks.insert(result.position);
-    }
-    instance.insert_chunk_data(result.position, result.chunk_data);
-
-    let Some(mesh) = result.mesh else {
-        return;
-    };
-
-    let mesh_handle = meshes.add(mesh);
-    let offset = chunk_world_offset(result.position);
-
-    let material = if instance.debug_colors {
-        materials.add(StandardMaterial {
-            base_color: color_from_chunk_pos(result.position),
-            perceptual_roughness: 0.9,
-            ..default()
-        })
+    // Insert chunk data (Terrain/Mesh stages) or update status in-place (Features stage)
+    let completed_status = if let Some(chunk_data) = result.chunk_data {
+        let status = chunk_data.status;
+        if !result.from_disk {
+            instance.dirty_chunks.insert(result.position);
+        }
+        instance.insert_chunk_data(result.position, chunk_data);
+        status
     } else {
-        default_material.0.clone()
+        // Features stage: update status in-place, no re-palettization
+        let data = instance
+            .get_chunk_data_mut(result.position)
+            .expect("chunk must exist for Features status update");
+        data.status = ChunkStatus::Features;
+        if !result.from_disk {
+            instance.dirty_chunks.insert(result.position);
+        }
+        ChunkStatus::Features
     };
 
-    let chunk_entity = commands
-        .spawn((
-            VoxelChunk {
-                position: result.position,
-                lod_level: 0,
-            },
-            Mesh3d(mesh_handle),
-            MeshMaterial3d(material),
-            Transform::from_translation(offset),
-        ))
-        .id();
+    // Queue entity spawns from Features stage
+    if !result.entity_spawns.is_empty() {
+        pending_entity_spawns
+            .0
+            .push((result.position, result.entity_spawns));
+    }
 
-    commands.entity(map_entity).add_child(chunk_entity);
+    // Spawn mesh entity only when a mesh is present (Mesh stage or disk-loaded Full chunks)
+    if let Some(mesh) = result.mesh {
+        let mesh_handle = meshes.add(mesh);
+        let offset = chunk_world_offset(result.position);
+
+        let material = if instance.debug_colors {
+            materials.add(StandardMaterial {
+                base_color: color_from_chunk_pos(result.position),
+                perceptual_roughness: 0.9,
+                ..default()
+            })
+        } else {
+            default_material.0.clone()
+        };
+
+        let chunk_entity = commands
+            .spawn((
+                VoxelChunk {
+                    position: result.position,
+                    lod_level: 0,
+                },
+                Mesh3d(mesh_handle),
+                MeshMaterial3d(material),
+                Transform::from_translation(offset),
+            ))
+            .id();
+
+        commands.entity(map_entity).add_child(chunk_entity);
+    }
+
+    // Re-enqueue if chunk can advance further
+    let col = chunk_to_column(result.position);
+    if let Some(&level) = instance.chunk_levels.get(&col) {
+        let max_status = ChunkStatus::max_for_level(level);
+        if completed_status < max_status {
+            gen_queue.heap.push(ChunkWork {
+                position: result.position,
+                effective_level: level,
+                distance_to_source: propagator.min_distance_to_source(col),
+            });
+        }
+    }
 }
 
 /// Whether a 2D column is within the map's optional bounds.

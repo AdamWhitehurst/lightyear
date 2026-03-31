@@ -652,8 +652,8 @@ Pass `gen_queue`, `propagator`, and `pending_entity_spawns` through to `handle_c
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all`
-- [ ] `cargo test -p voxel_map_engine`
+- [x] `cargo check-all`
+- [x] `cargo test -p voxel_map_engine`
 
 #### Manual Verification:
 - [ ] `cargo server` — chunks generate and display correctly
