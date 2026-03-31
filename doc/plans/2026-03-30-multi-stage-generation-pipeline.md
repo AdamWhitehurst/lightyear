@@ -298,11 +298,11 @@ Export `FlatGenerator` from `terrain.rs` (make `pub`). Note: `flat_terrain_voxel
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all`
-- [ ] `cargo test -p voxel_map_engine`
+- [x] `cargo check-all`
+- [x] `cargo test -p voxel_map_engine`
 
 #### Manual Verification:
-- [ ] `cargo server` — identical behavior to before
+- [x] `cargo server` — identical behavior to before
 
 ---
 

@@ -9,7 +9,7 @@ use noise::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::config::VoxelGenerator;
+use crate::config::{VoxelGenerator, VoxelGeneratorImpl};
 use crate::meshing::flat_terrain_voxels;
 use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
 
@@ -300,10 +300,39 @@ pub fn select_biome<'a>(rules: &'a [BiomeRule], height: f64, moisture: f64) -> &
         .unwrap_or(&rules[0])
 }
 
-/// Build a [`VoxelGenerator`] closure from terrain components on a map entity.
+/// Terrain generator using 2D heightmap noise with biome-aware material selection.
+struct HeightmapGenerator {
+    seed: u64,
+    height_map: HeightMap,
+    moisture_map: Option<MoistureMap>,
+    biome_rules: Option<BiomeRules>,
+}
+
+impl VoxelGeneratorImpl for HeightmapGenerator {
+    fn generate_terrain(&self, chunk_pos: IVec3) -> Vec<WorldVoxel> {
+        generate_heightmap_chunk(
+            chunk_pos,
+            self.seed,
+            &self.height_map,
+            self.moisture_map.as_ref(),
+            self.biome_rules.as_ref(),
+        )
+    }
+}
+
+/// Flat terrain generator (no noise).
+pub struct FlatGenerator;
+
+impl VoxelGeneratorImpl for FlatGenerator {
+    fn generate_terrain(&self, chunk_pos: IVec3) -> Vec<WorldVoxel> {
+        flat_terrain_voxels(chunk_pos)
+    }
+}
+
+/// Build a [`VoxelGenerator`] from terrain components on a map entity.
 ///
 /// Reads [`HeightMap`], [`MoistureMap`], and [`BiomeRules`] from the entity.
-/// If no `HeightMap` is present, falls back to [`flat_terrain_voxels`].
+/// If no `HeightMap` is present, falls back to [`FlatGenerator`].
 pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
     let height = entity.get::<HeightMap>().cloned();
     let moisture = entity.get::<MoistureMap>().cloned();
@@ -323,10 +352,13 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
     );
 
     match height {
-        Some(h) => VoxelGenerator(Arc::new(move |chunk_pos| {
-            generate_heightmap_chunk(chunk_pos, seed, &h, moisture.as_ref(), biomes.as_ref())
+        Some(height_map) => VoxelGenerator(Arc::new(HeightmapGenerator {
+            seed,
+            height_map,
+            moisture_map: moisture,
+            biome_rules: biomes,
         })),
-        None => VoxelGenerator(Arc::new(flat_terrain_voxels)),
+        None => VoxelGenerator(Arc::new(FlatGenerator)),
     }
 }
 

@@ -4,8 +4,8 @@ use bevy::prelude::*;
 use lightyear::prelude::{Controlled, Predicted};
 use protocol::{CharacterMarker, MapInstanceId, MapRegistry};
 use voxel_map_engine::prelude::{
-    chunk_to_column, column_to_chunks, flat_terrain_voxels, ChunkData, ChunkStatus, ChunkTicket,
-    FillType, PalettedChunk, TicketType, VoxelChunk, VoxelGenerator, VoxelMapConfig,
+    chunk_to_column, column_to_chunks, ChunkData, ChunkStatus, ChunkTicket, FillType,
+    FlatGenerator, PalettedChunk, TicketType, VoxelChunk, VoxelGenerator, VoxelMapConfig,
     VoxelMapInstance, VoxelPlugin, WorldVoxel, DEFAULT_COLUMN_Y_MAX, DEFAULT_COLUMN_Y_MIN,
 };
 
@@ -28,7 +28,7 @@ fn spawn_client_map(app: &mut App) -> Entity {
         .spawn((
             VoxelMapInstance::new(3),
             config,
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(Arc::new(FlatGenerator)),
             Transform::default(),
             MapInstanceId::Overworld,
         ))

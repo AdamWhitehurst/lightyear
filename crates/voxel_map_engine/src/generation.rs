@@ -5,9 +5,9 @@ use bevy::log::info_span;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 
-use crate::config::VoxelGenerator;
+use crate::config::{VoxelGenerator, VoxelGeneratorImpl};
 use crate::meshing::mesh_chunk_greedy;
-use crate::types::{ChunkData, ChunkStatus, FillType, WorldVoxel};
+use crate::types::{ChunkData, ChunkStatus, FillType};
 
 /// Number of chunks to generate per async task.
 pub const GEN_BATCH_SIZE: usize = 8;
@@ -78,10 +78,10 @@ pub fn spawn_chunk_gen_batch(
     pending.tasks.push(task);
 }
 
-fn generate_chunk(position: IVec3, generator: &dyn Fn(IVec3) -> Vec<WorldVoxel>) -> ChunkGenResult {
+fn generate_chunk(position: IVec3, generator: &dyn VoxelGeneratorImpl) -> ChunkGenResult {
     let voxels = {
         let _span = info_span!("terrain_gen").entered();
-        generator(position)
+        generator.generate_terrain(position)
     };
     let chunk_data = {
         let _span = info_span!("palettize_chunk").entered();
