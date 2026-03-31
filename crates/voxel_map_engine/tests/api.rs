@@ -20,7 +20,7 @@ fn spawn_map(app: &mut App, spawning_distance: u32) -> Entity {
     spawn_map_with(
         app,
         spawning_distance,
-        VoxelGenerator(Arc::new(flat_terrain_voxels)),
+        VoxelGenerator(Arc::new(FlatGenerator)),
     )
 }
 
@@ -323,8 +323,12 @@ fn set_voxel_isolated_between_instances() {
         .unwrap();
 }
 
-fn all_air_voxels(_chunk_pos: IVec3) -> Vec<WorldVoxel> {
-    vec![WorldVoxel::Air; PaddedChunkShape::USIZE]
+struct AllAirGenerator;
+
+impl VoxelGeneratorImpl for AllAirGenerator {
+    fn generate_terrain(&self, _chunk_pos: IVec3) -> Vec<WorldVoxel> {
+        vec![WorldVoxel::Air; PaddedChunkShape::USIZE]
+    }
 }
 
 /// Test: raycast on one map does not see another map's voxels.
@@ -332,7 +336,7 @@ fn all_air_voxels(_chunk_pos: IVec3) -> Vec<WorldVoxel> {
 fn raycast_isolated_between_instances() {
     let mut app = test_app();
     let map_a = spawn_map(&mut app, 1);
-    let map_b = spawn_map_with(&mut app, 1, VoxelGenerator(Arc::new(all_air_voxels)));
+    let map_b = spawn_map_with(&mut app, 1, VoxelGenerator(Arc::new(AllAirGenerator)));
     tick(&mut app, 1);
 
     app.world_mut()

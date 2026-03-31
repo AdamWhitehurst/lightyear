@@ -130,7 +130,7 @@ fn lookup_voxel(
         _ => true,
     };
     if needs_generate {
-        *cached_chunk = Some((chunk_pos, (generator.0)(chunk_pos)));
+        *cached_chunk = Some((chunk_pos, generator.0.generate_terrain(chunk_pos)));
     }
 
     let (_, voxels) = cached_chunk.as_ref().unwrap();
@@ -140,7 +140,7 @@ fn lookup_voxel(
 /// Evaluate the voxel generator at a single world-space position.
 fn evaluate_voxel_at(pos: IVec3, generator: &VoxelGenerator) -> WorldVoxel {
     let chunk_pos = voxel_to_chunk_pos(pos);
-    let voxels = (generator.0)(chunk_pos);
+    let voxels = generator.0.generate_terrain(chunk_pos);
     lookup_voxel_in_chunk(&voxels, pos, chunk_pos)
 }
 
@@ -184,9 +184,9 @@ mod tests {
 
     #[test]
     fn evaluate_voxel_flat_terrain() {
-        use crate::meshing::flat_terrain_voxels;
+        use crate::terrain::FlatGenerator;
         use std::sync::Arc;
-        let generator = VoxelGenerator(Arc::new(flat_terrain_voxels));
+        let generator = VoxelGenerator(Arc::new(FlatGenerator));
 
         let voxel = evaluate_voxel_at(IVec3::new(0, -1, 0), &generator);
         assert_eq!(voxel, WorldVoxel::Solid(0));

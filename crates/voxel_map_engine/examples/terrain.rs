@@ -21,7 +21,7 @@ fn setup(mut commands: Commands) {
         .spawn((
             instance,
             VoxelMapConfig::new(0, 0, 5, None, 5),
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(Arc::new(FlatGenerator)),
             PendingChunks::default(),
             Transform::default(),
         ))

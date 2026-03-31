@@ -12,7 +12,7 @@ use protocol::{
 };
 use ui::MapTransitionState;
 use voxel_map_engine::prelude::{
-    chunk_to_column, column_to_chunks, flat_terrain_voxels, ChunkData, ChunkStatus, ChunkTicket,
+    chunk_to_column, column_to_chunks, ChunkData, ChunkStatus, ChunkTicket, FlatGenerator,
     VoxelGenerator, VoxelMapConfig, VoxelMapInstance, VoxelPlugin, VoxelWorld, WorldVoxel,
     DEFAULT_COLUMN_Y_MAX, DEFAULT_COLUMN_Y_MIN,
 };
@@ -102,7 +102,7 @@ fn spawn_overworld(mut commands: Commands, mut registry: ResMut<MapRegistry>) {
         .spawn((
             VoxelMapInstance::new(5),
             config,
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(Arc::new(FlatGenerator)),
             Transform::default(),
             MapInstanceId::Overworld,
         ))
@@ -465,8 +465,8 @@ fn despawn_all_maps_except(
 
 fn generator_for_map(map_id: &MapInstanceId) -> VoxelGenerator {
     match map_id {
-        MapInstanceId::Overworld => VoxelGenerator(Arc::new(flat_terrain_voxels)),
-        MapInstanceId::Homebase { .. } => VoxelGenerator(Arc::new(flat_terrain_voxels)),
+        MapInstanceId::Overworld => VoxelGenerator(Arc::new(FlatGenerator)),
+        MapInstanceId::Homebase { .. } => VoxelGenerator(Arc::new(FlatGenerator)),
     }
 }
 

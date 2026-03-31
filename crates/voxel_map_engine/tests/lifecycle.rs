@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use bevy::prelude::*;
 use voxel_map_engine::prelude::*;
 
@@ -19,7 +17,7 @@ fn spawn_map(app: &mut App, spawning_distance: u32) -> Entity {
         .spawn((
             VoxelMapInstance::new(5),
             VoxelMapConfig::new(0, 0, spawning_distance, None, 5),
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(std::sync::Arc::new(FlatGenerator)),
             Transform::default(),
         ))
         .id()
@@ -121,7 +119,7 @@ fn bounded_map_respects_bounds() {
         .spawn((
             VoxelMapInstance::new(5),
             VoxelMapConfig::new(0, 0, 5, Some(IVec3::new(2, 2, 2)), 5),
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(std::sync::Arc::new(FlatGenerator)),
             Transform::default(),
         ))
         .id();

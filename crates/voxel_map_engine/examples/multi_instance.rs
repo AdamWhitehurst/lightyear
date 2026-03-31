@@ -55,7 +55,7 @@ fn spawn_overworld(commands: &mut Commands) -> Entity {
         .spawn((
             instance,
             config,
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(Arc::new(FlatGenerator)),
             marker,
             PendingChunks::default(),
             Transform::default(),
@@ -70,7 +70,7 @@ fn spawn_homebase(commands: &mut Commands) -> Entity {
         .spawn((
             instance,
             config,
-            VoxelGenerator(Arc::new(raised_terrain_voxels)),
+            VoxelGenerator(Arc::new(RaisedGenerator)),
             marker,
             PendingChunks::default(),
             Transform::from_translation(Vec3::new(200.0, 0.0, 0.0)),
@@ -85,7 +85,7 @@ fn spawn_arena(commands: &mut Commands) -> Entity {
         .spawn((
             instance,
             config,
-            VoxelGenerator(Arc::new(bowl_terrain_voxels)),
+            VoxelGenerator(Arc::new(BowlGenerator)),
             marker,
             PendingChunks::default(),
             Transform::from_translation(Vec3::new(-200.0, 0.0, 0.0)),
@@ -93,32 +93,40 @@ fn spawn_arena(commands: &mut Commands) -> Entity {
         .id()
 }
 
-fn raised_terrain_voxels(chunk_pos: IVec3) -> Vec<WorldVoxel> {
-    let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
-    for i in 0..PaddedChunkShape::SIZE {
-        let [_x, y, _z] = PaddedChunkShape::delinearize(i);
-        let world_y = chunk_pos.y * CHUNK_SIZE as i32 + y as i32 - 1;
-        if world_y < 4 {
-            voxels[i as usize] = WorldVoxel::Solid(0);
+struct RaisedGenerator;
+
+impl VoxelGeneratorImpl for RaisedGenerator {
+    fn generate_terrain(&self, chunk_pos: IVec3) -> Vec<WorldVoxel> {
+        let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+        for i in 0..PaddedChunkShape::SIZE {
+            let [_x, y, _z] = PaddedChunkShape::delinearize(i);
+            let world_y = chunk_pos.y * CHUNK_SIZE as i32 + y as i32 - 1;
+            if world_y < 4 {
+                voxels[i as usize] = WorldVoxel::Solid(0);
+            }
         }
+        voxels
     }
-    voxels
 }
 
-fn bowl_terrain_voxels(chunk_pos: IVec3) -> Vec<WorldVoxel> {
-    let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
-    for i in 0..PaddedChunkShape::SIZE {
-        let [x, y, z] = PaddedChunkShape::delinearize(i);
-        let world_x = (chunk_pos.x * CHUNK_SIZE as i32 + x as i32 - 1) as f32;
-        let world_y = (chunk_pos.y * CHUNK_SIZE as i32 + y as i32 - 1) as f32;
-        let world_z = (chunk_pos.z * CHUNK_SIZE as i32 + z as i32 - 1) as f32;
-        let dist = (world_x * world_x + world_z * world_z).sqrt();
-        let surface_y = -2.0 + dist * 0.15;
-        if world_y < surface_y {
-            voxels[i as usize] = WorldVoxel::Solid(0);
+struct BowlGenerator;
+
+impl VoxelGeneratorImpl for BowlGenerator {
+    fn generate_terrain(&self, chunk_pos: IVec3) -> Vec<WorldVoxel> {
+        let mut voxels = vec![WorldVoxel::Air; PaddedChunkShape::USIZE];
+        for i in 0..PaddedChunkShape::SIZE {
+            let [x, y, z] = PaddedChunkShape::delinearize(i);
+            let world_x = (chunk_pos.x * CHUNK_SIZE as i32 + x as i32 - 1) as f32;
+            let world_y = (chunk_pos.y * CHUNK_SIZE as i32 + y as i32 - 1) as f32;
+            let world_z = (chunk_pos.z * CHUNK_SIZE as i32 + z as i32 - 1) as f32;
+            let dist = (world_x * world_x + world_z * world_z).sqrt();
+            let surface_y = -2.0 + dist * 0.15;
+            if world_y < surface_y {
+                voxels[i as usize] = WorldVoxel::Solid(0);
+            }
         }
+        voxels
     }
-    voxels
 }
 
 fn teleport_camera(

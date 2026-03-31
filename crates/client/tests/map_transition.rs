@@ -9,8 +9,7 @@ use protocol::PendingTransition;
 use protocol::{CharacterMarker, MapInstanceId, MapRegistry};
 use ui::{ClientState, MapTransitionState};
 use voxel_map_engine::prelude::{
-    chunk_to_column, flat_terrain_voxels, ChunkTicket, VoxelGenerator, VoxelMapConfig,
-    VoxelMapInstance,
+    chunk_to_column, ChunkTicket, FlatGenerator, VoxelGenerator, VoxelMapConfig, VoxelMapInstance,
 };
 
 fn transition_test_app() -> App {
@@ -34,7 +33,7 @@ fn spawn_map(app: &mut App) -> Entity {
         .spawn((
             VoxelMapInstance::new(3),
             VoxelMapConfig::new(0, 0, 1, None, 3),
-            VoxelGenerator(Arc::new(flat_terrain_voxels)),
+            VoxelGenerator(Arc::new(FlatGenerator)),
             Transform::default(),
             MapInstanceId::Overworld,
         ))
