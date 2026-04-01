@@ -10,6 +10,14 @@ use std::fmt;
 #[derive(Component, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Reflect)]
 pub struct WorldObjectId(pub String);
 
+/// Offset applied to the placement position when spawning a world object.
+///
+/// Vox models are often centered at their geometric midpoint, so this shifts the
+/// spawn position (e.g. `(0, 1.5, 0)` raises the object so its base sits on the surface).
+#[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component, Serialize, Deserialize)]
+pub struct PlacementOffset(pub Vec3);
+
 /// Broad classification of world objects.
 #[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize, Reflect)]
 #[reflect(Component, Serialize, Deserialize)]
