@@ -21,7 +21,7 @@ use crate::ticket::{
     ChunkTicket, DEFAULT_COLUMN_Y_MAX, DEFAULT_COLUMN_Y_MIN, TicketType, chunk_to_column,
     column_to_chunks,
 };
-use crate::types::{CHUNK_SIZE, ChunkStatus};
+use crate::types::{CHUNK_SIZE, ChunkStatus, FillType};
 
 /// Per-frame time budget for chunk pipeline work on a single map.
 /// Reset at the start of each frame by `update_chunks`.
@@ -723,6 +723,20 @@ fn drain_gen_queue(
                 let chunk_data = instance
                     .get_chunk_data(work.position)
                     .expect("chunk must exist at Terrain status");
+                // Uniform chunks (all solid or all air) have no surface — skip async
+                // placement and promote directly.
+                if !matches!(chunk_data.fill_type, FillType::Mixed) {
+                    let data = instance
+                        .get_chunk_data_mut(work.position)
+                        .expect("chunk must exist for Features promotion");
+                    data.status = ChunkStatus::Features;
+                    gen_queue.heap.push(ChunkWork {
+                        position: work.position,
+                        effective_level: work.effective_level,
+                        distance_to_source: work.distance_to_source,
+                    });
+                    continue;
+                }
                 let height_map = build_surface_height_map(work.position, &chunk_data.voxels);
                 tracker.generating.insert(work.position);
                 spawn_features_task(
