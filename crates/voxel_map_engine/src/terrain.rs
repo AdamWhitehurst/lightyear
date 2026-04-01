@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bevy::log::info_span;
+use bevy::log::{info_span, trace};
 use bevy::prelude::*;
 use ndshape::ConstShape;
 use noise::{
@@ -9,8 +9,9 @@ use noise::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::config::{VoxelGenerator, VoxelGeneratorImpl};
+use crate::config::{SurfaceHeightMap, VoxelGenerator, VoxelGeneratorImpl, WorldObjectSpawn};
 use crate::meshing::flat_terrain_voxels;
+use crate::placement::{placement_seed, poisson_disk_sample};
 use crate::types::{CHUNK_SIZE, PaddedChunkShape, WorldVoxel};
 
 /// Base noise algorithm.
@@ -78,6 +79,28 @@ pub struct BiomeRule {
     pub surface_material: u8,
     pub subsurface_material: u8,
     pub subsurface_depth: u32,
+}
+
+/// Rules for procedural world object placement on terrain.
+#[derive(Component, Clone, Debug, Serialize, Deserialize, Reflect)]
+#[reflect(Component, Serialize, Deserialize)]
+pub struct PlacementRules(pub Vec<PlacementRule>);
+
+/// A single placement rule for one type of world object.
+#[derive(Clone, Debug, Serialize, Deserialize, Reflect)]
+pub struct PlacementRule {
+    /// WorldObjectId string (matches `.object.ron` filename stem).
+    pub object_id: String,
+    /// Biome IDs where this object can spawn. Empty = all biomes.
+    pub allowed_biomes: Vec<String>,
+    /// Average objects per chunk (before filtering). Controls Poisson disk candidate count.
+    pub density: f64,
+    /// Minimum distance between objects of this type within a chunk.
+    pub min_spacing: f64,
+    /// Maximum terrain slope (rise/run) for placement. `None` = no slope filter.
+    pub slope_max: Option<f64>,
+    /// Height range (world Y) where this object can spawn.
+    pub height_range: (f64, f64),
 }
 
 /// Constructs a 2D noise function from a [`NoiseDef`] and world seed.
@@ -300,12 +323,33 @@ pub fn select_biome<'a>(rules: &'a [BiomeRule], height: f64, moisture: f64) -> &
         .unwrap_or(&rules[0])
 }
 
+/// Select a biome at a single world XZ position without building full noise caches.
+///
+/// Samples height and moisture noise at the given point and returns the matching
+/// biome rule. Used by `place_features` for sparse point lookups.
+fn select_biome_at_pos<'a>(
+    seed: u64,
+    height_map: &HeightMap,
+    moisture_map: &MoistureMap,
+    biome_rules: &'a BiomeRules,
+    world_x: f64,
+    world_z: f64,
+) -> &'a BiomeRule {
+    let height_noise = build_noise_fn(&height_map.noise, seed);
+    let moisture_noise = build_noise_fn(&moisture_map.noise, seed);
+    let terrain_height =
+        height_map.base_height as f64 + height_noise.get([world_x, world_z]) * height_map.amplitude;
+    let moisture = moisture_noise.get([world_x, world_z]);
+    select_biome(&biome_rules.0, terrain_height, moisture)
+}
+
 /// Terrain generator using 2D heightmap noise with biome-aware material selection.
 struct HeightmapGenerator {
     seed: u64,
     height_map: HeightMap,
     moisture_map: Option<MoistureMap>,
     biome_rules: Option<BiomeRules>,
+    placement_rules: Option<PlacementRules>,
 }
 
 impl VoxelGeneratorImpl for HeightmapGenerator {
@@ -317,6 +361,70 @@ impl VoxelGeneratorImpl for HeightmapGenerator {
             self.moisture_map.as_ref(),
             self.biome_rules.as_ref(),
         )
+    }
+
+    fn place_features(
+        &self,
+        chunk_pos: IVec3,
+        heights: &SurfaceHeightMap,
+    ) -> Vec<WorldObjectSpawn> {
+        let Some(ref rules) = self.placement_rules else {
+            return Vec::new();
+        };
+        let mut spawns = Vec::new();
+
+        for (rule_idx, rule) in rules.0.iter().enumerate() {
+            let seed = placement_seed(self.seed, chunk_pos, rule_idx);
+            let max_candidates = (rule.density * (CHUNK_SIZE as f64).powi(2)).ceil() as usize;
+            let candidates = poisson_disk_sample(seed, chunk_pos, rule.min_spacing, max_candidates);
+
+            for pos_xz in candidates {
+                let local_x = pos_xz.x as u32;
+                let local_z = pos_xz.y as u32;
+                if local_x >= CHUNK_SIZE || local_z >= CHUNK_SIZE {
+                    trace!("place_features: candidate ({local_x}, {local_z}) out of chunk bounds");
+                    continue;
+                }
+
+                let height_idx = (local_x * CHUNK_SIZE + local_z) as usize;
+                let Some(height) = heights.heights[height_idx] else {
+                    trace!("place_features: no surface at ({local_x}, {local_z}), skipping");
+                    continue;
+                };
+
+                if height < rule.height_range.0 || height > rule.height_range.1 {
+                    continue;
+                }
+
+                if !rule.allowed_biomes.is_empty() {
+                    if let (Some(moisture_map), Some(biome_rules)) =
+                        (&self.moisture_map, &self.biome_rules)
+                    {
+                        let world_x = chunk_pos.x as f64 * CHUNK_SIZE as f64 + pos_xz.x as f64;
+                        let world_z = chunk_pos.z as f64 * CHUNK_SIZE as f64 + pos_xz.y as f64;
+                        let biome = select_biome_at_pos(
+                            self.seed,
+                            &self.height_map,
+                            moisture_map,
+                            biome_rules,
+                            world_x,
+                            world_z,
+                        );
+                        if !rule.allowed_biomes.iter().any(|b| b == &biome.biome_id) {
+                            continue;
+                        }
+                    }
+                }
+
+                let world_x = chunk_pos.x as f32 * CHUNK_SIZE as f32 + pos_xz.x;
+                let world_z = chunk_pos.z as f32 * CHUNK_SIZE as f32 + pos_xz.y;
+                spawns.push(WorldObjectSpawn {
+                    object_id: rule.object_id.clone(),
+                    position: Vec3::new(world_x, height as f32, world_z),
+                });
+            }
+        }
+        spawns
     }
 }
 
@@ -337,6 +445,7 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
     let height = entity.get::<HeightMap>().cloned();
     let moisture = entity.get::<MoistureMap>().cloned();
     let biomes = entity.get::<BiomeRules>().cloned();
+    let placement = entity.get::<PlacementRules>().cloned();
 
     debug_assert!(
         moisture.is_none() || height.is_some(),
@@ -357,6 +466,7 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
             height_map,
             moisture_map: moisture,
             biome_rules: biomes,
+            placement_rules: placement,
         })),
         None => VoxelGenerator(Arc::new(FlatGenerator)),
     }
