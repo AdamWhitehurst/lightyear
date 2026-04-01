@@ -22,11 +22,19 @@
     "voxel_map_engine::terrain::PlacementRules": ([
         (
             object_id: "tree_circle",
+            allowed_biomes: ["mountains"],
+            density: 0.000015,
+            min_spacing: 100.0,
+            slope_max: None,
+            height_range: (-100.0, 100.0),
+        ),
+        (
+            object_id: "tree_circle",
             allowed_biomes: ["forest", "grassland"],
-            density: 0.0015,
-            min_spacing: 50.0,
-            slope_max: Some(0.5),
-            height_range: (0.0, 30.0),
+            density: 0.0001,
+            min_spacing: 100.0,
+            slope_max: Some(0.75),
+            height_range: (-30.0, 30.0),
         ),
     ]),
 }

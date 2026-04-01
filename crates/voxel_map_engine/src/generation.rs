@@ -176,7 +176,7 @@ pub fn spawn_mesh_task(pending: &mut PendingChunks, position: IVec3, voxels: Vec
 /// top-down for the highest solid voxel. Called on the main thread before
 /// dispatching the Features async task.
 pub fn build_surface_height_map(chunk_pos: IVec3, palette: &PalettedChunk) -> SurfaceHeightMap {
-    use crate::types::{CHUNK_SIZE, PADDED_CHUNK_SIZE, PaddedChunkShape};
+    use crate::types::{CHUNK_SIZE, PaddedChunkShape};
     use ndshape::ConstShape;
 
     let voxels = palette.to_voxels();
@@ -186,10 +186,10 @@ pub fn build_surface_height_map(chunk_pos: IVec3, palette: &PalettedChunk) -> Su
         for z in 0..CHUNK_SIZE {
             let px = x + 1;
             let pz = z + 1;
-            for py in (0..PADDED_CHUNK_SIZE).rev() {
+            for py in (1..=CHUNK_SIZE).rev() {
                 let idx = PaddedChunkShape::linearize([px, py, pz]) as usize;
                 if matches!(voxels[idx], WorldVoxel::Solid(_)) {
-                    let world_y = chunk_pos.y as f64 * CHUNK_SIZE as f64 + py as f64 - 1.0 + 1.0;
+                    let world_y = chunk_pos.y as f64 * CHUNK_SIZE as f64 + (py - 1) as f64 + 1.0;
                     heights[(x * CHUNK_SIZE + z) as usize] = Some(world_y);
                     break;
                 }
