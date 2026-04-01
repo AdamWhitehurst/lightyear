@@ -36,8 +36,8 @@ pub struct WorldObjectSpawn {
     pub position: Vec3,
 }
 
-/// 16×16 surface height map built from PalettedChunk on the main thread.
-/// `heights[x * 16 + z]` = world Y of highest solid voxel, or `None` if all air.
+/// `CHUNK_SIZE` × `CHUNK_SIZE` surface height map built from PalettedChunk on the main thread.
+/// `heights[x * CHUNK_SIZE + z]` = world Y of highest solid voxel, or `None` if all air.
 pub struct SurfaceHeightMap {
     pub chunk_pos: IVec3,
     pub heights: [Option<f64>; 256],

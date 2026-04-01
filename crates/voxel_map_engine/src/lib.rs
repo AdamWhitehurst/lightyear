@@ -8,6 +8,7 @@ pub mod mesh_cache;
 pub mod meshing;
 pub mod palette;
 pub mod persistence;
+pub mod placement;
 pub mod propagator;
 pub mod raycast;
 pub mod terrain;
@@ -33,6 +34,8 @@ impl Plugin for VoxelPlugin {
         app.register_type::<terrain::NoiseDef>();
         app.register_type::<terrain::NoiseType>();
         app.register_type::<terrain::FractalType>();
+        app.register_type::<terrain::PlacementRules>();
+        app.register_type::<terrain::PlacementRule>();
 
         let generation_enabled = resource_exists::<ChunkGenerationEnabled>;
 
@@ -63,6 +66,7 @@ pub mod prelude {
     pub use crate::mesh_cache::*;
     pub use crate::meshing::*;
     pub use crate::palette::*;
+    pub use crate::placement::*;
     pub use crate::propagator::*;
     pub use crate::raycast::*;
     pub use crate::terrain::*;

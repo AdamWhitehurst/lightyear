@@ -877,12 +877,12 @@ pub fn build_generator(entity: EntityRef, seed: u64) -> VoxelGenerator {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo check-all`
-- [ ] `cargo test -p voxel_map_engine`
+- [x] `cargo check-all`
+- [x] `cargo test -p voxel_map_engine`
 
 #### Manual Verification:
-- [ ] `cargo server` — no entity spawns yet (no PlacementRules in terrain.ron)
-- [ ] Unit tests for Poisson disk and height sampling pass
+- [x] `cargo server` — no entity spawns yet (no PlacementRules in terrain.ron)
+- [x] Unit tests for Poisson disk and height sampling pass
 
 ---
 
