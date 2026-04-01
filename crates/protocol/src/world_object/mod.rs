@@ -10,4 +10,7 @@ pub use loader::deserialize_world_object;
 pub use plugin::WorldObjectPlugin;
 pub use registry::{WorldObjectDefRegistry, WorldObjectManifest};
 pub use spawn::apply_object_components;
-pub use types::{ObjectCategory, VisualKind, WorldObjectDef, WorldObjectId, WorldObjectLoadError};
+pub use types::{
+    ObjectCategory, PlacementOffset, VisualKind, WorldObjectDef, WorldObjectId,
+    WorldObjectLoadError,
+};

@@ -9,6 +9,7 @@
     "protocol::RespawnTimerConfig": (duration_ticks: 384),
     // Static — immovable physics body
     "avian3d::dynamics::rigid_body::RigidBody": Static,
+    "protocol::world_object::types::PlacementOffset": ((0.0, 5.0, 0.0)),
     // Damageable(32) collides with Character(2), Hitbox(4), Projectile(8)
     "avian3d::collision::collider::layers::CollisionLayers": (
         memberships: (32),

@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use bevy::tasks::AsyncComputeTaskPool;
 use protocol::map::{ChunkEntityRef, MapInstanceId};
 use protocol::vox_model::{VoxModelAsset, VoxModelRegistry};
-use protocol::world_object::{WorldObjectDefRegistry, WorldObjectId};
+use protocol::world_object::{PlacementOffset, WorldObjectDefRegistry, WorldObjectId};
 use voxel_map_engine::prelude::{
     chunk_to_column, PendingEntitySpawns, VoxelMapConfig, VoxelMapInstance, WorldObjectSpawn,
 };
@@ -48,6 +48,7 @@ pub fn spawn_chunk_entities(
                     );
                     continue;
                 };
+                let offset = extract_placement_offset(def);
                 let entity = spawn_world_object(
                     &mut commands,
                     id,
@@ -58,8 +59,9 @@ pub fn spawn_chunk_entities(
                     &vox_assets,
                     &meshes,
                 );
+                let position = Vec3::from(spawn.position) + offset;
                 commands.entity(entity).insert((
-                    Position(spawn.position.into()),
+                    Position(position.into()),
                     ChunkEntityRef {
                         chunk_pos,
                         map_entity,
@@ -180,4 +182,15 @@ pub fn save_all_chunk_entities_on_exit(
             }
         }
     }
+}
+
+/// Extracts `PlacementOffset` from a world object definition's reflected components.
+///
+/// Returns `Vec3::ZERO` if no `PlacementOffset` is present.
+fn extract_placement_offset(def: &protocol::world_object::WorldObjectDef) -> Vec3 {
+    def.components
+        .iter()
+        .find_map(|c| c.try_downcast_ref::<PlacementOffset>())
+        .map(|o| o.0)
+        .unwrap_or(Vec3::ZERO)
 }

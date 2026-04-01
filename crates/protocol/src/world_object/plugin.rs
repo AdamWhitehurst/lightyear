@@ -52,5 +52,6 @@ impl Plugin for WorldObjectPlugin {
         app.register_type::<ObjectCategory>();
         app.register_type::<VisualKind>();
         app.register_type::<ColliderConstructor>();
+        app.register_type::<super::types::PlacementOffset>();
     }
 }
